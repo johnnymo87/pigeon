@@ -17,7 +17,7 @@ import { SLACK_HANDLE_MIN, slackChatId, slackSecretKeyForMachine, type SlackWork
 import { handleEditNotification, handleSendNotification } from "../src/notifications";
 import { handleSendMessage, handleUnpinTopic } from "../src/messages";
 import { handleNamedTopic, handleNamedTopicBind } from "../src/named-topics";
-import { resolveTopic, SUPERSEDE_CLOSE_BOUND_MS } from "../src/topic-manager";
+import { resolveTopic, SUPERSEDE_CLOSE_BOUND_MS, SUPERSEDE_MIN_AGE_MS } from "../src/topic-manager";
 import { finalize, getBySession, reserve } from "../src/topics";
 import { createTelegramClient } from "../src/telegram";
 import { authorizeStoredAddress, resolveWorkerTarget } from "../src/chat/address";
@@ -159,7 +159,7 @@ const tgOf = (method: string) => tgCalls.filter((c) => c.method === method);
 
 /** A conversation this team already has, returning its handle. */
 async function seedChannel(teamId: string, channelId: string): Promise<number> {
-  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
+  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, ?, ?, 1)")
     .bind(teamId, channelId, Date.now())
     .run();
   const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
@@ -182,7 +182,18 @@ async function seedAlerts(ws: SlackWorkspace): Promise<string> {
 }
 
 /** A session whose topic row already lives in Slack. */
-async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWorkspace) {
+/**
+ * Topic rows are seeded as OLD (10 minutes) so a supersede is allowed to replace them: a row
+ * younger than SUPERSEDE_MIN_AGE_MS is deliberately left alone. `ageMs: 0` seeds a fresh one.
+ */
+const OLD_ROW_MS = 10 * 60_000;
+async function ageTopic(sessionId: string, ageMs: number) {
+  await env.DB.prepare("UPDATE topics SET created_at = ? WHERE session_id = ?")
+    .bind(Date.now() - ageMs, sessionId)
+    .run();
+}
+
+async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWorkspace, ageMs = OLD_ROW_MS) {
   const channelId = `CSESS${stamp()}`.toUpperCase();
   const handle = await seedChannel(ws.teamId, channelId);
   await reserve(env.DB, { sessionId, machineId, chatId: slackChatId(ws), name: "s" });
@@ -193,12 +204,14 @@ async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWor
     name: "s",
     provisional: false,
   });
+  await ageTopic(sessionId, ageMs);
   return { channelId, handle };
 }
 
-async function seedTelegramTopic(sessionId: string, machineId: string, chatId: string, thread: number) {
+async function seedTelegramTopic(sessionId: string, machineId: string, chatId: string, thread: number, ageMs = OLD_ROW_MS) {
   await reserve(env.DB, { sessionId, machineId, chatId, name: "tg" });
   await finalize(env.DB, { sessionId, chatId, messageThreadId: thread, name: "tg", provisional: false });
+  await ageTopic(sessionId, ageMs);
 }
 
 async function messageRow(chatId: string, messageId: number) {
@@ -379,6 +392,59 @@ describe("supersede", () => {
     expect(row?.chat_id).toBe(ALLOWED);
     expect(row?.message_thread_id).toBe(321);
     expect(tgOf("sendMessage")[0]?.body).toMatchObject({ chat_id: ALLOWED, message_thread_id: 321 });
+  });
+
+  describe("hysteresis: a row younger than SUPERSEDE_MIN_AGE_MS is not superseded", () => {
+    const run = async (rowAgeMs: number, thread: number) => {
+      const m = await mkMachine({ slack: true });
+      const sessionId = await seedSession(m.machineId);
+      const seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!, rowAgeMs);
+      const created: number[] = [];
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: m.machineId,
+        chatId: ALLOWED,
+        dir: "~/p",
+        title: "T",
+        botToken: "unused",
+        supersede: true,
+        env: envFor([m]),
+        tgClient: {
+          ...createTelegramClient("unused"),
+          createForumTopic: async (o: { name: string }) => {
+            created.push(thread);
+            return { ok: true as const, result: { message_thread_id: thread, name: o.name, icon_color: 0 } };
+          },
+        },
+      });
+      warn.mockRestore();
+      return { res, sessionId, seeded, created, m };
+    };
+
+    it("is five minutes", () => {
+      expect(SUPERSEDE_MIN_AGE_MS).toBe(5 * 60_000);
+    });
+
+    it("just under the floor: topic_in_other_chat, the Slack row untouched, nothing created or closed", async () => {
+      const { res, sessionId, seeded, created, m } = await run(SUPERSEDE_MIN_AGE_MS - 5000, 5100);
+      expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat" });
+      expect(created).toEqual([]);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(slackChatId(m.ws!));
+      expect(row?.message_thread_id).toBe(seeded.handle);
+      expect(slackOf("conversations.archive")).toHaveLength(0);
+    });
+
+    it("just over the floor: superseded as before", async () => {
+      // The archive of the old channel is the Slack call a supersede makes.
+      slack("conversations.archive", { ok: true });
+      const { res, sessionId, created } = await run(SUPERSEDE_MIN_AGE_MS + 5000, 5101);
+      expect(res).toMatchObject({ ok: true, messageThreadId: 5101, created: true });
+      expect(created).toEqual([5101]);
+      expect((await getBySession(env.DB, sessionId))?.chat_id).toBe(ALLOWED);
+      expect(slackOf("conversations.archive")).toHaveLength(1);
+    });
   });
 
   it("a close that outlasts the 3 s bound is logged and does not hold the notification", async () => {
@@ -723,8 +789,9 @@ describe("errorClass on Slack failures", () => {
   it("a payload Slack rejects (also after relocating to #alerts) is a 502 rejected_format", async () => {
     const { m, sessionId } = await slackSession();
     await seedAlerts(m.ws!);
-    slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
-    slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
+    // Each post is tried with blocks and then once as plain text; both fail here, in the
+    // session channel and again after relocating to #alerts.
+    for (let i = 0; i < 4; i++) slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const res = await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId)));
     expect(res.status).toBe(502);
@@ -890,6 +957,7 @@ describe("/messages/send authorization", () => {
 
     // rejected -> 200 status 400
     slack("chat.postMessage", { ok: false, error: "msg_too_long" });
+    slack("chat.postMessage", { ok: false, error: "msg_too_long" }); // the plain retry
     const rejected = await send(e, m.key, { chatId: chat, messageThreadId: handle });
     expect(rejected.status).toBe(200);
     expect(await rejected.json()).toMatchObject({ ok: false, telegram: { status: 400 }, errorClass: "rejected_format" });

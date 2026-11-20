@@ -201,6 +201,9 @@ CREATE TABLE IF NOT EXISTS slack_conversations (
   team_id    TEXT NOT NULL,
   channel_id TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  -- 1 once the owner is known to be in the channel (invite ok or already_in_channel). A post into a
+  -- row with 0 retries the invite best-effort, so one failed invite does not leave the owner out forever.
+  owner_invited INTEGER NOT NULL DEFAULT 0,
   UNIQUE (team_id, channel_id)
 );
 INSERT OR IGNORE INTO slack_conversations (handle, team_id, channel_id, created_at)

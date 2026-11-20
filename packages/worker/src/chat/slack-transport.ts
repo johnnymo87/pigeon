@@ -16,7 +16,7 @@
  * with a deadline (`/messages/send` has 4 s) cannot be left holding a second, unbounded call.
  */
 import type { D1Database } from "@cloudflare/workers-types";
-import { callSlack, uploadToSlack, type SlackBody } from "../slack";
+import { callSlack, slackErrorClass, uploadToSlack, type SlackBody } from "../slack";
 import type {
   CloseForumTopicOptions,
   CreateForumTopicOptions,
@@ -205,6 +205,8 @@ const OK_TRUE = { ok: true, result: true } as const;
 interface Target {
   handle: number;
   channelId: string;
+  /** `slack_conversations.owner_invited`: false means a post should retry the owner invite. */
+  ownerInvited: boolean;
 }
 
 export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
@@ -221,10 +223,10 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
 
   async function targetForHandle(handle: number): Promise<Target | null> {
     const row = await db
-      .prepare("SELECT channel_id FROM slack_conversations WHERE handle = ? AND team_id = ?")
+      .prepare("SELECT channel_id, owner_invited FROM slack_conversations WHERE handle = ? AND team_id = ?")
       .bind(handle, ws.teamId)
-      .first<{ channel_id: string }>();
-    return row ? { handle, channelId: row.channel_id } : null;
+      .first<{ channel_id: string; owner_invited: number }>();
+    return row ? { handle, channelId: row.channel_id, ownerInvited: row.owner_invited === 1 } : null;
   }
 
   /**
@@ -259,13 +261,18 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
   }
 
   /**
-   * Records a post and returns its handle, or 0 when D1 would not record it.
+   * Records a post and returns its handle, or a NEGATIVE sentinel when D1 would not record it.
    *
    * Only called after Slack accepted the post. Throwing would make the daemon retry a message that
    * is already in the channel, a visible duplicate, so a failed insert is retried once and then
-   * downgraded: the send succeeds with message_id 0. The cost is that this one post cannot later be
-   * edited or used as a reply target (0 is an unknown handle), which only matters for a wizard
-   * question and a reply-threaded file.
+   * downgraded: the send succeeds with a unique negative message_id. The cost is that this one post
+   * cannot later be edited or used as a reply target (a negative id is never a handle: handles are
+   * at least 2^40, so it is an unknown handle), which only matters for a wizard question and a
+   * reply-threaded file.
+   *
+   * Unique, not a constant, because the caller stores the id in `messages`, whose primary key is
+   * `(chat_id, message_id)`: a fixed 0 made the second downgrade in a chat fail that insert and
+   * turn an already-delivered post into a 500 the daemon would retry.
    */
   async function recordPost(channelId: string, ts: string, text: string): Promise<number> {
     for (let attempt = 1; attempt <= 2; attempt++) {
@@ -282,7 +289,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         return row.handle;
       } catch (err) {
         if (attempt === 2) {
-          console.warn("[worker] slack post sent but not recorded; returning message_id 0", {
+          console.warn("[worker] slack post sent but not recorded; returning a negative message_id", {
             channelId,
             ts,
             err: String(err),
@@ -290,7 +297,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         }
       }
     }
-    return 0;
+    return -(Date.now() * 1000 + Math.floor(Math.random() * 1000));
   }
 
   async function postForHandle(handle: number): Promise<{ channelId: string; ts: string } | null> {
@@ -313,11 +320,31 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
 
   // ── conversation operations ──
 
+  /**
+   * Invites the owner, best-effort, and records `owner_invited` once Slack says they are in
+   * (ok or `already_in_channel`). A failure only warns and leaves the flag at 0, so the next post
+   * into the conversation tries again. Never throws on a Slack failure or a D1 failure.
+   */
   async function inviteOwner(channelId: string, signal?: AbortSignal): Promise<void> {
     const res = await bot("conversations.invite", { channel: channelId, users: ws.ownerUserId }, signal);
     if (!res.ok && slackErr(res) !== "already_in_channel") {
       console.warn("[worker] slack owner invite failed", { channelId, error: slackErr(res) ?? res.kind });
+      return;
     }
+    try {
+      await db
+        .prepare("UPDATE slack_conversations SET owner_invited = 1 WHERE team_id = ? AND channel_id = ?")
+        .bind(ws.teamId, channelId)
+        .run();
+    } catch (err) {
+      console.warn("[worker] slack owner_invited not recorded", { channelId, err: String(err) });
+    }
+  }
+
+  /** The retry half of the invite: a conversation whose invite never landed gets another try. */
+  async function ensureOwnerInvited(target: Target, signal?: AbortSignal): Promise<void> {
+    if (target.ownerInvited) return;
+    await inviteOwner(target.channelId, signal);
   }
 
   const join = (channelId: string, signal?: AbortSignal) => bot("conversations.join", { channel: channelId }, signal);
@@ -360,14 +387,14 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
   async function alertsFromDb(): Promise<Target | null> {
     const row = await db
       .prepare(
-        `SELECT c.handle AS handle, c.channel_id AS channel_id
+        `SELECT c.handle AS handle, c.channel_id AS channel_id, c.owner_invited AS owner_invited
          FROM named_topics t
          JOIN slack_conversations c ON c.handle = t.message_thread_id AND c.team_id = ?
          WHERE t.chat_id = ? AND t.topic_key = ?`,
       )
       .bind(ws.teamId, chat, ALERTS_TOPIC_KEY)
-      .first<{ handle: number; channel_id: string }>();
-    return row ? { handle: row.handle, channelId: row.channel_id } : null;
+      .first<{ handle: number; channel_id: string; owner_invited: number }>();
+    return row ? { handle: row.handle, channelId: row.channel_id, ownerInvited: row.owner_invited === 1 } : null;
   }
 
   /**
@@ -461,12 +488,14 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
         const id = created.result.channel?.id;
         if (typeof id !== "string") return upstreamFailure("create_without_channel");
         channelId = id;
-        await inviteOwner(id, signal);
       }
     }
 
     const handle = await ensureConversation(channelId);
     if (handle === null) return upstreamFailure("handle_not_recorded");
+    // Created or discovered, the owner may not be in it yet. After the row exists so the invite
+    // can record itself; a failure is retried by the first post into the channel.
+    await inviteOwner(channelId, signal);
     const now = Date.now();
     await db
       .prepare(
@@ -477,7 +506,8 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       .bind(chat, ALERTS_TOPIC_KEY, handle, ALERTS_CHANNEL_NAME, now, now)
       .run();
     const winner = await alertsFromDb();
-    return { ok: true, result: winner ?? { handle, channelId } };
+    if (winner) return { ok: true, result: winner };
+    return { ok: true, result: { handle, channelId, ownerInvited: false } };
   }
 
   /** Drops the `_alerts` row, but only while it still points at `handle`. */
@@ -503,6 +533,13 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     notifyOwner: boolean | undefined;
     notifyCategory: ExplicitNotifyCategory | undefined;
     build: (notifyOwner: boolean) => SlackMessage;
+    /**
+     * When Slack rejects the blocks, retry once as plain text (the message's escaped fallback
+     * text, no blocks) before giving up, so a block problem never reaches the daemon as a
+     * relocation. Off for the rich-markdown path: its rejection goes back to the handler, which
+     * falls back to a plain `sendMessage` (and so to this retry).
+     */
+    plainOnRejection: boolean;
     signal?: AbortSignal;
   }
 
@@ -514,22 +551,37 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       conversationKind: await conversationKind(target.handle),
     });
     const message = input.build(notify);
-    return withChannelRecovery(
-      target.channelId,
-      () =>
-        bot(
-          "chat.postMessage",
-          {
-            channel: target.channelId,
-            text: message.text,
-            blocks: message.blocks,
-            unfurl_links: false,
-            unfurl_media: false,
-          },
-          input.signal,
-        ),
-      input.signal,
-    );
+    const send = (withBlocks: boolean) =>
+      withChannelRecovery(
+        target.channelId,
+        () =>
+          bot(
+            "chat.postMessage",
+            {
+              channel: target.channelId,
+              text: message.text,
+              ...(withBlocks ? { blocks: message.blocks } : {}),
+              unfurl_links: false,
+              unfurl_media: false,
+            },
+            input.signal,
+          ),
+        input.signal,
+      );
+    const res = await send(true);
+    if (
+      !res.ok &&
+      input.plainOnRejection &&
+      message.blocks.length > 0 &&
+      slackErrorClass(res) === "rejected_format"
+    ) {
+      console.warn("[worker] slack rejected the blocks, retrying as plain text", {
+        channelId: target.channelId,
+        error: slackErr(res),
+      });
+      return send(false);
+    }
+    return res;
   }
 
   async function post(input: PostInput): Promise<ChatResult<{ message_id: number }>> {
@@ -556,6 +608,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     const ts = res.result.ts;
     if (typeof ts !== "string" || ts === "") return upstreamFailure("post_without_ts");
     const handle = await recordPost(target.channelId, ts, input.recordText);
+    await ensureOwnerInvited(target, input.signal);
     return { ok: true, result: { message_id: handle } };
   }
 
@@ -607,6 +660,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     if (!completed.ok) return completed;
 
     const handle = await recordPost(target.channelId, `file:${fileId}`, filename);
+    await ensureOwnerInvited(target, signal);
     return { ok: true, result: { message_id: handle } };
   }
 
@@ -649,6 +703,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return post({
         messageThreadId: options.messageThreadId,
         recordText: options.text,
+        plainOnRejection: true,
         notifyOwner: options.notifyOwner,
         notifyCategory: options.notifyCategory,
         build: (notify) =>
@@ -667,6 +722,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return post({
         messageThreadId: options.messageThreadId,
         recordText: options.text ?? options.markdown,
+        plainOnRejection: false,
         notifyOwner: options.notifyOwner,
         notifyCategory: options.notifyCategory,
         build: (notify) =>
@@ -821,7 +877,10 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       const target = await targetForHandle(options.messageThreadId);
       if (!target) return unknownHandle("conversation");
       const res = await asUser("conversations.unarchive", { channel: target.channelId });
-      if (res.ok) return OK_TRUE;
+      if (res.ok) {
+        await ensureOwnerInvited(target);
+        return OK_TRUE;
+      }
       if (slackErr(res) === "not_archived") {
         return { ok: false, kind: "topic_not_modified", response: res.response };
       }

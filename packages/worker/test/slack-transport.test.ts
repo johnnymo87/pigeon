@@ -84,9 +84,9 @@ const methods = () => calls.map((c) => c.method);
 const json = (c: Call | undefined, key: string) => JSON.parse(c?.params.get(key) ?? "null");
 
 /** A channel the transport already knows, returning its handle. */
-async function seedChannel(ws: SlackWorkspace, channelId: string): Promise<number> {
-  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
-    .bind(ws.teamId, channelId, Date.now())
+async function seedChannel(ws: SlackWorkspace, channelId: string, ownerInvited = true): Promise<number> {
+  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, ?, ?, ?)")
+    .bind(ws.teamId, channelId, Date.now(), ownerInvited ? 1 : 0)
     .run();
   const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
     .bind(ws.teamId, channelId)
@@ -486,22 +486,32 @@ describe("#alerts", () => {
     slack("conversations.list", { ok: true, channels: [{ id: "C0", name: "general" }], response_metadata: { next_cursor: "page2" } });
     slack("conversations.list", { ok: true, channels: [{ id: "CFOUND", name: "alerts" }], response_metadata: { next_cursor: "" } });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", posted);
     const res = await t.sendMessage({ chatId: slackChatId(ws), text: "boom" });
     expect(res.ok).toBe(true);
-    expect(methods()).toEqual(["conversations.list", "conversations.list", "conversations.join", "chat.postMessage"]);
+    // A discovered #alerts may not have the owner in it, so the owner is invited too.
+    expect(methods()).toEqual([
+      "conversations.list",
+      "conversations.list",
+      "conversations.join",
+      "conversations.invite",
+      "chat.postMessage",
+    ]);
     expect(calls[0]!.params.get("types")).toBe("public_channel");
     expect(calls[0]!.params.get("exclude_archived")).toBe("false");
     expect(calls[0]!.params.get("limit")).toBe("200");
     expect(calls[1]!.params.get("cursor")).toBe("page2");
     expect(calls[2]!.params.get("channel")).toBe("CFOUND");
     expect(calls[3]!.params.get("channel")).toBe("CFOUND");
+    expect(calls[3]!.params.get("users")).toBe("U0OWNER");
+    expect(calls[4]!.params.get("channel")).toBe("CFOUND");
     expect(await alertsRow(ws)).toEqual({ name: "alerts", channel_id: "CFOUND" });
 
     // The next send needs no discovery.
     slack("chat.postMessage", { ok: true, ts: "2.2" });
     expect((await t.sendMessage({ chatId: slackChatId(ws), text: "again" })).ok).toBe(true);
-    expect(methods().slice(4)).toEqual(["chat.postMessage"]);
+    expect(methods().slice(5)).toEqual(["chat.postMessage"]);
   });
 
   it("creates #alerts and invites the owner when none exists", async () => {
@@ -546,12 +556,19 @@ describe("#alerts", () => {
     slack("chat.postMessage", { ok: false, error: "channel_not_found" });
     slack("conversations.list", { ok: true, channels: [{ id: "CNEW", name: "alerts" }] });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", posted);
     const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
     expect(res.ok).toBe(true);
-    expect(methods()).toEqual(["chat.postMessage", "conversations.list", "conversations.join", "chat.postMessage"]);
+    expect(methods()).toEqual([
+      "chat.postMessage",
+      "conversations.list",
+      "conversations.join",
+      "conversations.invite",
+      "chat.postMessage",
+    ]);
     expect(calls[0]!.params.get("channel")).toBe("CDEAD");
-    expect(calls[3]!.params.get("channel")).toBe("CNEW");
+    expect(calls[4]!.params.get("channel")).toBe("CNEW");
     expect(await alertsRow(ws)).toEqual({ name: "alerts", channel_id: "CNEW" });
   });
 
@@ -561,6 +578,7 @@ describe("#alerts", () => {
     slack("chat.postMessage", { ok: false, error: "channel_not_found" });
     slack("conversations.list", { ok: true, channels: [{ id: "CNEW2", name: "alerts" }] });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", { ok: false, error: "channel_not_found" });
     const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
     expect(res.ok).toBe(false);
@@ -1058,6 +1076,7 @@ describe("#alerts discovery, review fixes", () => {
     slack("conversations.create", { ok: false, error: "name_taken" });
     slack("conversations.list", { ok: true, channels: [{ id: "CRACE", name: "alerts", is_archived: false }] });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", posted);
     const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
     expect(res.ok).toBe(true);
@@ -1066,10 +1085,11 @@ describe("#alerts discovery, review fixes", () => {
       "conversations.create",
       "conversations.list",
       "conversations.join",
+      "conversations.invite",
       "chat.postMessage",
     ]);
     expect(calls[3]!.params.get("channel")).toBe("CRACE");
-    expect(calls[4]!.params.get("channel")).toBe("CRACE");
+    expect(calls[5]!.params.get("channel")).toBe("CRACE");
   });
 
   it("returns the name_taken error when even a second discovery finds nothing", async () => {
@@ -1087,10 +1107,17 @@ describe("#alerts discovery, review fixes", () => {
     slack("conversations.list", { ok: true, channels: [{ id: "CARCHALERT", name: "alerts", is_archived: true }] });
     slack("conversations.unarchive", { ok: true });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", posted);
     const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "boom" });
     expect(res.ok).toBe(true);
-    expect(methods()).toEqual(["conversations.list", "conversations.unarchive", "conversations.join", "chat.postMessage"]);
+    expect(methods()).toEqual([
+      "conversations.list",
+      "conversations.unarchive",
+      "conversations.join",
+      "conversations.invite",
+      "chat.postMessage",
+    ]);
     expect(calls[0]!.params.get("exclude_archived")).toBe("false");
     expect(calls[1]!.auth).toBe("Bearer xoxp-user");
     expect(calls[1]!.params.get("channel")).toBe("CARCHALERT");
@@ -1101,6 +1128,7 @@ describe("#alerts discovery, review fixes", () => {
     const ws = mkWs();
     slack("conversations.list", { ok: true, channels: [{ id: "CLIVE", name: "alerts", is_archived: false }] });
     slack("conversations.join", { ok: true });
+    slack("conversations.invite", { ok: true });
     slack("chat.postMessage", posted);
     expect((await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "x" })).ok).toBe(true);
     expect(methods()).not.toContain("conversations.unarchive");
@@ -1181,7 +1209,7 @@ describe("a D1 failure after Slack accepted the call", () => {
     if (res.ok) expect(res.result.message_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
   });
 
-  it("returns message_id 0 with a warning, not a thrown error, when the record keeps failing", async () => {
+  it("returns a negative message_id with a warning, not a thrown error, when the record keeps failing", async () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CDB2");
     slack("chat.postMessage", posted);
@@ -1189,7 +1217,13 @@ describe("a D1 failure after Slack accepted the call", () => {
     try {
       const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 99), ws });
       const res = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
-      expect(res).toEqual({ ok: true, result: { message_id: 0 } });
+      expect(res.ok).toBe(true);
+      if (res.ok) {
+        expect(res.result.message_id).toBeLessThan(0);
+        // Never a handle: it resolves to no post, so an edit of it is thread_not_found.
+        const edit = await transport(ws).editMessageText({ chatId: slackChatId(ws), messageId: res.result.message_id, text: "x" });
+        expect(!edit.ok && edit.kind).toBe("thread_not_found");
+      }
       expect(warn.mock.calls.some((c) => String(c[0]).includes("not recorded"))).toBe(true);
     } finally {
       warn.mockRestore();
@@ -1206,7 +1240,38 @@ describe("a D1 failure after Slack accepted the call", () => {
     try {
       const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 99), ws });
       const res = await t.sendDocument({ chatId: slackChatId(ws), messageThreadId: handle, document: new Blob(["x"]), filename: "a" });
-      expect(res).toEqual({ ok: true, result: { message_id: 0 } });
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.result.message_id).toBeLessThan(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("two downgrades in a row get different ids, so the messages (chat_id, message_id) key cannot collide", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CDB5");
+    slack("chat.postMessage", posted);
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000200", channel: "C1" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const t = createSlackTransport({ db: flakyDb(/INTO slack_posts/, 99), ws });
+      const ids: number[] = [];
+      for (const text of ["one", "two"]) {
+        const res = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text });
+        expect(res.ok).toBe(true);
+        if (res.ok) ids.push(res.result.message_id);
+      }
+      expect(ids[0]).toBeLessThan(0);
+      expect(ids[1]).toBeLessThan(0);
+      expect(ids[0]).not.toBe(ids[1]);
+      // The caller stores them under (chat_id, message_id): both inserts must succeed.
+      for (const id of ids) {
+        await env.DB.prepare(
+          "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
+        )
+          .bind(slackChatId(ws), id, "ses_x", uniq("tok"), Date.now())
+          .run();
+      }
     } finally {
       warn.mockRestore();
     }
@@ -1249,7 +1314,6 @@ describe("a D1 failure after Slack accepted the call", () => {
     const ws = mkWs();
     slack("conversations.list", { ok: true, channels: [] });
     slack("conversations.create", { ok: true, channel: { id: "CAORPHAN", name: "alerts" } });
-    slack("conversations.invite", { ok: true });
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const t = createSlackTransport({ db: flakyDb(/INTO slack_conversations/, 99), ws });
@@ -1375,5 +1439,172 @@ describe("Telegram requests are unchanged by the new option fields", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+// ─── owner invite retry (review fix) ───────────────────────────────────────
+
+describe("owner invite is retried until it lands", () => {
+  const ownerInvited = async (ws: SlackWorkspace, channelId: string) =>
+    (
+      await env.DB.prepare("SELECT owner_invited AS v FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
+        .bind(ws.teamId, channelId)
+        .first<{ v: number }>()
+    )?.v;
+
+  it("createForumTopic records owner_invited on ok and on already_in_channel, and leaves 0 on a failure", async () => {
+    const cases: Array<[string, Record<string, unknown>, number]> = [
+      ["CINV1", { ok: true }, 1],
+      ["CINV2", { ok: false, error: "already_in_channel" }, 1],
+      ["CINV3", { ok: false, error: "user_not_found" }, 0],
+    ];
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const [channelId, inviteReply, expected] of cases) {
+        const ws = mkWs();
+        slack("conversations.create", { ok: true, channel: { id: channelId, name: "x" } });
+        slack("conversations.invite", inviteReply);
+        slack("conversations.setTopic", { ok: true });
+        expect((await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "x" })).ok).toBe(true);
+        expect(await ownerInvited(ws, channelId)).toBe(expected);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a post into a conversation with owner_invited = 0 retries the invite after posting, and records it", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRETRY1", false);
+    slack("chat.postMessage", posted);
+    slack("conversations.invite", { ok: true });
+    const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
+    expect(res.ok).toBe(true);
+    expect(methods()).toEqual(["chat.postMessage", "conversations.invite"]);
+    expect(calls[1]!.params.get("channel")).toBe("CRETRY1");
+    expect(calls[1]!.params.get("users")).toBe("U0OWNER");
+    expect(await ownerInvited(ws, "CRETRY1")).toBe(1);
+
+    // Recorded: the next post makes no invite call.
+    slack("chat.postMessage", { ok: true, ts: "2.2", channel: "C1" });
+    expect((await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "again" })).ok).toBe(true);
+    expect(methods().slice(2)).toEqual(["chat.postMessage"]);
+  });
+
+  it("a failing retry only warns: the post still succeeds and the next post tries again", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRETRY2", false);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      slack("chat.postMessage", posted);
+      slack("conversations.invite", { ok: false, error: "not_in_channel" });
+      const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.result.message_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("owner invite failed"))).toBe(true);
+      expect(await ownerInvited(ws, "CRETRY2")).toBe(0);
+
+      slack("chat.postMessage", { ok: true, ts: "3.3", channel: "C1" });
+      slack("conversations.invite", { ok: false, error: "already_in_channel" });
+      expect((await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "2" })).ok).toBe(true);
+      expect(await ownerInvited(ws, "CRETRY2")).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a file post and a reopen retry the invite too", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CRETRY3", false);
+    slack("files.getUploadURLExternal", { ok: true, upload_url: "https://files.slack.com/upload/v1/R3", file_id: "FR3" });
+    fetchMock.get("https://files.slack.com").intercept({ method: "POST", path: "/upload/v1/R3" }).reply(200, "OK - 1");
+    slack("files.completeUploadExternal", { ok: true, files: [] });
+    slack("conversations.invite", { ok: true });
+    const file = await transport(ws).sendDocument({ chatId: slackChatId(ws), messageThreadId: handle, document: new Blob(["x"]), filename: "a" });
+    expect(file.ok).toBe(true);
+    expect(methods().at(-1)).toBe("conversations.invite");
+    expect(await ownerInvited(ws, "CRETRY3")).toBe(1);
+
+    const other = await seedChannel(ws, "CRETRY4", false);
+    calls.length = 0;
+    slack("conversations.unarchive", { ok: true });
+    slack("conversations.invite", { ok: true });
+    expect((await transport(ws).reopenForumTopic({ chatId: slackChatId(ws), messageThreadId: other })).ok).toBe(true);
+    expect(methods()).toEqual(["conversations.unarchive", "conversations.invite"]);
+    expect(await ownerInvited(ws, "CRETRY4")).toBe(1);
+  });
+
+  it("a stored #alerts with owner_invited = 0 is invited by the next post; a discovered one is invited on adoption", async () => {
+    const ws = mkWs();
+    await seedNamed(ws, "_alerts", await seedChannel(ws, "CALRT0", false));
+    slack("chat.postMessage", posted);
+    slack("conversations.invite", { ok: true });
+    expect((await transport(ws).sendMessage({ chatId: slackChatId(ws), text: "x" })).ok).toBe(true);
+    expect(methods()).toEqual(["chat.postMessage", "conversations.invite"]);
+    expect(await ownerInvited(ws, "CALRT0")).toBe(1);
+  });
+});
+
+// ─── plain retry when Slack rejects the blocks (review fix) ────────────────
+
+describe("a rejected block payload is retried once as plain text", () => {
+  it("sendMessage: invalid_blocks -> a second post without blocks, same text, and its handle is returned", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CPLAINRT");
+    slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
+    slack("chat.postMessage", { ok: true, ts: "7.7", channel: "C1" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await transport(ws).sendMessage({
+        chatId: slackChatId(ws),
+        messageThreadId: handle,
+        text: "hello <!channel>",
+        replyMarkup: { inline_keyboard: [[{ text: "Go", callback_data: "x" }]] },
+      });
+      expect(res.ok).toBe(true);
+      if (res.ok) expect(res.result.message_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
+      expect(methods()).toEqual(["chat.postMessage", "chat.postMessage"]);
+      expect(calls[0]!.params.has("blocks")).toBe(true);
+      expect(calls[1]!.params.has("blocks")).toBe(false);
+      expect(calls[1]!.params.get("text")).toBe(calls[0]!.params.get("text"));
+      expect(calls[1]!.params.get("text")).not.toContain("<!channel>");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("sendMessage: a second rejection is returned (rejected_format), no third attempt", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CPLAINRT2");
+    slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
+    slack("chat.postMessage", { ok: false, error: "msg_too_long" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "x" });
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect((res.response as { errorClass: string }).errorClass).toBe("rejected_format");
+      expect(methods()).toEqual(["chat.postMessage", "chat.postMessage"]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("a rejection that is not about the format is not retried", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CPLAINRT3");
+    slack("chat.postMessage", { ok: false, error: "some_unknown_error" });
+    const res = await transport(ws).sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "x" });
+    expect(res.ok).toBe(false);
+    expect(methods()).toEqual(["chat.postMessage"]);
+  });
+
+  it("sendRichMessage returns the rejection as it is: the handler's isRichRejection fallback goes through sendMessage", async () => {
+    const ws = mkWs();
+    const handle = await seedChannel(ws, "CPLAINRT4");
+    slack("chat.postMessage", { ok: false, error: "invalid_blocks" });
+    const res = await transport(ws).sendRichMessage({ chatId: slackChatId(ws), messageThreadId: handle, markdown: "**x**" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect((res.response as { errorClass: string }).errorClass).toBe("rejected_format");
+    expect(methods()).toEqual(["chat.postMessage"]);
   });
 });

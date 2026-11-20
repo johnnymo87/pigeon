@@ -3,8 +3,9 @@
  * wizard) needs to find a post's channel and ts, so it is useful for minutes. 30 days is far
  * past any edit and keeps the table (and its AUTOINCREMENT counter) from growing without bound.
  *
- * Run from the hourly cron, best-effort: this is a janitor, so a missing table (schema not applied
- * yet) or a D1 error is logged and never propagates to the other cron jobs.
+ * Run from the hourly cron (only when a Slack workspace secret exists), best-effort: this is a
+ * janitor, so a missing table (schema not applied yet: a quiet log line) or a D1 error is logged and
+ * never propagates to the other cron jobs.
  */
 import type { D1Database } from "@cloudflare/workers-types";
 
@@ -39,6 +40,11 @@ export async function sweepSlackPosts(db: D1Database, opts: SlackPostSweepOption
       .run();
     return res.meta?.changes ?? 0;
   } catch (err) {
+    // A schema that is not applied yet is expected before the first Slack rollout: not an error.
+    if (/no such table/i.test(String(err))) {
+      console.log("[worker] slack_posts retention skipped: table missing");
+      return 0;
+    }
     console.error("[worker] slack_posts retention sweep failed", { error: String(err) });
     return 0;
   }

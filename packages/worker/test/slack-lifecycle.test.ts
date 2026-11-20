@@ -13,7 +13,8 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import worker from "../src/index";
 import d1Schema from "../src/d1-schema.sql?raw";
 import { sha256Hex } from "../src/credentials";
-import { slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
+import { hasSlackWorkspaceSecret, slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
+import { createTelegramClient } from "../src/telegram";
 import { SLACK_POST_SWEEP_CAP, SLACK_POST_TTL_MS, sweepSlackPosts } from "../src/chat/slack-posts";
 import { slackArchiveUrl } from "../src/slack";
 import { resolveMentionKeyboard } from "../src/mention-links";
@@ -103,7 +104,7 @@ function slack(method: string, reply: Record<string, unknown>) {
 const methods = () => slackCalls.map((c) => c.method);
 
 async function seedChannel(teamId: string, channelId: string): Promise<number> {
-  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
+  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, ?, ?, 1)")
     .bind(teamId, channelId, Date.now())
     .run();
   const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
@@ -201,7 +202,19 @@ describe("sweepSlackPosts", () => {
       prepare: () => ({ bind: () => ({ run: async () => Promise.reject(new Error("D1_ERROR")) }) }),
     } as unknown as D1Database;
     expect(await sweepSlackPosts(rejecting)).toBe(0);
-    expect(err).toHaveBeenCalledTimes(2);
+    // Only the real D1 error is an error: a missing table is a quiet log line (see below).
+    expect(err).toHaveBeenCalledTimes(1);
+  });
+
+  it("a missing table is a console.log, not an error", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const missing = {
+      prepare: () => ({ bind: () => ({ run: async () => Promise.reject(new Error("D1_ERROR: no such table: slack_posts")) }) }),
+    } as unknown as D1Database;
+    expect(await sweepSlackPosts(missing)).toBe(0);
+    expect(err).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -235,6 +248,39 @@ describe("scheduled", () => {
   });
 });
 
+describe("scheduled: the slack_posts sweep only runs when Slack is configured", () => {
+  const run = (e: Env, scheduledTime: number) =>
+    worker.scheduled({ scheduledTime, cron: "0 * * * *", noRetry() {} } as unknown as ScheduledController, e);
+  const oldPost = async (team: string) => {
+    await env.DB.prepare("INSERT INTO slack_posts (team_id, channel_id, ts, text, created_at) VALUES (?, 'C1', '8.1', 'x', ?)")
+      .bind(team, Date.now() - SLACK_POST_TTL_MS - DAY)
+      .run();
+  };
+  const count = async (team: string) =>
+    (await env.DB.prepare("SELECT COUNT(*) AS n FROM slack_posts WHERE team_id = ?").bind(team).first<{ n: number }>())!.n;
+
+  it("a worker with no SLACK_WORKSPACE_* secret leaves slack_posts alone", async () => {
+    const team = `TNOSLACK${stamp()}`;
+    await oldPost(team);
+    expect(hasSlackWorkspaceSecret({ ...env } as unknown as Env)).toBe(false);
+    await run({ ...env } as unknown as Env, Date.UTC(2031, 0, 15, 5, 0, 0));
+    expect(await count(team)).toBe(1);
+  });
+
+  it("with one, it sweeps", async () => {
+    const m = await mkMachine();
+    const team = m.ws.teamId;
+    await oldPost(team);
+    await run(envFor([m]), Date.UTC(2031, 0, 15, 5, 0, 0));
+    expect(await count(team)).toBe(0);
+  });
+
+  it("hasSlackWorkspaceSecret counts any SLACK_WORKSPACE_* key, valid or not, and nothing else", () => {
+    expect(hasSlackWorkspaceSecret({ SLACK_NOTIFY_OWNER: "x" } as unknown as Env)).toBe(false);
+    expect(hasSlackWorkspaceSecret({ SLACK_WORKSPACE_DEVBOX: "not json" } as unknown as Env)).toBe(true);
+  });
+});
+
 // ─── reaper ────────────────────────────────────────────────────────────────
 
 describe("topic reaper on Slack rows", () => {
@@ -264,6 +310,114 @@ describe("topic reaper on Slack rows", () => {
     expect(res.closedOrphans).toBeGreaterThanOrEqual(1);
     expect(slackCalls.find((c) => c.method === "conversations.archive")?.params.get("channel")).toBe(channelId);
     expect((await getBySession(env.DB, sessionId))?.state).toBe("closed");
+  });
+});
+
+describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () => {
+  const TG_CHAT = "-100777";
+  const NOW = 400 * DAY;
+
+  async function seedOrphan(machineId: string, chat: { ws: SlackWorkspace } | { tg: string }) {
+    const sessionId = await seedSession(machineId, 1000);
+    if ("ws" in chat) {
+      await seedSlackTopic(sessionId, machineId, chat.ws);
+    } else {
+      await reserve(env.DB, { sessionId, machineId, chatId: chat.tg, name: "tg" });
+      await finalize(env.DB, {
+        sessionId,
+        chatId: chat.tg,
+        messageThreadId: 100 + ++counter,
+        name: "tg",
+        provisional: false,
+      });
+    }
+    return sessionId;
+  }
+
+  const states = async (ids: string[]) => Promise.all(ids.map(async (id) => (await getBySession(env.DB, id))?.state));
+
+  function tgFake(answers: Array<"ok" | "limited">) {
+    const closes: number[] = [];
+    return {
+      closes,
+      client: {
+        ...createTelegramClient("unused"),
+        closeForumTopic: async (o: { messageThreadId: number }) => {
+          closes.push(o.messageThreadId);
+          return answers.shift() === "limited"
+            ? { ok: false as const, kind: "rate_limited" as const, retryAfter: 5 }
+            : { ok: true as const, result: true as const };
+        },
+      },
+    };
+  }
+
+  it("a Slack 429 skips the remaining Slack rows but still closes every Telegram row, and reports rateLimited", async () => {
+    const m = await mkMachine();
+    const slackIds = [await seedOrphan(m.machineId, { ws: m.ws }), await seedOrphan(m.machineId, { ws: m.ws })];
+    const tgIds = [await seedOrphan(m.machineId, { tg: TG_CHAT }), await seedOrphan(m.machineId, { tg: TG_CHAT })];
+    // One archive only: a second Slack call would find no interceptor and fail the test.
+    fetchMock
+      .get("https://slack.com")
+      .intercept({ method: "POST", path: "/api/conversations.archive" })
+      .reply(429, { ok: false, error: "ratelimited" }, { headers: { "retry-after": "5" } });
+    const tg = tgFake(["ok", "ok"]);
+
+    const res = await closeOrphanedTopics(env.DB, {
+      botToken: "unused",
+      now: NOW,
+      limit: 50,
+      env: envFor([m]),
+      tgClient: tg.client,
+    });
+
+    expect(res.rateLimited).toBe(true);
+    expect(res.closedOrphans).toBe(2);
+    expect(tg.closes).toHaveLength(2);
+    expect(await states(tgIds)).toEqual(["closed", "closed"]);
+    // The limited row and the skipped one both stay open for the next tick.
+    expect(await states(slackIds)).toEqual(["open", "open"]);
+  });
+
+  it("a Telegram 429 skips the remaining Telegram rows but still closes the Slack rows", async () => {
+    const m = await mkMachine();
+    const slackIds = [await seedOrphan(m.machineId, { ws: m.ws }), await seedOrphan(m.machineId, { ws: m.ws })];
+    const tgIds = [await seedOrphan(m.machineId, { tg: TG_CHAT }), await seedOrphan(m.machineId, { tg: TG_CHAT })];
+    slack("conversations.archive", { ok: true });
+    slack("conversations.archive", { ok: true });
+    const tg = tgFake(["limited", "ok"]);
+
+    const res = await closeOrphanedTopics(env.DB, {
+      botToken: "unused",
+      now: NOW,
+      limit: 50,
+      env: envFor([m]),
+      tgClient: tg.client,
+    });
+
+    expect(res.rateLimited).toBe(true);
+    expect(res.closedOrphans).toBe(2);
+    expect(tg.closes).toHaveLength(1);
+    expect(await states(slackIds)).toEqual(["closed", "closed"]);
+    expect(await states(tgIds)).toEqual(["open", "open"]);
+  });
+
+  it("Telegram only: a 429 still stops at that row and reports rateLimited, as before", async () => {
+    const m = await mkMachine();
+    const tgIds = [await seedOrphan(m.machineId, { tg: TG_CHAT }), await seedOrphan(m.machineId, { tg: TG_CHAT })];
+    const tg = tgFake(["limited", "ok"]);
+    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, tgClient: tg.client });
+    expect(res).toEqual({ closedOrphans: 0, rateLimited: true });
+    expect(tg.closes).toHaveLength(1);
+    expect(await states(tgIds)).toEqual(["open", "open"]);
+  });
+
+  it("no 429 anywhere: rateLimited is false", async () => {
+    const m = await mkMachine();
+    await seedOrphan(m.machineId, { tg: TG_CHAT });
+    const tg = tgFake(["ok"]);
+    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, tgClient: tg.client });
+    expect(res).toEqual({ closedOrphans: 1, rateLimited: false });
   });
 });
 

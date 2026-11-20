@@ -187,6 +187,10 @@ export async function closeOrphanedTopics(
 
   const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let closedOrphans = 0;
+  // A 429 limits ONE provider, so it stops that transport's remaining rows and no others: Slack
+  // being limited must not leave Telegram orphans open until tomorrow's tick, nor the reverse.
+  // Telegram-only (or Slack-only) runs therefore behave exactly as the single flag did.
+  const limited = new Set<"slack" | "telegram">();
 
   for (const row of rows) {
     if (row.message_thread_id === null) {
@@ -195,13 +199,17 @@ export async function closeOrphanedTopics(
       continue;
     }
 
+    const transport = isSlackChatId(row.chat_id) ? "slack" : "telegram";
+    if (limited.has(transport)) continue;
+
     const res = await tgFor(row.chat_id).closeForumTopic({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });
 
     if (!res.ok && res.kind === "rate_limited") {
-      return { closedOrphans, rateLimited: true };
+      limited.add(transport);
+      continue;
     }
 
     // Everything that is not a 429 marks the row closed — including a GENERIC failure.
@@ -219,7 +227,7 @@ export async function closeOrphanedTopics(
     closedOrphans++;
   }
 
-  return { closedOrphans, rateLimited: false };
+  return { closedOrphans, rateLimited: limited.size > 0 };
 }
 
 /**

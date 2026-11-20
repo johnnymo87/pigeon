@@ -70,6 +70,16 @@ export interface ResolveTopicOptions {
 /** How long a superseded conversation's close is awaited before the notification carries on. */
 export const SUPERSEDE_CLOSE_BOUND_MS = 3_000;
 
+/**
+ * A row younger than this is never superseded. Worker isolates pick up a changed
+ * `SLACK_WORKSPACE_*` secret one at a time, so for a while some resolve a machine to Slack and
+ * others to Telegram. Without a floor, each flips the session's conversation back and forth (every
+ * flip archives a channel and mints another). A row that young was almost certainly made by the
+ * other side of that overlap; the loser answers `topic_in_other_chat` (unthreaded, healed at the
+ * next supersede once the rollout settles and the row has aged).
+ */
+export const SUPERSEDE_MIN_AGE_MS = 5 * 60_000;
+
 export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
 
 /**
@@ -186,6 +196,7 @@ export async function resolveTopic(
   async function maybeSupersede(row: TopicRow): Promise<boolean> {
     if (!opts.supersede || superseded) return false;
     if (isSlackChatId(row.chat_id) === isSlackChatId(opts.chatId)) return false;
+    if ((opts.now ?? Date.now()) - row.created_at < SUPERSEDE_MIN_AGE_MS) return false;
     superseded = true;
     const deleted = await deleteTopicBySession(db, opts.sessionId, row.chat_id, row.message_thread_id);
     console.warn("[worker] superseding the session's conversation in the other transport", {

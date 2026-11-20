@@ -157,7 +157,7 @@ function slack(method: string, reply: Record<string, unknown>) {
 }
 
 async function seedChannel(ws: SlackWorkspace, channelId: string, namedKey?: string): Promise<number> {
-  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at) VALUES (?, ?, ?)")
+  await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, ?, ?, 1)")
     .bind(ws.teamId, channelId, Date.now())
     .run();
   const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")

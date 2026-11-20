@@ -18,6 +18,9 @@
  * Telegram-shaped contract) start here. Telegram message-thread ids and message ids stay far
  * below 2^40, so a handle at or above it can only be a Slack one. The tables seed a row at
  * 2^40 - 1 so AUTOINCREMENT hands out values from 2^40 without writing `sqlite_sequence`.
+ *
+ * A NEGATIVE message id is never a handle: it is the placeholder for a post Slack accepted but D1
+ * would not record, so it cannot be edited or replied to (it resolves as an unknown handle).
  */
 export const SLACK_HANDLE_MIN = 2 ** 40;
 
@@ -125,6 +128,11 @@ export function slackWorkspaceForTeam(env: Env, teamId: string): SlackWorkspace 
     if (ws && ws.teamId === teamId) return ws;
   }
   return null;
+}
+
+/** True when the worker has at least one `SLACK_WORKSPACE_*` secret (valid or not): Slack is in play. */
+export function hasSlackWorkspaceSecret(env: Env): boolean {
+  return Object.keys(bag(env)).some((key) => key.startsWith(SECRET_PREFIX));
 }
 
 /** The chat address of a workspace; `isSlackChatId` in `./index` recognises it. */
