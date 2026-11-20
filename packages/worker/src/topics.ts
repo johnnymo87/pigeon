@@ -206,6 +206,21 @@ export async function reserve(
 }
 
 /**
+ * The `AND chat_id = ?` clause a topic CAS carries when the caller names its chat
+ * (chat-transport phase 2, pigeon-4ogz.1, spec §1 "Every topic CAS is scoped to chat_id").
+ *
+ * A session's row can move between chats while a provider call is in flight: a machine that
+ * flips to Slack supersedes its sessions' Telegram rows with Slack ones, and a Telegram create can
+ * take 57s (pigeon-iqpd). Unscoped, that late create's finalize would write a Telegram thread id
+ * into the Slack row, and its failure cleanup would delete the Slack reservation. Scoped, both
+ * miss. The chat is optional only so the long-standing direct calls in the Telegram test suite
+ * keep their meaning; `resolveTopic` always passes it.
+ */
+function chatScope(chatId: string | undefined): { sql: string; binds: string[] } {
+  return chatId === undefined ? { sql: "", binds: [] } : { sql: " AND chat_id = ?", binds: [chatId] };
+}
+
+/**
  * Finalize a reserved topic row with its assigned message_thread_id.
  * CAS operation: only succeeds if message_thread_id IS NULL (prevents late winner overwriting).
  * Optionally updates name if provided.
@@ -221,18 +236,21 @@ export async function finalize(
     messageThreadId: number;
     name?: string | null;
     provisional?: boolean;
+    /** The chat the topic was created in. Every production caller passes it (see `chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   if (opts.name !== undefined) {
     const res = await db
       .prepare(
         `UPDATE topics
          SET message_thread_id = ?, name = ?, name_provisional = ?, updated_at = ?
-         WHERE session_id = ? AND message_thread_id IS NULL`,
+         WHERE session_id = ? AND message_thread_id IS NULL${scope.sql}`,
       )
-      .bind(opts.messageThreadId, opts.name, opts.provisional ? 1 : 0, now, opts.sessionId)
+      .bind(opts.messageThreadId, opts.name, opts.provisional ? 1 : 0, now, opts.sessionId, ...scope.binds)
       .run();
     return (res.meta.changes ?? 0) > 0;
   } else {
@@ -240,9 +258,9 @@ export async function finalize(
       .prepare(
         `UPDATE topics
          SET message_thread_id = ?, updated_at = ?
-         WHERE session_id = ? AND message_thread_id IS NULL`,
+         WHERE session_id = ? AND message_thread_id IS NULL${scope.sql}`,
       )
-      .bind(opts.messageThreadId, now, opts.sessionId)
+      .bind(opts.messageThreadId, now, opts.sessionId, ...scope.binds)
       .run();
     return (res.meta.changes ?? 0) > 0;
   }
@@ -258,17 +276,20 @@ export async function rename(
   opts: {
     sessionId: string;
     name: string;
+    /** Scope to the chat whose topic was renamed (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET name = ?, name_provisional = 0, updated_at = ?
-       WHERE session_id = ?`,
+       WHERE session_id = ?${scope.sql}`,
     )
-    .bind(opts.name, now, opts.sessionId)
+    .bind(opts.name, now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
 }
@@ -291,17 +312,20 @@ export async function renameProvisional(
   opts: {
     sessionId: string;
     name: string;
+    /** Scope to the chat whose topic was renamed (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET name = ?, name_provisional = 0, updated_at = ?
-       WHERE session_id = ? AND name_provisional = 1`,
+       WHERE session_id = ? AND name_provisional = 1${scope.sql}`,
     )
-    .bind(opts.name, now, opts.sessionId)
+    .bind(opts.name, now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }
@@ -313,17 +337,20 @@ export async function markClosed(
   db: D1Database,
   opts: {
     sessionId: string;
+    /** Scope to the chat whose topic was closed (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET state = 'closed', closed_at = ?, updated_at = ?
-       WHERE session_id = ?`,
+       WHERE session_id = ?${scope.sql}`,
     )
-    .bind(now, now, opts.sessionId)
+    .bind(now, now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
 }
@@ -335,17 +362,20 @@ export async function markOpen(
   db: D1Database,
   opts: {
     sessionId: string;
+    /** Scope to the chat whose topic was reopened (`chatScope`). */
+    chatId?: string;
     now?: number;
   },
 ): Promise<boolean> {
   const now = opts.now ?? Date.now();
+  const scope = chatScope(opts.chatId);
   const res = await db
     .prepare(
       `UPDATE topics
        SET state = 'open', closed_at = NULL, updated_at = ?
-       WHERE session_id = ?`,
+       WHERE session_id = ?${scope.sql}`,
     )
-    .bind(now, opts.sessionId)
+    .bind(now, opts.sessionId, ...scope.binds)
     .run();
   return (res.meta.rows_written ?? 0) > 0;
 }
@@ -357,10 +387,13 @@ export async function markOpen(
 export async function deleteBySession(
   db: D1Database,
   sessionId: string,
+  /** Scope to the chat whose create failed (`chatScope`). */
+  chatId?: string,
 ): Promise<boolean> {
+  const scope = chatScope(chatId);
   const res = await db
-    .prepare("DELETE FROM topics WHERE session_id = ? AND message_thread_id IS NULL")
-    .bind(sessionId)
+    .prepare(`DELETE FROM topics WHERE session_id = ? AND message_thread_id IS NULL${scope.sql}`)
+    .bind(sessionId, ...scope.binds)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }

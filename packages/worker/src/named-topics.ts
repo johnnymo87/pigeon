@@ -19,7 +19,8 @@ import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { isAllowedChatId } from "./notifications";
 import { topicsEnabled } from "./topics";
-import { createTelegramClient, getTelegramErrorDetails, type TelegramClient } from "./telegram";
+import { getTelegramErrorDetails } from "./telegram";
+import { transportForChat, type ChatTransport } from "./chat";
 
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
@@ -104,11 +105,12 @@ export async function resolveNamedTopic(
     staleThreadId?: number;
     botToken: string;
     now?: number;
-    tgClient?: TelegramClient;
+    /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
+    tgClient?: ChatTransport;
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = opts.tgClient ?? createTelegramClient(opts.botToken);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 
@@ -264,7 +266,7 @@ export async function maybeAnswerInNamedTopic(
     .bind(now, chatId, row.topic_key, now - NAMED_TOPIC_HINT_INTERVAL_MS)
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
-    const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN);
     const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
       console.warn("[worker] named topic hint failed", { key: row.topic_key, details: getTelegramErrorDetails(res) });

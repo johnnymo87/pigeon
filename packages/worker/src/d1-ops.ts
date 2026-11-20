@@ -5,7 +5,7 @@
  * command-queue.ts with D1-native async queries.
  */
 
-import { createTelegramClient } from "./telegram";
+import { transportForChat } from "./chat";
 import { MAX_SESSIONS } from "./sessions";
 
 export const LEASE_TIMEOUT_MS = 60_000; // 60s lease expiry
@@ -354,7 +354,7 @@ export async function checkSessionHighWaterAlert(
 
   let alerted = false;
   try {
-    const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+    const client = transportForChat(firstChatId, env.TELEGRAM_BOT_TOKEN);
     const res = await client.sendMessage({ chatId: firstChatId, text });
     if (res.ok) {
       alerted = true;

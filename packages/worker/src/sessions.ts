@@ -1,6 +1,6 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs, refusedCsvForSql, type Principal } from "./credentials";
-import { createTelegramClient } from "./telegram";
+import { transportForChat } from "./chat";
 import { topicsEnabled, getBySession, markClosed } from "./topics";
 import { withD1, StorageError } from "./d1";
 
@@ -285,12 +285,12 @@ async function unregisterSession(
     if (topic && topic.state === "open") {
       // Mark closed in D1 before touching Telegram, so a failed/timed-out Telegram call still
       // leaves a row the reaper will collect.
-      await markClosed(db, { sessionId });
+      await markClosed(db, { sessionId, chatId: topic.chat_id });
       // A reservation row (NULL thread id) has no Telegram topic yet; closeForumTopic on it is a
       // guaranteed 400.
       if (topic.message_thread_id !== null) {
         try {
-          const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+          const client = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN);
           await client.closeForumTopic({
             chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,

@@ -1,7 +1,8 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs } from "./credentials";
 import { withD1, StorageError } from "./d1";
-import { createTelegramClient, getTelegramErrorDetails } from "./telegram";
+import { getTelegramErrorDetails } from "./telegram";
+import { transportForChat } from "./chat";
 import {
   getBySession,
   isPlaceholderTitle,
@@ -21,7 +22,7 @@ export async function editTopicName(
     return { ok: false, error: "topic has no message thread" };
   }
 
-  const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
+  const tg = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN);
   const editRes = await tg.editForumTopic({
     chatId: topic.chat_id,
     messageThreadId: topic.message_thread_id,
@@ -39,7 +40,7 @@ export async function editTopicName(
     return { ok: false, error: getTelegramErrorDetails(editRes) };
   }
 
-  await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, name }));
+  await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, chatId: topic.chat_id, name }));
   return { ok: true };
 }
 
