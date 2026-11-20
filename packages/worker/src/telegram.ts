@@ -195,7 +195,8 @@ export function logTelegramCall(method: string, elapsedMs: number, outcome: stri
  * Every exported method routes through here. That is the point: a per-method wrapper would
  * have to be remembered at each of the twelve call sites, and the thirteenth would silently
  * go unmeasured. The one Telegram fetch that is not a Bot API method, the file download, has
- * its own function below (`downloadFile`) and is timed the same way.
+ * its own function below (`downloadFile`). It is timed to response headers only, because its
+ * body is streamed into R2 by the caller, and it has no abort (unchanged from before it moved).
  *
  * Two things about the measurement are easy to misread:
  *

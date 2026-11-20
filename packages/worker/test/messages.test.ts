@@ -175,6 +175,36 @@ describe("POST /messages/send", () => {
     expect(res.status).toBe(502);
   });
 
+  test("explicit null optional fields mean absent, not a 400 (a 400 would make the daemon fall back)", async () => {
+    const sends = onTelegram("sendMessage", { data: { ok: true, result: { message_id: 3 } } });
+    const res = await call("/messages/send", {
+      chatId: CHAT,
+      text: "x",
+      messageThreadId: null,
+      entities: null,
+      urlButtons: null,
+      timeoutMs: null,
+    });
+    expect(res.status).toBe(200);
+    expect(sends).toEqual([{ chat_id: CHAT, text: "x" }]);
+  });
+
+  test("a non-JSON HTTP 400 (not Telegram speaking) is a 502, not 'Telegram said no'", async () => {
+    onTelegram("sendMessage", { status: 400, data: "<html>bad gateway-ish</html>", raw: true });
+    const res = await call("/messages/send", { chatId: CHAT, text: "x" });
+    expect(res.status).toBe(502);
+  });
+
+  test("URL buttons are rebuilt as {text, url}; extra keys never reach Telegram", async () => {
+    const sends = onTelegram("sendMessage", { data: { ok: true, result: { message_id: 1 } } });
+    await call("/messages/send", {
+      chatId: CHAT,
+      text: "x",
+      urlButtons: [[{ text: "a", url: "https://e.x/1", callback_data: "cmd:T:x" }]],
+    });
+    expect(sends[0].reply_markup).toEqual({ inline_keyboard: [[{ text: "a", url: "https://e.x/1" }]] });
+  });
+
   test("timeoutMs above the cap is rejected", async () => {
     const res = await call("/messages/send", { chatId: CHAT, text: "x", timeoutMs: MESSAGES_SEND_MAX_TIMEOUT_MS + 1 });
     expect(res.status).toBe(400);

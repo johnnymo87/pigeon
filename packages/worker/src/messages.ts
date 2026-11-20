@@ -63,26 +63,34 @@ function isPositiveInt(v: unknown): v is number {
   return typeof v === "number" && Number.isInteger(v) && v > 0;
 }
 
+// Optional fields: `undefined` and an explicit `null` both mean absent. Rejecting `null` with a
+// 400 would read to the daemon as "this worker cannot deliver" and send every alert direct.
+
 function parseTimeout(v: unknown): number | null | undefined {
-  if (v === undefined) return undefined;
+  if (v == null) return undefined;
   if (!isPositiveInt(v) || v > MESSAGES_SEND_MAX_TIMEOUT_MS) return null;
   return v;
 }
 
 type UrlButtons = Array<Array<{ text: string; url: string }>>;
 
+/** URL buttons only, rebuilt as `{text, url}` so no other button field can reach Telegram. */
 function parseUrlButtons(v: unknown): UrlButtons | null | undefined {
-  if (v === undefined) return undefined;
+  if (v == null) return undefined;
   if (!Array.isArray(v)) return null;
+  const rows: UrlButtons = [];
   for (const row of v) {
     if (!Array.isArray(row)) return null;
+    const out: Array<{ text: string; url: string }> = [];
     for (const b of row) {
       if (!b || typeof b !== "object") return null;
       const { text, url } = b as Record<string, unknown>;
       if (typeof text !== "string" || typeof url !== "string") return null;
+      out.push({ text, url });
     }
+    rows.push(out);
   }
-  return v as UrlButtons;
+  return rows;
 }
 
 function descriptionOf(res: { response?: unknown; description?: string }): string | undefined {
@@ -101,7 +109,14 @@ function toResponse<T>(res: TgResult<T>, okBody: (result: T) => Record<string, u
   if (res.kind === "rate_limited") {
     return Response.json({ ok: false, telegram: { status: 429, retryAfter: res.retryAfter, ...withDescription } });
   }
-  if (res.kind === "thread_not_found" || res.kind === "topic_not_modified" || (res.kind === "error" && res.errorCode === 400)) {
+  // A 400 counts as Telegram speaking only when Telegram's JSON body came back. A bare HTTP 400
+  // with an unparseable body (an intermediary's error page) says nothing about the payload, so
+  // it is a delivery failure like any other.
+  if (
+    res.kind === "thread_not_found" ||
+    res.kind === "topic_not_modified" ||
+    (res.kind === "error" && res.errorCode === 400 && res.response !== undefined)
+  ) {
     return Response.json({ ok: false, telegram: { status: 400, ...withDescription } });
   }
   const status = res.kind === "error" ? res.errorCode : undefined;
@@ -150,7 +165,17 @@ async function bounded(
   }
 }
 
+/**
+ * Time left of the caller's bound. The clock starts at handler entry, not at the Telegram call,
+ * so auth (a D1 lookup on a cache miss) is charged against it too and the daemon's slightly
+ * longer worker leg sees a definite answer rather than racing an in-flight post.
+ */
+function remaining(startedAt: number, timeoutMs: number): number {
+  return Math.max(1, timeoutMs - (Date.now() - startedAt));
+}
+
 export async function handleSendMessage(env: Env, request: Request): Promise<Response> {
+  const startedAt = Date.now();
   if (!(await authenticate(request, env))) return unauthorized();
   const body = await readBody(request);
   if (body instanceof Response) return body;
@@ -159,8 +184,8 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
   const text = typeof body.text === "string" ? body.text : "";
   const urlButtons = parseUrlButtons(body.urlButtons);
   const timeoutMs = parseTimeout(body.timeoutMs);
-  const thread = body.messageThreadId;
-  const entities = body.entities;
+  const thread = body.messageThreadId ?? undefined;
+  const entities = body.entities ?? undefined;
   if (
     !chatId ||
     !text ||
@@ -179,7 +204,7 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
   }
 
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-  return bounded(timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS, async (signal) =>
+  return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
       await tg.sendMessage({
         chatId,
@@ -195,6 +220,7 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
 }
 
 export async function handleUnpinTopic(env: Env, request: Request): Promise<Response> {
+  const startedAt = Date.now();
   if (!(await authenticate(request, env))) return unauthorized();
   const body = await readBody(request);
   if (body instanceof Response) return body;
@@ -209,7 +235,7 @@ export async function handleUnpinTopic(env: Env, request: Request): Promise<Resp
   }
 
   const tg = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-  return bounded(MESSAGES_SEND_DEFAULT_TIMEOUT_MS, async (signal) =>
+  return bounded(remaining(startedAt, MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(await tg.unpinAllForumTopicMessages({ chatId, messageThreadId: thread, signal }), () => ({})),
   );
 }
