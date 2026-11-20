@@ -1,0 +1,116 @@
+{
+  "_metadata": {
+    "major_version": 1,
+    "minor_version": 1
+  },
+  "display_information": {
+    "name": "pigeon {{MACHINE}}",
+    "description": "Routes chat to the agent sessions running on {{MACHINE}}.",
+    "background_color": "#2c2d30"
+  },
+  "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": false,
+      "messages_tab_read_only_enabled": true
+    },
+    "bot_user": {
+      "display_name": "pigeon",
+      "always_online": true
+    },
+    "slash_commands": [
+      {
+        "command": "/launch",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Start a headless session on a machine",
+        "usage_hint": "<machine> <dir> [--tag <tag>] <prompt>",
+        "should_escape": false
+      },
+      {
+        "command": "/kill",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "End this channel's session (or the one named)",
+        "usage_hint": "[<session-id>]",
+        "should_escape": false
+      },
+      {
+        "command": "/interrupt",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Interrupt the session's current turn",
+        "usage_hint": "[<session-id>]",
+        "should_escape": false
+      },
+      {
+        "command": "/compact",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Compact the session's conversation",
+        "usage_hint": "[<session-id>]",
+        "should_escape": false
+      },
+      {
+        "command": "/retitle",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Rename this session's channel",
+        "usage_hint": "<new title>",
+        "should_escape": false
+      },
+      {
+        "command": "/mcp",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "List, enable or disable the session's MCP servers",
+        "usage_hint": "[<session-id>] list | enable <server> | disable <server>",
+        "should_escape": false
+      },
+      {
+        "command": "/model",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "List models, or set the session's model",
+        "usage_hint": "[<session-id>] [<provider/model>]",
+        "should_escape": false
+      },
+      {
+        "command": "/tag",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Tag sessions for spend attribution",
+        "usage_hint": "[list | <tag> | <session-id> <tag>]",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "chat:write",
+        "channels:manage",
+        "channels:read",
+        "channels:history",
+        "channels:join",
+        "commands",
+        "files:read",
+        "files:write",
+        "incoming-webhook"
+      ],
+      "user": [
+        "channels:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "request_url": "{{BASE_URL}}/slack/{{MACHINE}}/events",
+      "bot_events": [
+        "message.channels"
+      ]
+    },
+    "incoming_webhooks": {
+      "incoming_webhooks_enabled": true
+    },
+    "interactivity": {
+      "is_enabled": true,
+      "request_url": "{{BASE_URL}}/slack/{{MACHINE}}/interactivity"
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
