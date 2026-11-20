@@ -180,19 +180,19 @@ page*), under `umask 077`:
 
 ### 6. Notifications (Jonathan's account, this browser session)
 
-Spec D7: session channels must not push; questions, error alerts, coordinator channels and
-`#alerts` must. pigeon gets there with mentions, and the preferences below are what make mentions
-the line:
+Spec D7 (revised 2026-11-20): **nothing pushes to start**; Jonathan turns categories on later
+(`SLACK_NOTIFY_OWNER`, `PIGEON_SLACK_NOTIFY_OWNER`). A push happens only on an @-mention, and pigeon
+mentions him only for enabled categories, so with these preferences and every category off, nothing
+pushes:
 
 0. *Preferences → Availability → Allow notifications*: **Every day, 12:00 AM to Midnight**. A new
    workspace defaults to weekdays 9:00–17:00 and pauses everything outside it, `#alerts` included.
 1. *Preferences → Notifications → Notify me about*: **"Direct messages, mentions & keywords"**
    ("Mentions only"). Session channels then push only when pigeon @-mentions him (questions, error
    alerts).
-2. Per channel **"All new messages"** (channel name → notification bell, or *Change notifications*)
-   on `#alerts`, on `#em-alerts` (devbox), and on the channel healthchecks.io posts to (`#alerts`
-   unless `pigeon-4ogz.9` chose another; if it creates one, set it then). These receive posts from
-   incoming webhooks and healthchecks.io, which may not mention him.
+2. **No per-channel override.** `#alerts` and `#em-alerts` stay at *Just mentions* (the bell →
+   *Edit notifications*). To make one push on every post later (healthchecks.io cannot mention),
+   set it to *All new posts* there.
 3. Mobile: check that *Use different settings for my mobile devices* is **off**, so the phone
    follows desktop. Do this check on the phone if Jonathan has the workspace there; otherwise
    record it as unchecked.
@@ -357,6 +357,8 @@ What setup actually looked like, differing from the steps above:
 - **New workspaces pause notifications outside weekdays 9:00–17:00** (*Preferences →
   Availability*). That would silence `#alerts` at night, so it was set to *Every day*, 12:00 AM
   to *Midnight* (the last end option, below the visible list). Step 6 needs this added.
+- `#alerts` and `#em-alerts` were first set to *All new posts*, then set back to *Just mentions*
+  the same day (`pigeon-4ogz.18`, no pushes to start).
 - Notification pref is *Mentions and direct messages* (which also counts `@channel`/`@here`, so
   pigeon must never use those). *Thread replies* was left on (Slack's default), so a bot reply in a
   thread Jonathan follows still pushes.
