@@ -27,6 +27,7 @@ export async function editTopicName(
     chatId: topic.chat_id,
     messageThreadId: topic.message_thread_id,
     name,
+    sessionId: topic.session_id,
   });
 
   // TOPIC_NOT_MODIFIED means Telegram's name already equals the requested one, so the

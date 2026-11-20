@@ -1,5 +1,5 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { transportForChat, type ChatTransport } from "./chat";
+import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
   listOrphaned,
   listReapable,
@@ -112,7 +112,7 @@ export interface TopicReaperResult {
 /**
  * Job 1 — reap. Delete topics with state='closed' AND closed_at < now - 30 days.
  * Capped at limit per run (default 5). On thread_not_found, drops the D1 row anyway.
- * NULL message_thread_id rows skip Telegram entirely.
+ * NULL message_thread_id rows skip Telegram entirely, and so do Slack rows (nothing to delete).
  */
 export async function reapTopics(
   db: D1Database,
@@ -137,6 +137,14 @@ export async function reapTopics(
   for (const row of rows) {
     if (row.message_thread_id === null) {
       const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, null);
+      if (deleted) reaped++;
+      continue;
+    }
+
+    // Slack has nothing to delete: a channel can only be archived (which the orphan-closer did
+    // when the row closed), never removed. The row is just forgotten, with no provider call.
+    if (isSlackChatId(row.chat_id)) {
+      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
       if (deleted) reaped++;
       continue;
     }

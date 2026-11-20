@@ -20,7 +20,7 @@
  */
 import type { D1Database } from "@cloudflare/workers-types";
 import type { Principal } from "../credentials";
-import { isAllowedChatId } from "../notifications";
+import { isAllowedChatId } from "./allowlist";
 import { isSlackChatId } from "./index";
 import { SLACK_HANDLE_MIN, slackChatId, slackWorkspaceForMachine, slackWorkspaceForTeam, teamIdOfChat } from "./slack-config";
 import type { SlackWorkspace } from "./slack-config";
@@ -71,8 +71,6 @@ export type StoredAddress =
       /** The thread/handle to act in. Undefined on Slack means that workspace's `#alerts`. */
       threadId: number | undefined;
       slack: boolean;
-      /** The Slack address was derived from a numeric one (so the response must say where it went). */
-      rerouted: boolean;
     }
   | { ok: false; response: Response };
 
@@ -116,18 +114,18 @@ export async function authorizeStoredAddress(
     if (principal.kind !== "machine") return refuse();
     if (!slackWorkspaceForTeam(env, team)) return refuse();
     const own = machineSlackWorkspace(env, principal);
-    if (own && own.teamId === team) return { ok: true, chatId, threadId, slack: true, rerouted: false };
+    if (own && own.teamId === team) return { ok: true, chatId, threadId, slack: true };
     if (threadId === undefined) return refuse();
     if (!(await holdsCommandIn(db, principal.machineId, chatId, threadId))) return refuse();
-    return { ok: true, chatId, threadId, slack: true, rerouted: false };
+    return { ok: true, chatId, threadId, slack: true };
   }
   if (isSlackChatId(chatId)) return refuse(); // `slack:` with no team id
 
   const own = machineSlackWorkspace(env, principal);
   if (own && (threadId === undefined || threadId >= SLACK_HANDLE_MIN)) {
-    return { ok: true, chatId: slackChatId(own), threadId, slack: true, rerouted: true };
+    return { ok: true, chatId: slackChatId(own), threadId, slack: true };
   }
 
   if (!isAllowedChatId(chatId, env)) return refuse();
-  return { ok: true, chatId, threadId, slack: false, rerouted: false };
+  return { ok: true, chatId, threadId, slack: false };
 }

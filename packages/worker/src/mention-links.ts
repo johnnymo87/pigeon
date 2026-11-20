@@ -12,6 +12,8 @@
  *
  * Decoration only, so it FAILS OPEN: any error here yields no buttons, never a failed send.
  */
+import { isSlackChatId } from "./chat";
+import { slackConversationUrl } from "./chat/slack-url";
 
 /** Most buttons added to one notification, matching the daemon's MAX_ALERT_LINKS. */
 export const MAX_MENTION_LINKS = 8;
@@ -56,7 +58,15 @@ export function buttonLabel(topicName: string | null, mentionedId: string): stri
   return chars.length <= MAX_LABEL_CHARS ? label : `${chars.slice(0, MAX_LABEL_CHARS - 1).join("")}…`;
 }
 
-function topicUrl(chatId: string, threadId: number | null): string | null {
+async function topicUrl(
+  db: D1Database,
+  env: Env | undefined,
+  chatId: string,
+  threadId: number | null,
+): Promise<string | null> {
+  // A Slack row's link needs the channel id and the workspace's domain; without an env (a caller
+  // that has no secrets) there is no way to build it, so it gets no button.
+  if (isSlackChatId(chatId)) return env ? slackConversationUrl(db, env, chatId, threadId) : null;
   const m = /^-100(\d+)$/.exec(chatId);
   if (!m || typeof threadId !== "number" || !Number.isInteger(threadId) || threadId <= 0) return null;
   return `https://t.me/c/${m[1]}/${threadId}`;
@@ -73,6 +83,7 @@ export async function resolveMentionKeyboard(
   db: D1Database,
   text: string,
   selfId: string,
+  env?: Env,
 ): Promise<UrlKeyboard | undefined> {
   const ids = extractMentionedIds(text, selfId);
   if (ids.length === 0) return undefined;
@@ -94,7 +105,7 @@ export async function resolveMentionKeyboard(
       if (matches.length !== 1) continue;
       const row = matches[0]!;
       if (row.session_id === selfId || linked.has(row.session_id)) continue;
-      const url = topicUrl(row.chat_id, row.message_thread_id);
+      const url = await topicUrl(db, env, row.chat_id, row.message_thread_id);
       if (!url) continue;
       linked.add(row.session_id);
       rows.push([{ text: buttonLabel(row.name, id), url }]);

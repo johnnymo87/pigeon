@@ -3,7 +3,8 @@ import { authenticate } from "./credentials";
 import { getTelegramErrorDetails, isPermanentTopicFailure, TgResult } from "./telegram";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import { machineSlackWorkspace, resolveWorkerTarget } from "./chat/address";
-import { teamIdOfChat } from "./chat/slack-config";
+import { isAllowedChatId } from "./chat/allowlist";
+import { slackWorkspaceForTeam, teamIdOfChat } from "./chat/slack-config";
 import { SLACK_MARKDOWN_MAX } from "./chat/slack-render";
 import { errorClassOf } from "./slack";
 import { resolveTopic } from "./topic-manager";
@@ -11,6 +12,9 @@ import { deleteTopicBySession, topicsEnabled } from "./topics";
 import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
 import { hasButtons, resolveMentionKeyboard } from "./mention-links";
+
+// Kept importable from here: the allowlist moved to a leaf module to break an import cycle.
+export { isAllowedChatId };
 
 interface SendNotificationBody {
   sessionId: string;
@@ -220,17 +224,6 @@ export async function alertRelocation(
     });
     return false;
   }
-}
-
-export function isAllowedChatId(chatId: string | number, env: Env): boolean {
-  const raw = env.ALLOWED_CHAT_IDS;
-  if (!raw) return false;
-  const allowed = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (allowed.length === 0) return false;
-  return allowed.includes(String(chatId));
 }
 
 /**
@@ -580,7 +573,7 @@ export async function handleSendNotification(
     let linkMarkupResolved = false;
     const sendPlain = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
       if (!linkMarkupResolved) {
-        linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId);
+        linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId, env);
         linkMarkupResolved = true;
       }
       const result = await tg.sendMessage({
@@ -608,7 +601,7 @@ export async function handleSendNotification(
         if (!richLinkMarkupResolved) {
           richLinkMarkup = callerHasButtons
             ? undefined
-            : await resolveMentionKeyboard(db, richMarkdown!, sessionId);
+            : await resolveMentionKeyboard(db, richMarkdown!, sessionId, env);
           richLinkMarkupResolved = true;
         }
         const result = await tg.sendRichMessage({
@@ -953,7 +946,6 @@ export async function handleEditNotification(
     text?: string;
     replyMarkup?: unknown;
     entities?: unknown[];
-    notifyOwner?: boolean;
   };
 
   const { notificationId, text, replyMarkup, entities } = body;
@@ -971,10 +963,13 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
-  // A Slack post is editable only by a machine that is on that workspace: the shared key, a
-  // Telegram machine, or another team's machine never reaches Slack.
+  // A Slack post is editable only by a machine on that post's workspace: the shared key, a
+  // Telegram machine, or another team's machine never reaches Slack. When the post's team has no
+  // configured workspace (the secret was deleted) there is nothing to authorize against, so the
+  // call falls through to the transport's transient SLACK_UNAVAILABLE and the daemon retries.
+  const isSlackRow = isSlackChatId(row.chat_id);
   const rowTeam = teamIdOfChat(row.chat_id);
-  if (rowTeam !== null) {
+  if (isSlackRow && rowTeam !== null && slackWorkspaceForTeam(env, rowTeam)) {
     const ws = machineSlackWorkspace(env, principal);
     if (!ws || ws.teamId !== rowTeam) {
       return json({ error: "chat_not_allowed" }, 403);
@@ -990,7 +985,6 @@ export async function handleEditNotification(
     text,
     entities,
     replyMarkup,
-    ...(rowTeam !== null && body.notifyOwner === true ? { notifyOwner: true } : {}),
   });
 
   if (!telegramResult.ok) {
@@ -999,7 +993,7 @@ export async function handleEditNotification(
       {
         error: "Telegram API error",
         details,
-        ...(rowTeam !== null ? { errorClass: errorClassOf(details) ?? "upstream" } : {}),
+        ...(isSlackRow ? { errorClass: errorClassOf(details) ?? "upstream" } : {}),
       },
       502,
     );

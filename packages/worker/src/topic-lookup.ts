@@ -1,6 +1,8 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { withD1, StorageError } from "./d1";
+import { isSlackChatId } from "./chat";
+import { slackConversationUrl } from "./chat/slack-url";
 
 /**
  * Upper bound on one lookup batch. Keeps the `IN (...)` well under D1's bound-parameter
@@ -13,6 +15,12 @@ export interface TopicLookupEntry {
   chatId: string;
   messageThreadId: number | null;
   state: "open" | "closed";
+  /**
+   * The conversation's link, on Slack rows ONLY (`null` when it cannot be built: the workspace's
+   * secret is gone, or the handle has no conversation). A Telegram entry has no `url` field at
+   * all, so its shape is exactly what it always was; callers build Telegram links themselves.
+   */
+  url?: string | null;
 }
 
 /**
@@ -76,6 +84,9 @@ export async function handleTopicLookup(
         chatId: row.chat_id,
         messageThreadId: row.message_thread_id,
         state: row.state,
+        ...(isSlackChatId(row.chat_id)
+          ? { url: await withD1("topics.lookupUrl", slackConversationUrl(db, env, row.chat_id, row.message_thread_id)) }
+          : {}),
       };
     }
   } catch (err) {

@@ -12,6 +12,7 @@ import { handleWhoami } from "./credentials";
 import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./relay";
 import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
+import { sweepSlackPosts } from "./chat/slack-posts";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
@@ -216,6 +217,14 @@ export default {
       await checkSessionHighWaterAlert(env.DB, env);
     } catch (err) {
       console.error("Session high-water alert failed:", err);
+    }
+    try {
+      // Best-effort on its own (a missing table or a D1 error is logged inside), so it needs no
+      // wrapper to protect the jobs around it; the try is for the unexpected.
+      const swept = await sweepSlackPosts(env.DB);
+      if (swept > 0) console.log("[slack] slack_posts retention", { swept });
+    } catch (err) {
+      console.error("Slack post retention failed:", err);
     }
     try {
       // The orphan-closer is gated to a daily window (pigeon-4890) because each close posts a

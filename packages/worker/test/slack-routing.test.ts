@@ -427,6 +427,104 @@ describe("supersede", () => {
     expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("-100111");
   });
 
+  describe("a row that appears while resolveTopic is already running", () => {
+    const FOREIGN_CREATE = (created: number[], thread: number) => ({
+      ...createTelegramClient("unused"),
+      createForumTopic: async (o: { name: string }) => {
+        created.push(created.length + 1);
+        return { ok: true as const, result: { message_thread_id: thread, name: o.name, icon_color: 0 } };
+      },
+    });
+
+    it("loser path: the reserve is lost to the other transport's row, which is superseded and reserved again", async () => {
+      const m = await mkMachine({ slack: true });
+      const e = envFor([m]);
+      const sessionId = await seedSession(m.machineId);
+      let seeded: { channelId: string } | undefined;
+      // The first lookup (step 1) sees nothing; the Slack row lands right after it, so the
+      // reserve loses and the loser-path re-read is what finds the foreign row.
+      let lookups = 0;
+      const racing = new Proxy(env.DB, {
+        get(target, prop) {
+          if (prop !== "prepare") {
+            const v = Reflect.get(target, prop, target);
+            return typeof v === "function" ? v.bind(target) : v;
+          }
+          return (sql: string) => {
+            const stmt = target.prepare(sql);
+            if (sql !== "SELECT * FROM topics WHERE session_id = ?") return stmt;
+            return {
+              bind: (...args: unknown[]) => {
+                const bound = stmt.bind(...args);
+                return {
+                  first: async () => {
+                    const row = await bound.first();
+                    if (++lookups === 1) seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!);
+                    return row;
+                  },
+                };
+              },
+            };
+          };
+        },
+      }) as unknown as D1Database;
+      slack("conversations.archive", { ok: true });
+      const created: number[] = [];
+
+      const res = await resolveTopic(racing, {
+        sessionId,
+        machineId: m.machineId,
+        chatId: ALLOWED,
+        dir: "~/p",
+        title: "T",
+        botToken: "unused",
+        supersede: true,
+        env: e,
+        tgClient: FOREIGN_CREATE(created, 4242),
+      });
+      expect(res).toMatchObject({ ok: true, messageThreadId: 4242, created: true });
+      expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(seeded?.channelId);
+      expect(created).toHaveLength(1);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(ALLOWED);
+      expect(row?.message_thread_id).toBe(4242);
+    });
+
+    it("poll path: a foreign row that shows up while polling is superseded the same way", async () => {
+      const m = await mkMachine({ slack: true });
+      const e = envFor([m]);
+      const sessionId = await seedSession(m.machineId);
+      // A rival's unfinalized reservation in OUR chat: step 1 and the loser path wait on it.
+      await reserve(env.DB, { sessionId, machineId: m.machineId, chatId: ALLOWED, name: "rival" });
+      let seeded: { channelId: string } | undefined;
+      let polls = 0;
+      slack("conversations.archive", { ok: true });
+      const created: number[] = [];
+
+      const res = await resolveTopic(env.DB, {
+        sessionId,
+        machineId: m.machineId,
+        chatId: ALLOWED,
+        dir: "~/p",
+        title: "T",
+        botToken: "unused",
+        supersede: true,
+        env: e,
+        tgClient: FOREIGN_CREATE(created, 4243),
+        delayFn: async () => {
+          if (++polls !== 1) return;
+          // The rival gave up and the machine's other-transport row took its place.
+          await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
+          seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!);
+        },
+      });
+      expect(res).toMatchObject({ ok: true, messageThreadId: 4243, created: true });
+      expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(seeded?.channelId);
+      expect(created).toHaveLength(1);
+      expect((await getBySession(env.DB, sessionId))?.chat_id).toBe(ALLOWED);
+    });
+  });
+
   it("a Telegram create that finishes after a supersede does not touch the Slack row (chat-scoped finalize)", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
@@ -846,13 +944,26 @@ describe("/notifications/edit routing", () => {
     expect(slackCalls).toHaveLength(0);
 
     slack("chat.update", { ok: true, ts, channel: channelId });
+    // notifyOwner is not part of an edit: a session channel's edit never mentions.
     const ok = await edit(e, owner.key, { notificationId, notifyOwner: true });
     expect(ok.status).toBe(200);
     expect(await ok.json()).toEqual({ ok: true });
     const call = slackOf("chat.update")[0];
     expect(call?.params.get("channel")).toBe(channelId);
     expect(call?.params.get("ts")).toBe(ts);
-    expect(call?.params.get("text")).toContain("<@U0OWNER>");
+    expect(call?.params.get("text")).not.toContain("<@U0OWNER>");
+  });
+
+  it("a post whose team has no configured workspace is not a 403: it is a transient failure with no provider call", async () => {
+    const owner = await mkMachine({ slack: true });
+    const { notificationId } = await slackQuestion(owner.ws!);
+    const bare = await mkMachine(); // a Telegram machine, and the team's secret is gone from env
+    for (const key of [bare.key, SHARED]) {
+      const res = await edit(envFor([bare]), key, { notificationId });
+      expect(res.status).toBe(502);
+      expect(((await res.json()) as { errorClass: string }).errorClass).toBe("upstream");
+    }
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("a Slack failure is a 502 carrying errorClass", async () => {
