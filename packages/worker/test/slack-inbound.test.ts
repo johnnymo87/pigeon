@@ -13,6 +13,7 @@ import worker from "../src/index";
 import { slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
 import { slackSignature, verifySlackSignature } from "../src/chat/slack-verify";
 import { finalize, reserve } from "../src/topics";
+import { MAX_COMMAND_LENGTH } from "../src/chat/limits";
 import { handleSlackRequest, pickSlackFile, SLACK_APP_COMMANDS, slackTextToPlain, sweepSlackSeenEvents } from "../src/slack-inbound";
 import manifestRaw from "../slack/manifest.template.json?raw";
 
@@ -885,5 +886,211 @@ describe("interactivity", () => {
     expect(slackOf("chat.postEphemeral")[0]!.params.get("text")).toBe("Session expired");
     expect(slackOf("chat.postEphemeral")[0]!.params.get("user")).toBe(OWNER);
     expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+});
+
+// ─── behaviour the Telegram webhook suite used to cover (pigeon-4ogz.13) ───
+//
+// The Telegram ingress was deleted. What its tests checked that is not Telegram's own shape (the
+// route-level queueing, metadata, refusals) is kept here against the Slack ingress, which shares
+// `parseChatCommand`, `resolveSessionRef` and the command queue with it.
+
+describe("events: refusals and bound channels", () => {
+  it("a plain (non-thread) message in a bound named channel goes to the bound session, with the sender", async () => {
+    const box = await mkBox();
+    const sessionId = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:plain");
+    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)")
+      .bind(box.chat, "stallwatch:plain", sessionId, Date.now())
+      .run();
+    await sendEvent(box, { channel: named.channelId, text: "status?" });
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ session_id: sessionId, command: "status?", command_type: "execute", message_thread_id: named.handle });
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ senderId: OWNER });
+  });
+
+  it("a bound channel whose session row is gone is inert: the digest hint, not 'Session not found'", async () => {
+    const box = await mkBox();
+    const sessionId = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:gone");
+    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)")
+      .bind(box.chat, "stallwatch:gone", sessionId, Date.now())
+      .run();
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
+    slack("chat.postMessage", { ok: true, ts: "1700000030.000100", channel: named.channelId });
+    await sendEvent(box, { channel: named.channelId, text: "anyone?" });
+    expect(slackOf("chat.postMessage")).toHaveLength(1);
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).not.toContain("Session not found");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("a session's channel whose session row is gone answers 'Session not found' and queues nothing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(ch.sessionId).run();
+    slack("chat.postMessage", { ok: true, ts: "1700000031.000100", channel: ch.channelId });
+    await sendEvent(box, { channel: ch.channelId, text: "hello" });
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toBe("Session not found");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("a command over the length limit is refused in the channel and queues nothing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    slack("chat.postMessage", { ok: true, ts: "1700000032.000100", channel: ch.channelId });
+    await sendEvent(box, { channel: ch.channelId, text: "x".repeat(MAX_COMMAND_LENGTH + 1) });
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("Command too long");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+});
+
+describe("slash commands: queueing and refusals", () => {
+  it("/interrupt and /compact queue for the channel's session", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const a = await json(await sendCommand(box, "/interrupt", "", ch.channelId));
+    const b = await json(await sendCommand(box, "/compact", "", ch.channelId));
+    expect(a.response_type).toBe("in_channel");
+    expect(b.response_type).toBe("in_channel");
+    expect((await commandsFor(box.machineId)).map((r) => [r.command_type, r.session_id, r.message_thread_id])).toEqual([
+      ["interrupt", ch.sessionId, ch.handle],
+      ["compact", ch.sessionId, ch.handle],
+    ]);
+  });
+
+  it("a session command in a channel whose session row is gone says so and queues nothing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(ch.sessionId).run();
+    const body = await json(await sendCommand(box, "/compact", "", ch.channelId));
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain(`Session \`${ch.sessionId}\` not found.`);
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("an unknown session id is refused, and an explicit id wins over the channel's session", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const none = await json(await sendCommand(box, "/kill", "ses_nosuchsession00", ch.channelId));
+    expect(none.response_type).toBe("ephemeral");
+    expect(none.text).toMatch(/No session matches/);
+    expect(await commandsFor(box.machineId)).toEqual([]);
+
+    const target = await seedSession(box.machineId);
+    await sendCommand(box, "/mcp", `${target} enable slack`, ch.channelId);
+    await sendCommand(box, "/model", `${target} anthropic/opus`, ch.channelId);
+    expect((await commandsFor(box.machineId)).map((r) => [r.command_type, r.command, r.session_id])).toEqual([
+      ["mcp_enable", "slack", target],
+      ["model_set", "anthropic/opus", target],
+    ]);
+  });
+
+  it("a named target on a machine not recently seen is refused", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const stale = await mkBox({ online: false });
+    const target = await seedSession(stale.machineId);
+    const body = await json(await sendCommand(box, "/compact", target, ch.channelId));
+    expect(body.text).toBe(`${stale.machineId} is not recently seen.`);
+    expect(await commandsFor(stale.machineId)).toEqual([]);
+  });
+
+  it("/mcp list, /mcp disable and /model (list) map to their command types", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await sendCommand(box, "/mcp", "list", ch.channelId);
+    await sendCommand(box, "/mcp", "disable slack", ch.channelId);
+    await sendCommand(box, "/model", "", ch.channelId);
+    expect((await commandsFor(box.machineId)).map((r) => [r.command_type, r.command])).toEqual([
+      ["mcp_list", ""],
+      ["mcp_disable", "slack"],
+      ["model_list", ""],
+    ]);
+  });
+
+  it("/launch --tag keeps the prompt in command and the tag in metadata; no flag and no inheritance queues no metadata", async () => {
+    const box = await mkBox();
+    const alerts = await seedNamedChannel(box, "_alerts");
+    const tagged = await json(await sendCommand(box, "/launch", `${box.machineId} pigeon --tag my-prog fix the bug`, alerts.channelId));
+    expect(tagged.text).toContain(", tag my-prog");
+    await sendCommand(box, "/launch", `${box.machineId} pigeon plain prompt`, alerts.channelId);
+    const rows = await commandsFor(box.machineId);
+    expect(rows[0]).toMatchObject({ command_type: "launch", command: "fix the bug", directory: "pigeon" });
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ tag: "my-prog" });
+    expect(rows[1]).toMatchObject({ command: "plain prompt" });
+    expect(rows[1]!.metadata_json).toBeNull();
+  });
+
+  it("/launch with an invalid tag answers usage and queues nothing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const body = await json(await sendCommand(box, "/launch", `${box.machineId} pigeon --tag auto:x go`, ch.channelId));
+    expect(body.response_type).toBe("ephemeral");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("/launch --backend goose carries the backend, with --tag or with inheritance, but never inherits over --tag", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await sendCommand(box, "/launch", `${box.machineId} pigeon --backend goose --tag prog go`, ch.channelId);
+    await sendCommand(box, "/launch", `${box.machineId} pigeon --backend goose go`, ch.channelId);
+    const rows = await commandsFor(box.machineId);
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ tag: "prog", backend: "goose" });
+    expect(JSON.parse(rows[1]!.metadata_json!)).toEqual({ backend: "goose", inheritFromSessionId: ch.sessionId });
+  });
+
+  it("/launch does not inherit from a channel whose session is on another machine", async () => {
+    const box = await mkBox();
+    const other = await mkBox();
+    const ch = await seedSessionChannel(other);
+    // Same workspace team as `other`, so the channel is known; the target machine is `box`.
+    box.ws.teamId = other.ws.teamId;
+    await env.DB.prepare("INSERT OR REPLACE INTO machines (machine_id, last_poll_at) VALUES (?, ?)").bind(box.machineId, Date.now()).run();
+    const boxEnv = { ...box.env, [slackSecretKeyForMachine(box.machineId)]: JSON.stringify(box.ws) } as unknown as Env;
+    const res = await call({ ...box, env: boxEnv }, await signed({ ...box, env: boxEnv }, "commands", new URLSearchParams({
+      team_id: box.ws.teamId, api_app_id: box.ws.appId, user_id: OWNER, channel_id: ch.channelId,
+      command: "/launch", text: `${box.machineId} pigeon go`, response_url: "https://example.invalid/r",
+    }).toString(), "application/x-www-form-urlencoded"));
+    expect(res.status).toBe(200);
+    const row = (await commandsFor(box.machineId))[0]!;
+    expect(row.command_type).toBe("launch");
+    expect(row.metadata_json).toBeNull();
+  });
+
+  it("/tag: a malformed form answers usage, an auto: tag is refused, and nothing is queued", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const usage = await json(await sendCommand(box, "/tag", "a b c", ch.channelId));
+    expect(usage.response_type).toBe("ephemeral");
+    const auto = await json(await sendCommand(box, "/tag", "auto:x", ch.channelId));
+    expect(auto.response_type).toBe("ephemeral");
+    const dir = await json(await sendCommand(box, "/tag", "dir", ch.channelId));
+    expect(dir.response_type).toBe("ephemeral");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("/tag <tag> and /tag <other-session> <tag>: the channel's session routes, the target is tagged", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const other = await seedSession(box.machineId);
+    await sendCommand(box, "/tag", "mine", ch.channelId);
+    await sendCommand(box, "/tag", `${other} theirs`, ch.channelId);
+    const rows = await commandsFor(box.machineId);
+    expect(rows.map((r) => [r.command_type, r.command, r.session_id, JSON.parse(r.metadata_json!).targetSessionId])).toEqual([
+      ["tag_set", "mine", ch.sessionId, ch.sessionId],
+      ["tag_set", "theirs", ch.sessionId, other],
+    ]);
+  });
+
+  it("/retitle: when the channel edit fails nothing is written and the refusal names the session", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    slack("conversations.info", { ok: false, error: "channel_not_found" });
+    const body = await json(await sendCommand(box, "/retitle", "Never applied", ch.channelId));
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain(`Failed to rename the channel of session \`${ch.sessionId}\``);
+    const label = await env.DB.prepare("SELECT label FROM sessions WHERE session_id = ?").bind(ch.sessionId).first<{ label: string }>();
+    expect(label!.label).toBe("inbound");
   });
 });

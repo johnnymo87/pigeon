@@ -1,6 +1,6 @@
 /**
  * Slack ingress (chat-transport phase 2, bead pigeon-4ogz.4; spec
- * docs/plans/2026-11-20-slack-transport-design.md §5). Slack's counterpart of `webhook.ts`.
+ * docs/plans/2026-11-20-slack-transport-design.md §5). The Telegram webhook it replaced is gone (pigeon-4ogz.13).
  *
  *   POST /slack/<machine>/events         Events API (`message.channels`, `url_verification`)
  *   POST /slack/<machine>/commands       slash commands
@@ -616,13 +616,13 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     }
     const { machineId, directory, prompt, tag, backend } = launch;
     if (!(await isMachineRecent(db, machineId))) return commandReply(`${machineId} is not recently seen.`, false);
-    // Tag inheritance from the channel's session, as Telegram does from the topic (see webhook.ts).
+    // Tag inheritance from the channel's session.
     let inheritFromSessionId: string | undefined;
     if (!tag) {
       const ctx = await channelContext(db, chat, handle);
       if (ctx.kind === "found" && ctx.machineId === machineId) inheritFromSessionId = ctx.sessionId;
-      // A coordinator's channel is a bound named channel, not a session topic. Telegram reaches the
-      // coordinator by swipe-reply, which a slash command cannot do, so the binding stands in for it
+      // A coordinator's channel is a bound named channel, not a session channel. A slash command
+      // cannot swipe-reply to the coordinator, so the binding stands in for it
       // here: inheritance is only a candidate the daemon validates (its program, not a destructive act).
       if (ctx.kind === "none" && handle !== null) {
         const bound = await getBoundSessionByThread(db, chat, handle);
@@ -774,7 +774,7 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
   const channelId = payload.channel?.id ?? payload.container?.channel_id;
   if (typeof channelId !== "string" || !channelId) return OK();
 
-  // Exactly Telegram's callback_data: cmd:TOKEN:ACTION (resolveCallbackSession in webhook.ts).
+  // The button value is the daemon's callback_data: cmd:TOKEN:ACTION.
   const parts = value.split(":");
   if (parts.length < 3) return OK();
   const token = parts[1]!;

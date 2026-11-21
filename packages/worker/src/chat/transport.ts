@@ -15,8 +15,8 @@
  * `ChatTransport` structurally, so every existing test that injects a fake Telegram client keeps
  * working unchanged.
  *
- * Inbound-only Telegram calls (`getFile`, `downloadFile`, `answerCallbackQuery`) are not here: they
- * belong to the Telegram webhook, and Slack's ingress has its own equivalents.
+ * Inbound-only Telegram calls were deleted with the Telegram webhook, and Slack's ingress
+ * has its own equivalents.
  *
  * `src/telegram.ts` remains the only file that knows Telegram's host (egress guard test).
  */

@@ -21,7 +21,6 @@ import { resolveWorkerTarget } from "./chat/address";
 import { topicsEnabled } from "./topics";
 import { failureDetails } from "./chat/failures";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
-import { topicUrl } from "./mention-links";
 
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
@@ -282,88 +281,12 @@ export async function maybeAnswerInNamedTopic(
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
     const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
-    const text = (await movedTopicHint(db, env, chatId, messageThreadId, row.topic_key)) ?? NAMED_TOPIC_HINT_TEXT;
-    const res = await tg.sendMessage({ chatId, messageThreadId, text });
+    const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
       console.warn("[worker] named topic hint failed", { key: row.topic_key, details: failureDetails(res) });
     }
   }
   return true;
-}
-
-/** The hint for a named topic whose session moved to the other transport (`movedTopicHint`). */
-export function movedTopicHintText(to: "slack" | "telegram", name: string, url: string | null): string {
-  const where = to === "slack" ? "a Slack channel" : "a Telegram topic";
-  const label = name.trim() ? ` (${name.trim()})` : "";
-  return (
-    `The session that read this topic moved to ${where}${label}. It reads and answers there, not here` +
-    (url ? `: ${url}` : ".")
-  );
-}
-
-/**
- * The hint for an unbound named topic whose key is bound on the OTHER transport (bead
- * pigeon-4ogz.22): a stall-watch coordinator after `slack-flip` moved its binding (or moved it
- * back). The old conversation keeps its `named_topics` row as history, so without this a message
- * typed there got the digest hint, which reads as an outage for a coordinator.
- *
- * Null (the caller sends the stock hint) unless exactly one live binding fits: the key bound in
- * no chat of THIS conversation, and bound to a registered session in exactly one chat of the other
- * transport, or, when several chats there bind it, exactly one whose machine has posted into this
- * chat. The worker cannot tell whose chat a numeric id is, so with a single candidate it assumes
- * the key is one machine's (a `stallwatch:<tag>` key normally is); with several it never guesses.
- * Decoration: any failure is logged and gives null.
- */
-async function movedTopicHint(
-  db: D1Database,
-  env: Env,
-  chatId: string,
-  messageThreadId: number,
-  key: string,
-): Promise<string | null> {
-  try {
-    const rows = (
-      await db
-        .prepare(
-          `SELECT b.chat_id, s.machine_id, t.message_thread_id, t.name
-             FROM named_topic_bindings b
-             JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
-             JOIN sessions s ON s.session_id = b.session_id
-            WHERE b.topic_key = ?`,
-        )
-        .bind(key)
-        .all<{ chat_id: string; machine_id: string; message_thread_id: number; name: string }>()
-    ).results;
-    if (rows.some((r) => r.chat_id === chatId)) return null;
-    const here = isSlackChatId(chatId);
-    let candidates = rows.filter((r) => isSlackChatId(r.chat_id) !== here);
-    if (candidates.length > 1) {
-      const posted: typeof candidates = [];
-      for (const c of candidates) {
-        // By machine, not session, so a coordinator rotated since the flip still matches.
-        const hit = await db
-          .prepare(
-            `SELECT 1 AS one FROM messages m JOIN sessions s ON s.session_id = m.session_id
-              WHERE m.chat_id = ? AND s.machine_id = ? LIMIT 1`,
-          )
-          .bind(chatId, c.machine_id)
-          .first<{ one: number }>();
-        if (hit) posted.push(c);
-      }
-      candidates = posted;
-    }
-    const target = candidates.length === 1 ? candidates[0] : undefined;
-    if (!target) return null;
-    const url = await topicUrl(db, env, target.chat_id, target.message_thread_id);
-    return movedTopicHintText(here ? "telegram" : "slack", target.name, url);
-  } catch (err) {
-    console.warn("[worker] moved-topic hint lookup failed; sending the stock hint", {
-      key,
-      messageThreadId,
-      error: String(err),
-    });
-    return null;
-  }
 }
 
 /**

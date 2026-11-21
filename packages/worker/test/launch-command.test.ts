@@ -66,7 +66,7 @@ describe("parseLaunchMessage", () => {
   });
 
   it("answers usage for a malformed /launch instead of returning null", () => {
-    // Returning null would let webhook.ts fall through to the plain-message
+    // Returning null would let the ingress fall through to the plain-message
     // path, injecting the typo into a live session as a prompt.
     expect(parseLaunchMessage("/launch")).toEqual({ kind: "usage" });
     expect(parseLaunchMessage("/launch devbox")).toEqual({ kind: "usage" });

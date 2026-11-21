@@ -24,36 +24,3 @@ describe("telegram egress guard", () => {
     expect(offenders).toEqual([]);
   });
 });
-
-// ─── TelegramClient.downloadFile: the inbound media fetch, now through the client ───
-
-import { fetchMock } from "cloudflare:test";
-import { afterEach, beforeEach } from "vitest";
-import { createTelegramClient } from "../src/telegram";
-
-describe("TelegramClient.downloadFile", () => {
-  beforeEach(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-  });
-  afterEach(() => {
-    fetchMock.get("https://api.telegram.org").cleanMocks();
-    fetchMock.deactivate();
-  });
-
-  test("fetches the file path under /file/bot<token>/ and returns the raw response", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "GET", path: "/file/bottok123/photos/file_7.jpg" })
-      .reply(200, "JPEGBYTES");
-    const res = await createTelegramClient("tok123").downloadFile("photos/file_7.jpg");
-    expect(res.ok).toBe(true);
-    expect(await res.text()).toBe("JPEGBYTES");
-  });
-
-  test("a non-2xx is returned, not thrown, so the caller can report it", async () => {
-    fetchMock.get("https://api.telegram.org").intercept({ method: "GET", path: /\/file\/bot.*/ }).reply(404, "nope");
-    const res = await createTelegramClient("tok123").downloadFile("x/y.bin");
-    expect(res.status).toBe(404);
-  });
-});

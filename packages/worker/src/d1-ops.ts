@@ -290,26 +290,6 @@ export async function cleanupCommands(
   };
 }
 
-// ─── cleanupSeenUpdates ───────────────────────────────────────────────────────
-
-/**
- * Cleanup old seen_updates entries older than 24 hours.
- * Returns the count of deleted rows.
- */
-export async function cleanupSeenUpdates(
-  db: D1Database,
-  now: number = Date.now(),
-): Promise<number> {
-  const oneDayAgo = now - 24 * 60 * 60 * 1000;
-
-  const result = await db
-    .prepare("DELETE FROM seen_updates WHERE created_at < ?")
-    .bind(oneDayAgo)
-    .run();
-
-  return result.meta.rows_written ?? 0;
-}
-
 // ─── checkSessionHighWaterAlert ───────────────────────────────────────────────
 
 /**

@@ -11,7 +11,6 @@ export default defineWorkersConfig({
           bindings: {
             CCR_API_KEY: "test-api-key",
             TELEGRAM_BOT_TOKEN: "test-bot-token",
-            TELEGRAM_WEBHOOK_SECRET: "test-webhook-secret",
             ALLOWED_CHAT_IDS: "8248645256",
             TELEGRAM_TOPICS_ENABLED: "false",
             // Production retires the shared key for the real machine ids, which the suite also

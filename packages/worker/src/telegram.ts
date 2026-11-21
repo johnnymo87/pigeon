@@ -14,15 +14,6 @@ import type {
   UnpinAllForumTopicMessagesOptions,
 } from "./chat/transport";
 
-export interface AnswerCallbackQueryOptions {
-  callbackQueryId: string;
-  text?: string;
-}
-
-export interface GetFileOptions {
-  fileId: string;
-}
-
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
 
 /**
@@ -46,7 +37,7 @@ export const TELEGRAM_SLOW_CALL_MS = 5_000;
  * Volume is small. `messages` rows over the last 7 days: 2,054, a mean of 293/day, peaking at
  * 617 on 2026-09-10. (Do not size this from the all-time table: rows are deleted when their
  * session is unregistered, so older days are survivors only and the long-run mean reads far
- * too low.) Add topic, wizard-edit, callback and getFile traffic and the realistic peak is
+ * too low.) Add topic and wizard-edit traffic and the realistic peak is
  * roughly a thousand log lines a day at `head_sampling_rate = 1`.
  *
  * The method name is logged; the URL is not, because it carries the bot token.
@@ -64,10 +55,7 @@ export function logTelegramCall(method: string, elapsedMs: number, outcome: stri
  * The single place a Telegram HTTP call is made, so the timing above cannot be bypassed.
  *
  * Every exported method routes through here. That is the point: a per-method wrapper would
- * have to be remembered at each of the twelve call sites, and the thirteenth would silently
- * go unmeasured. The one Telegram fetch that is not a Bot API method, the file download, has
- * its own function below (`downloadFile`). It is timed to response headers only, because its
- * body is streamed into R2 by the caller, and it has no abort (unchanged from before it moved).
+ * have to be remembered at each of the call sites, and the next would silently go unmeasured.
  *
  * Two things about the measurement are easy to misread:
  *
@@ -288,35 +276,6 @@ export async function sendDocument(
   });
 }
 
-export async function answerCallbackQuery(
-  botToken: string,
-  options: AnswerCallbackQueryOptions,
-): Promise<ChatResult<boolean>> {
-  const payload: Record<string, unknown> = {
-    callback_query_id: options.callbackQueryId,
-  };
-  if (options.text) {
-    payload.text = options.text;
-  }
-
-  return callTelegram<boolean>(botToken, "answerCallbackQuery", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function getFile(
-  botToken: string,
-  options: GetFileOptions,
-): Promise<ChatResult<{ file_path: string }>> {
-  return callTelegram<{ file_path: string }>(botToken, "getFile", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file_id: options.fileId }),
-  });
-}
-
 export async function createForumTopic(
   botToken: string,
   options: CreateForumTopicOptions,
@@ -426,25 +385,6 @@ export async function unpinAllForumTopicMessages(
   });
 }
 
-/**
- * Downloads a file Telegram is hosting (`file_path` from `getFile`). Not a Bot API method, so it
- * returns the raw Response rather than a ChatResult: the caller streams the body into R2.
- *
- * It lives here, not at its call site, so that this file stays the only one that knows
- * Telegram's host (the egress guard test enforces that; chat-transport, pigeon-lenr.1).
- */
-export async function downloadFile(botToken: string, filePath: string): Promise<Response> {
-  const startedAt = Date.now();
-  let outcome = "threw";
-  try {
-    const res = await fetch(`https://api.telegram.org/file/bot${botToken}/${filePath}`);
-    outcome = res.ok ? "ok" : `http_${res.status}`;
-    return res;
-  } finally {
-    logTelegramCall("downloadFile", Date.now() - startedAt, outcome);
-  }
-}
-
 export function createTelegramClient(botToken: string) {
   return {
     sendMessage: (options: SendMessageOptions) => sendMessage(botToken, options),
@@ -452,8 +392,6 @@ export function createTelegramClient(botToken: string) {
     editMessageText: (options: EditMessageTextOptions) => editMessageText(botToken, options),
     sendPhoto: (options: SendPhotoOptions) => sendPhoto(botToken, options),
     sendDocument: (options: SendDocumentOptions) => sendDocument(botToken, options),
-    answerCallbackQuery: (options: AnswerCallbackQueryOptions) => answerCallbackQuery(botToken, options),
-    getFile: (options: GetFileOptions) => getFile(botToken, options),
     createForumTopic: (options: CreateForumTopicOptions) => createForumTopic(botToken, options),
     editForumTopic: (options: EditForumTopicOptions) => editForumTopic(botToken, options),
     closeForumTopic: (options: CloseForumTopicOptions) => closeForumTopic(botToken, options),
@@ -461,7 +399,6 @@ export function createTelegramClient(botToken: string) {
     deleteForumTopic: (options: DeleteForumTopicOptions) => deleteForumTopic(botToken, options),
     unpinAllForumTopicMessages: (options: UnpinAllForumTopicMessagesOptions) =>
       unpinAllForumTopicMessages(botToken, options),
-    downloadFile: (filePath: string) => downloadFile(botToken, filePath),
   };
 }
 

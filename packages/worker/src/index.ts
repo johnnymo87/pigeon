@@ -2,11 +2,10 @@ import { handleNamedTopicRehome } from "./named-topic-rehome";
 import { handleSendMessage, handleUnpinTopic } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
-import { handleTelegramWebhook } from "./webhook";
 import { handleSlackRequest, sweepSlackSeenEvents, type SlackEndpoint } from "./slack-inbound";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
-import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
+import { cleanupCommands, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
 import { runTopicReaper, shouldCloseOrphans } from "./topic-reaper";
 import { handleTopicLookup } from "./topic-lookup";
 import { handleTopicRename } from "./topic-rename";
@@ -139,13 +138,8 @@ export default {
           return handleUnpinTopic(env, request);
         }
 
-        // Telegram webhook
-        if (path.startsWith("/webhook/telegram") && method === "POST") {
-          return handleTelegramWebhook(db, env, request);
-        }
-
         // Slack ingress (pigeon-4ogz.4). A machine with no SLACK_WORKSPACE_<MACHINE> secret gets
-        // this router's ordinary 404, so a Telegram-only worker answers exactly as before.
+        // this router's ordinary 404.
         const slackMatch = path.match(/^\/slack\/([a-z0-9_-]{1,64})\/(events|commands|interactivity)$/);
         if (slackMatch && method === "POST") {
           return handleSlackRequest(
@@ -199,11 +193,6 @@ export default {
       await cleanupCommands(env.DB);
     } catch (err) {
       console.error("Command cleanup failed:", err);
-    }
-    try {
-      await cleanupSeenUpdates(env.DB);
-    } catch (err) {
-      console.error("Seen-updates cleanup failed:", err);
     }
     // Order is load-bearing, twice over.
     //
