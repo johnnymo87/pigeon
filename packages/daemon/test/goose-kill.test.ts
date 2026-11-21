@@ -175,9 +175,28 @@ describe("executeGooseKill", () => {
       "gooseRunners.drop:gse_123",
       "sessions.delete:gse_123",
       "assignments.delete:gse_123",
-      "poller.unregisterSession:gse_123",
       expect.stringMatching(/^reply:/),
+      "poller.unregisterSession:gse_123",
     ]);
+  });
+
+  // pigeon-4ogz.20: /kill is an interactive close, so the topic (or Slack channel) closes now
+  // rather than in the next daily window. The reply goes first, because a closed Slack channel is
+  // archived and a reply into it would fail.
+  it("unregisters with immediate: true, after the reply", async () => {
+    const { deps } = makeDeps();
+
+    await executeGooseKill("gse_123", deps);
+
+    expect(deps.poller!.unregisterSession).toHaveBeenCalledWith("gse_123", { immediate: true });
+  });
+
+  it("still unregisters when the reply throws", async () => {
+    const { deps, events } = makeDeps({ reply: vi.fn().mockRejectedValue(new Error("worker down")) });
+
+    await expect(executeGooseKill("gse_123", deps)).rejects.toThrow("worker down");
+
+    expect(events).toContain("poller.unregisterSession:gse_123");
   });
 
   it("reads the session record BEFORE the delete", async () => {
