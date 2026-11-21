@@ -58,7 +58,8 @@ export function buttonLabel(topicName: string | null, mentionedId: string): stri
   return chars.length <= MAX_LABEL_CHARS ? label : `${chars.slice(0, MAX_LABEL_CHARS - 1).join("")}…`;
 }
 
-async function topicUrl(
+/** A conversation's link: `t.me/c/...` for a Telegram forum thread, the archive URL for Slack. */
+export async function topicUrl(
   db: D1Database,
   env: Env | undefined,
   chatId: string,
