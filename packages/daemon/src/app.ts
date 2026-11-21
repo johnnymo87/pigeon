@@ -16,7 +16,13 @@ import {
 } from "./alert-topic";
 import { generateToken, formatChatNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
 import { splitChatMessage } from "./split-message";
-import { ALLOWED_PULL_SOURCES, type QuestionInfoData } from "./storage/types";
+import {
+  ALLOWED_PULL_SOURCES,
+  HUMAN_REPLY_SOURCE,
+  LEGACY_HUMAN_REPLY_SOURCE,
+  normalizePullSource,
+  type QuestionInfoData,
+} from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
 import { payloadHasCloseTag } from "./swarm/envelope";
@@ -41,7 +47,10 @@ import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
 import { handleSessionRename, type SessionRenameDeps } from "./session-rename.js";
 import { coordinatorProgram, isSwarmReachableGooseRow } from "./swarm/coordinators";
 
-const ALLOWED_PULL_SOURCES_SET = new Set<string>(ALLOWED_PULL_SOURCES);
+// The legacy human-reply name is accepted (and stored as the new one) so a client
+// that still sends it is not refused with a 400 (pigeon-4ogz.14). The error names
+// only the current values.
+const ALLOWED_PULL_SOURCES_SET = new Set<string>([...ALLOWED_PULL_SOURCES, LEGACY_HUMAN_REPLY_SOURCE]);
 const INVALID_PULL_SOURCES_ERROR = `pull_sources must be an array of: ${ALLOWED_PULL_SOURCES.join(", ")}`;
 
 interface LegacySession {
@@ -1474,7 +1483,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         const now = nowFn();
         const counts = session
           ? storage.pullInbox.pendingCounts(sessionId, now, { includeSwarm })
-          : { total: 0, bySource: { "telegram-reply": 0, swarm: 0 } };
+          : { total: 0, bySource: { [HUMAN_REPLY_SOURCE]: 0, swarm: 0 } };
         const swarmPending = includeSwarm
           ? storage.pullInbox.pendingSwarm(sessionId, now)
           : { rows: [], truncated: false };
@@ -1521,7 +1530,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               );
             }
           }
-          pullSourcesToSet = Array.from(new Set(body.pull_sources));
+          pullSourcesToSet = Array.from(new Set((body.pull_sources as string[]).map(normalizePullSource)));
         }
 
         const existing = storage.sessions.get(sessionId);
@@ -1592,7 +1601,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Every episode of an unattended pull client re-registers, so this is what turns
         // swarm banking off when the client stops advertising it (switched off, or rolled
         // back to a version that does not know the field).
-        // Note: pull_sources gates ONLY swarm banking. chat-reply (`telegram-reply` source) banking stays active
+        // Note: pull_sources gates ONLY swarm banking. human-reply (`chat-reply`) banking stays active
         // as today regardless of whether it is listed in pull_sources.
         storage.sessions.setPullSources(sessionId, pullSourcesToSet, nowFn());
 

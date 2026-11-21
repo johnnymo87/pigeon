@@ -73,7 +73,8 @@ export const additiveColumns = [
   // written before this column meant. See SessionRecord.backendSessionId.
   "ALTER TABLE sessions ADD COLUMN backend_session_id TEXT DEFAULT NULL",
   // Pull sources opted into by the session (JSON-encoded array of strings,
-  // e.g. ["telegram-reply", "swarm"]). NULL means default (["telegram-reply"]).
+  // e.g. ["chat-reply", "swarm"]). NULL means default (["chat-reply"]); a stored legacy
+  // "telegram-reply" reads as "chat-reply" (pigeon-4ogz.14).
   // Only /session-start updates this column; other writers preserve it.
   "ALTER TABLE sessions ADD COLUMN pull_sources TEXT DEFAULT NULL",
   // The named-topic key a goose-acp session is bound to (a stall-watch

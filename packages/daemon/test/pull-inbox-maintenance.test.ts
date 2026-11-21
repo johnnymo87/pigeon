@@ -43,7 +43,7 @@ describe("pull inbox maintenance", () => {
   it("alerts when a banked message expires unread, and names it", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_pull", source: "telegram-reply", payload: "look at #42" },
+      { msgId: "m1", sessionId: "ses_pull", source: "chat-reply", payload: "look at #42" },
       1_000,
     );
     runPullInboxMaintenance({ storage: s, nowFn: () => 1_000 + DEFAULT_PULL_TTL_MS + 1 });
@@ -59,7 +59,7 @@ describe("pull inbox maintenance", () => {
   it("says nothing about a message the client read in time", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_pull", source: "telegram-reply", payload: "hi" },
+      { msgId: "m1", sessionId: "ses_pull", source: "chat-reply", payload: "hi" },
       1_000,
     );
     s.pullInbox.claim("ses_pull", 1_100);
@@ -71,7 +71,7 @@ describe("pull inbox maintenance", () => {
   it("alerts on a claimed message that was never acked, once the threshold passes", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_pull", source: "telegram-reply", payload: "hi" },
+      { msgId: "m1", sessionId: "ses_pull", source: "chat-reply", payload: "hi" },
       1_000,
     );
     s.pullInbox.claim("ses_pull", 2_000);
@@ -87,15 +87,15 @@ describe("pull inbox maintenance", () => {
 
   it("uses conditional wording for unacked alert: held swarm row vs active row", () => {
     const s = newDb();
-    // 1. Active telegram-reply row
+    // 1. Active chat-reply row
     s.pullInbox.bank(
-      { msgId: "m_active", sessionId: "ses_pull", source: "telegram-reply", payload: "active" },
+      { msgId: "m_active", sessionId: "ses_pull", source: "chat-reply", payload: "active" },
       1_000,
     );
     s.pullInbox.claim("ses_pull", 2_000);
 
     // 2. Swarm row on an opted-out session (held)
-    // In newDb(), ses_pull default pullSources is ["telegram-reply"] (not opted into swarm)
+    // In newDb(), ses_pull default pullSources is ["chat-reply"] (not opted into swarm)
     s.pullInbox.bank(
       { msgId: "m_held", sessionId: "ses_pull", source: "swarm", payload: "held" },
       1_000,
@@ -124,7 +124,7 @@ describe("pull inbox maintenance", () => {
   it("does not repeat the unacked alert on every cycle", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_pull", source: "telegram-reply", payload: "hi" },
+      { msgId: "m1", sessionId: "ses_pull", source: "chat-reply", payload: "hi" },
       1_000,
     );
     s.pullInbox.claim("ses_pull", 2_000);
@@ -136,7 +136,7 @@ describe("pull inbox maintenance", () => {
   it("reaps acked rows so the table does not grow without a reader", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_pull", source: "telegram-reply", payload: "hi" },
+      { msgId: "m1", sessionId: "ses_pull", source: "chat-reply", payload: "hi" },
       1_000,
     );
     s.pullInbox.claim("ses_pull", 1_100);
@@ -149,7 +149,7 @@ describe("pull inbox maintenance", () => {
   it("survives a session row that has already been reaped", () => {
     const s = newDb();
     s.pullInbox.bank(
-      { msgId: "m1", sessionId: "ses_gone", source: "telegram-reply", payload: "orphan" },
+      { msgId: "m1", sessionId: "ses_gone", source: "chat-reply", payload: "orphan" },
       1_000,
     );
     expect(() =>

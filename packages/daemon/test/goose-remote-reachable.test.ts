@@ -39,7 +39,7 @@ describe("createMarkGooseRemoteReachable", () => {
     expect(setSpy).not.toHaveBeenCalled();
 
     const afterRow = s.sessions.get("gse_test_register_only");
-    expect(afterRow!.pullSources).toEqual(["telegram-reply"]);
+    expect(afterRow!.pullSources).toEqual(["chat-reply"]);
   });
 
   it("grant: false followed by grant: true does not re-register, only writes pull_sources", async () => {
@@ -66,7 +66,7 @@ describe("createMarkGooseRemoteReachable", () => {
     expect(registerMock).toHaveBeenCalledTimes(1);
 
     const afterRow = s.sessions.get("gse_test_reg_then_grant");
-    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(afterRow!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 
   it("grant: false registration failure is retried when grant: true is called", async () => {
@@ -96,7 +96,7 @@ describe("createMarkGooseRemoteReachable", () => {
     expect(registerMock).toHaveBeenCalledTimes(2);
 
     const afterRow = s.sessions.get("gse_test_reg_retry");
-    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(afterRow!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 
   it("additive write from NULL pull_sources with grant: true", async () => {
@@ -111,8 +111,8 @@ describe("createMarkGooseRemoteReachable", () => {
     // Directly in sqlite, pull_sources is NULL after upsert
     const beforeRow = s.sessions.get("gse_test_1");
     expect(beforeRow).not.toBeNull();
-    // Storage parses NULL as the default ["telegram-reply"]
-    expect(beforeRow!.pullSources).toEqual(["telegram-reply"]);
+    // Storage parses NULL as the default ["chat-reply"]
+    expect(beforeRow!.pullSources).toEqual(["chat-reply"]);
 
     const mark = createMarkGooseRemoteReachable({
       sessions: s.sessions,
@@ -122,10 +122,10 @@ describe("createMarkGooseRemoteReachable", () => {
     expect(res).toEqual({ marked: true, registered: "skipped" });
 
     const afterRow = s.sessions.get("gse_test_1");
-    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(afterRow!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 
-  it("additive write from ['telegram-reply', 'swarm']", async () => {
+  it("additive write from ['chat-reply', 'swarm']", async () => {
     const s = storage!;
     s.sessions.upsert({
       sessionId: "gse_test_2",
@@ -133,7 +133,7 @@ describe("createMarkGooseRemoteReachable", () => {
       backendEndpoint: "ws://localhost:1/acp",
       notify: true,
     });
-    s.sessions.setPullSources("gse_test_2", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_test_2", ["chat-reply", "swarm"]);
 
     const mark = createMarkGooseRemoteReachable({
       sessions: s.sessions,
@@ -143,7 +143,7 @@ describe("createMarkGooseRemoteReachable", () => {
     expect(res).toEqual({ marked: true, registered: "skipped" });
 
     const afterRow = s.sessions.get("gse_test_2");
-    expect(afterRow!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(afterRow!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 
   it("already-complete list does not call setPullSources", async () => {
@@ -154,7 +154,7 @@ describe("createMarkGooseRemoteReachable", () => {
       backendEndpoint: "ws://localhost:1/acp",
       notify: true,
     });
-    s.sessions.setPullSources("gse_test_3", ["telegram-reply", "swarm", "swarm-remote"]);
+    s.sessions.setPullSources("gse_test_3", ["chat-reply", "swarm", "swarm-remote"]);
 
     const setSpy = vi.spyOn(s.sessions, "setPullSources");
 
@@ -464,11 +464,11 @@ describe("createMarkGooseRemoteReachable", () => {
     const resReg = await mark.register("gse_helper_methods");
     expect(resReg).toEqual({ marked: false, registered: true });
     expect(registerMock).toHaveBeenCalledTimes(1);
-    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["telegram-reply"]);
+    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["chat-reply"]);
 
     const resGrant = await mark.grant("gse_helper_methods");
     expect(resGrant).toEqual({ marked: true, registered: "cached" });
     expect(registerMock).toHaveBeenCalledTimes(1);
-    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(s.sessions.get("gse_helper_methods")!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 });

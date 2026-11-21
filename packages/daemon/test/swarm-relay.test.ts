@@ -246,7 +246,7 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
   it("refuses a pull session that opted into swarm but not swarm-remote", async () => {
     const s = db();
     s.sessions.upsert({ sessionId: TARGET, backendKind: "goose-pull" }, NOW);
-    s.sessions.setPullSources(TARGET, ["telegram-reply", "swarm"], NOW);
+    s.sessions.setPullSources(TARGET, ["chat-reply", "swarm"], NOW);
     expect((await receive(s, [message()]))[0]).toMatchObject({ reason: "remote_not_accepted" });
     expect(s.pullInbox.getIdentity("msg_relayed_1")).toBeNull();
   });
@@ -289,7 +289,7 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
       for (const over of [{ key: null }, { key: "stallwatch:_notices" }, { key: "digest:daily" }, { kind: "goose-pull", endpoint: null }]) {
         const s = db();
         gooseRow(s, over);
-        s.sessions.setPullSources(COORD, ["telegram-reply", "swarm"], NOW);
+        s.sessions.setPullSources(COORD, ["chat-reply", "swarm"], NOW);
         expect((await receive(s, [message({ to: COORD })]))[0], JSON.stringify(over)).toMatchObject({
           reason: "remote_not_accepted",
         });
@@ -597,7 +597,7 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
     expect(markSpy).toHaveBeenCalledWith(gseSender, { grant: false });
     // pull_sources did NOT gain swarm-remote!
     const row = a.s.sessions.get(gseSender);
-    expect(row!.pullSources).toEqual(["telegram-reply"]);
+    expect(row!.pullSources).toEqual(["chat-reply"]);
     expect(row!.pullSources).not.toContain("swarm-remote");
   });
 
@@ -623,7 +623,7 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
     expect(markSpy).toHaveBeenCalledTimes(1);
     expect(markSpy).toHaveBeenCalledWith(gseSender, { grant: false });
     const row = a.s.sessions.get(gseSender);
-    expect(row!.pullSources).toEqual(["telegram-reply"]);
+    expect(row!.pullSources).toEqual(["chat-reply"]);
   });
 
   it("grant applied after relay is accepted (row gains swarm-remote)", async () => {
@@ -647,7 +647,7 @@ describe("sending through the relay (pigeon-k0qn.7)", () => {
     expect(markSpy).toHaveBeenNthCalledWith(1, gseSender, { grant: false });
     expect(markSpy).toHaveBeenNthCalledWith(2, gseSender, { grant: true });
     const row = a.s.sessions.get(gseSender);
-    expect(row!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+    expect(row!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
   });
 
   it("mark not called when sender is ses_", async () => {

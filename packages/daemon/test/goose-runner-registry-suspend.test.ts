@@ -173,7 +173,7 @@ function makeSession(id: string): SessionRecord {
     backendProtocolVersion: null,
     backendEndpoint: null,
     backendAuthToken: null,
-    pullSources: ["telegram-reply"],
+    pullSources: ["chat-reply"],
     createdAt: 1000,
     updatedAt: 1000,
     lastSeen: 1000,

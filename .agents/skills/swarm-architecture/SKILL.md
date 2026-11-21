@@ -155,7 +155,7 @@ When `to` is a registered pull session (`backend_kind === "goose-pull"`) whose `
 - The background `SwarmArbiter` is bypassed entirely — no `prompt_async` attempts, no delivery race.
 - Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_...", "banked": true }`. (Non-banked sends omit `banked`).
 - Payload limit: payloads exceeding 4000 Unicode code points (`[...payload].length > 4000`) are refused with HTTP 413 `{ "error": "payload exceeds maximum length of 4000 characters (...)" }` at send time. Pull clients cannot take larger prompts; refusing at send time alerts the sender immediately.
-- Non-opted-in pull sessions: sends to pull sessions that have not opted into `"swarm"` still enter `swarm_messages`, fail arbiter delivery (~10 attempts with `TargetUnavailableError`), and result in a loud `delivery.failed` message back to the sender. This keeps behavior intact for pull clients that only accept `telegram-reply` rows (the historical name of the human-reply source; Slack replies use it).
+- Non-opted-in pull sessions: sends to pull sessions that have not opted into `"swarm"` still enter `swarm_messages`, fail arbiter delivery (~10 attempts with `TargetUnavailableError`), and result in a loud `delivery.failed` message back to the sender. This keeps behavior intact for pull clients that only accept human-reply (`chat-reply`, formerly `telegram-reply`) rows.
 - Banking failed delivery notices: when delivery to any target fails and the original sender was itself an opted-in pull session, its `delivery.failed` notice is also banked in `pull_inbox`.
 
 ### `POST /swarm/schedule`

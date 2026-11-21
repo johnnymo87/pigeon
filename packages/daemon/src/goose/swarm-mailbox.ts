@@ -1,5 +1,6 @@
 import { GOOSE_BACKEND_KIND } from "./backend-kind.js";
 import type { SessionRecord, UpsertSessionInput } from "../storage/types.js";
+import { DEFAULT_PULL_SOURCES, HUMAN_REPLY_SOURCE } from "../storage/types.js";
 import { gooseSessionId } from "./session-id.js";
 
 export interface EnsureGooseSwarmMailboxInput {
@@ -41,7 +42,7 @@ export type EnsureGooseSwarmMailboxResult =
  *
  * Rules:
  *  - Create-if-absent: with no row, creates a notify: false goose-acp row
- *    with pull_sources ["telegram-reply", "swarm"].
+ *    with pull_sources ["chat-reply", "swarm"].
  *  - With an existing row: never downgrades notify or overwrites endpoint, token,
  *    label, or cwd. Adds "swarm" to pull_sources and touches liveness (touch).
  *  - Refuses gse_ in session_id (400), non-goose existing rows (409), and legacy
@@ -103,7 +104,7 @@ export function ensureGooseSwarmMailbox(
   const existing = byBackend;
 
   if (existing) {
-    const existingPullSources = existing.pullSources ?? ["telegram-reply"];
+    const existingPullSources = existing.pullSources ?? [...DEFAULT_PULL_SOURCES];
     const pullSources = existingPullSources.includes("swarm")
       ? existingPullSources
       : [...existingPullSources, "swarm"];
@@ -142,7 +143,7 @@ export function ensureGooseSwarmMailbox(
     },
     now,
   );
-  sessions.setPullSources(sessionId, ["telegram-reply", "swarm"], now);
+  sessions.setPullSources(sessionId, [HUMAN_REPLY_SOURCE, "swarm"], now);
 
   return {
     ok: true,

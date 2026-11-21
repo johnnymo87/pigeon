@@ -33,7 +33,7 @@ describe("PullInboxRepository", () => {
       {
         msgId,
         sessionId,
-        source: "telegram-reply",
+        source: "chat-reply",
         payload: `payload ${msgId}`,
         ...extra,
       },
@@ -209,14 +209,14 @@ describe("PullInboxRepository", () => {
       created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, claimed_at INTEGER,
       claim_count INTEGER NOT NULL DEFAULT 0, acked_at INTEGER, unacked_alerted_at INTEGER)`);
     raw.db.exec(`INSERT INTO pull_inbox (msg_id, session_id, source, payload, created_at, expires_at)
-      VALUES ('old', 'ses_pull', 'telegram-reply', 'kept', 1000, 99999999)`);
+      VALUES ('old', 'ses_pull', 'chat-reply', 'kept', 1000, 99999999)`);
     initPullInboxSchema(raw.db);
     expect(
       raw.pullInbox.bank(
         {
           msgId: "new",
           sessionId: "ses_pull",
-          source: "telegram-reply",
+          source: "chat-reply",
           payload: "x",
           senderId: "1",
           inReplyTo: "prior",
@@ -291,7 +291,7 @@ describe("PullInboxRepository", () => {
     expect(claimed[0]!.senderId).toBe("ses_peer");
   });
 
-  it("claims telegram-reply rows before swarm rows regardless of created_at, then created_at, msg_id", () => {
+  it("claims chat-reply rows before swarm rows regardless of created_at, then created_at, msg_id", () => {
     const s = newDb();
     // Swarm message banked earlier
     s.pullInbox.bank(
@@ -300,12 +300,12 @@ describe("PullInboxRepository", () => {
     );
     // chat-reply message banked later
     s.pullInbox.bank(
-      { msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg1" },
+      { msgId: "t1", sessionId: "ses_pull", source: "chat-reply", payload: "tg1" },
       2_000,
     );
-    // Second telegram-reply banked between them
+    // Second chat-reply banked between them
     s.pullInbox.bank(
-      { msgId: "t0", sessionId: "ses_pull", source: "telegram-reply", payload: "tg0" },
+      { msgId: "t0", sessionId: "ses_pull", source: "chat-reply", payload: "tg0" },
       1_500,
     );
     // Second swarm banked earliest
@@ -317,38 +317,38 @@ describe("PullInboxRepository", () => {
     const claimed = s.pullInbox.claim("ses_pull", 3_000, 10);
     expect(claimed.map((r) => r.msgId)).toEqual(["t0", "t1", "s0", "s1"]);
 
-    // Limit=1 claim: telegram-reply is claimed, peer swarm chatter never crowds it out
+    // Limit=1 claim: chat-reply is claimed, peer swarm chatter never crowds it out
     const s2 = newDb();
     s2.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw" }, 1_000);
-    s2.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 2_000);
+    s2.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "chat-reply", payload: "tg" }, 2_000);
     const top1 = s2.pullInbox.claim("ses_pull", 3_000, 1);
     expect(top1.map((r) => r.msgId)).toEqual(["t1"]);
   });
 
   it("pendingCounts reports total and counts by source, always having both keys", () => {
     const s = newDb();
-    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 1_000);
+    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "chat-reply", payload: "tg" }, 1_000);
     s.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" }, 1_000);
     s.pullInbox.bank({ msgId: "s2", sessionId: "ses_pull", source: "swarm", payload: "sw2" }, 1_000);
 
     const counts = s.pullInbox.pendingCounts("ses_pull", 2_000);
     expect(counts.total).toBe(3);
     expect(counts.bySource).toEqual({
-      "telegram-reply": 1,
+      "chat-reply": 1,
       swarm: 2,
     });
 
     const emptyCounts = s.pullInbox.pendingCounts("ses_none", 2_000);
     expect(emptyCounts.total).toBe(0);
     expect(emptyCounts.bySource).toEqual({
-      "telegram-reply": 0,
+      "chat-reply": 0,
       swarm: 0,
     });
   });
 
   it("filters out swarm rows from claim, pendingCounts, and pendingCount when includeSwarm is false", () => {
     const s = newDb();
-    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" }, 1_000);
+    s.pullInbox.bank({ msgId: "t1", sessionId: "ses_pull", source: "chat-reply", payload: "tg" }, 1_000);
     s.pullInbox.bank({ msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" }, 1_000);
     s.pullInbox.bank({ msgId: "s2", sessionId: "ses_pull", source: "swarm", payload: "sw2" }, 1_000);
 
@@ -356,7 +356,7 @@ describe("PullInboxRepository", () => {
     expect(s.pullInbox.pendingCount("ses_pull", 2_000)).toBe(3);
     expect(s.pullInbox.pendingCounts("ses_pull", 2_000).total).toBe(3);
     expect(s.pullInbox.pendingCounts("ses_pull", 2_000).bySource).toEqual({
-      "telegram-reply": 1,
+      "chat-reply": 1,
       swarm: 2,
     });
 
@@ -365,7 +365,7 @@ describe("PullInboxRepository", () => {
     const filteredCounts = s.pullInbox.pendingCounts("ses_pull", 2_000, { includeSwarm: false });
     expect(filteredCounts.total).toBe(1);
     expect(filteredCounts.bySource).toEqual({
-      "telegram-reply": 1,
+      "chat-reply": 1,
       swarm: 0,
     });
 
@@ -391,7 +391,7 @@ describe("PullInboxRepository", () => {
       claimed_at INTEGER, claim_count INTEGER NOT NULL DEFAULT 0, acked_at INTEGER,
       unacked_alerted_at INTEGER)`);
     raw.db.exec(`INSERT INTO pull_inbox (msg_id, session_id, source, payload, created_at, expires_at)
-      VALUES ('existing', 'ses_pull', 'telegram-reply', 'text', 1000, 99999999)`);
+      VALUES ('existing', 'ses_pull', 'chat-reply', 'text', 1000, 99999999)`);
     initPullInboxSchema(raw.db);
     expect(
       raw.pullInbox.bank(
@@ -414,10 +414,10 @@ describe("PullInboxRepository", () => {
   });
 
   describe("pendingSwarm", () => {
-    it("returns only swarm rows (excludes telegram-reply)", () => {
+    it("returns only swarm rows (excludes chat-reply)", () => {
       const s = newDb();
       s.pullInbox.bank(
-        { msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg" },
+        { msgId: "t1", sessionId: "ses_pull", source: "chat-reply", payload: "tg" },
         1_000,
       );
       s.pullInbox.bank(

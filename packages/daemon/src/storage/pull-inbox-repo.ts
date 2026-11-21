@@ -7,8 +7,9 @@ import type BetterSqlite3 from "better-sqlite3";
  * every plain message to its session, and nothing drains a question for a pull
  * client).
  */
-// "telegram-reply" is the persisted name of the human-reply source (kept, pigeon-4ogz.14).
-export type PullInboxSource = "telegram-reply" | "swarm";
+// "chat-reply" is the human-reply source (HUMAN_REPLY_SOURCE, renamed from "telegram-reply" in
+// pigeon-4ogz.14; initPullInboxSchema rewrites legacy rows).
+export type PullInboxSource = "chat-reply" | "swarm";
 
 export interface PullInboxRecord {
   msgId: string;
@@ -191,7 +192,7 @@ export class PullInboxRepository {
             WHERE session_id = ?
               AND acked_at IS NULL
               AND expires_at > ?${swarmFilter}
-            ORDER BY CASE source WHEN 'telegram-reply' THEN 0 WHEN 'swarm' THEN 1 ELSE 2 END ASC,
+            ORDER BY CASE source WHEN 'chat-reply' THEN 0 WHEN 'swarm' THEN 1 ELSE 2 END ASC,
                      created_at ASC,
                      msg_id ASC
             LIMIT ?`,
@@ -257,7 +258,7 @@ export class PullInboxRepository {
   /**
    * How much unread mail this session has, broken down by source.
    *
-   * Always includes both keys ("telegram-reply" and "swarm").
+   * Always includes both keys ("chat-reply" and "swarm").
    * When `options.includeSwarm` is false, `source='swarm'` rows are excluded
    * from the count (reporting 0) so wake gates do not spin on mail the client
    * cannot currently collect.
@@ -277,14 +278,14 @@ export class PullInboxRepository {
       )
       .all(sessionId, now) as Array<{ source: string; n: number }>;
     const bySource: Record<PullInboxSource, number> = {
-      "telegram-reply": 0,
+      "chat-reply": 0,
       swarm: 0,
     };
     let total = 0;
     for (const r of rows) {
       const count = Number(r.n);
       total += count;
-      if (r.source === "telegram-reply" || r.source === "swarm") {
+      if (r.source === "chat-reply" || r.source === "swarm") {
         bySource[r.source] = count;
       }
     }

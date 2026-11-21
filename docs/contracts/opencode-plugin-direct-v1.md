@@ -36,6 +36,10 @@ For OpenCode sessions, daemon routes inbound chat commands to this backend.
 }
 ```
 
+`source` is one of `telegram-reply`, `telegram-callback`, `manual` (what the daemon sends today)
+or `chat-reply`, `chat-callback` (their neutral names, accepted by the plugin since
+`pigeon-4ogz.14`; the daemon switches to them once every serve has restarted onto that plugin).
+
 ## Ack Message (plugin -> daemon)
 
 ```json

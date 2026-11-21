@@ -116,7 +116,8 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
       // random id would put a second copy of the human's message in front of the
       // agent on any partially-completed ingest.
       msgId: `pull:${context.commandId}`,
-      source: "telegram-reply",
+      // HUMAN_REPLY_SOURCE. Kept a literal: lanes' contract test greps this line.
+      source: "chat-reply",
       payload: command,
       senderId,
       inReplyTo,
@@ -129,7 +130,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
     session: SessionRecord,
     input: {
       msgId: string;
-      source: "telegram-reply";
+      source: "chat-reply";
       payload: string;
       senderId: string;
       inReplyTo: string | null;
