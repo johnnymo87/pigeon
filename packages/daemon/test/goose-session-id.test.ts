@@ -236,7 +236,7 @@ describe("/launch --backend goose", () => {
         close: () => {},
       }),
       runnerFor: () => ({ deliver: async () => ({ ok: true as const }) }),
-      sendTelegramReply: async () => {},
+      sendChatReply: async () => {},
       mintTimeoutMs: 5_000,
     });
     const row = storage.sessions.get(gooseSessionId("devbox", "20261028_1"));

@@ -24,7 +24,7 @@ interface ReapDeps {
    * registers and buys not having to persist anything.
    */
   ownership?: OwnershipRefreshState;
-  /** Plain Telegram alert, for a session this daemon holds whose worker row another machine owns. */
+  /** Plain chat alert, for a session this daemon holds whose worker row another machine owns. */
   alert?: (text: string) => Promise<unknown>;
   nowFn?: () => number;
   log?: (msg: string) => void;
@@ -107,7 +107,7 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
   }
 
   // Ownership refresh (pigeon-k0qn.5). The worker's session row is what the cross-machine relay
-  // routes by, and its `updated_at` moves only on register, notifications and Telegram routing.
+  // routes by, and its `updated_at` moves only on register, notifications and chat routing.
   // A quiet session never notifies, so without this its row goes stale: another machine's
   // credential may take it over after 7 days, and the worker sweeps it at 14 and anyone may
   // claim it fresh. Re-registering each live session about once a day keeps the row owned and
@@ -147,7 +147,7 @@ export async function reapStaleSessions(deps: ReapDeps): Promise<ReapResult> {
             await deps.alert?.(
               `Session ${session.sessionId}${session.label ? ` (${session.label})` : ""} runs on this machine, ` +
                 `but the worker has it registered to another machine, which now receives its cross-machine ` +
-                `swarm messages and Telegram commands. ${detail}`,
+                `swarm messages and chat commands. ${detail}`,
             );
           } catch {
             // Best-effort; the log line above stands.

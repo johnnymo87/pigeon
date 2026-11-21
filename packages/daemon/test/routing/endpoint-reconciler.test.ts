@@ -393,7 +393,7 @@ describe("ServeEndpointReconciler", () => {
       endpoints: POOL,
       notifier: {
         sendPlainAlert: async () => {
-          throw new Error("telegram down");
+          throw new Error("chat down");
         },
       },
       log,

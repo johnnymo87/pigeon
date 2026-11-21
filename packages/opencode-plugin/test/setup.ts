@@ -97,12 +97,9 @@ beforeEach(() => {
   if (!process.env.PIGEON_DAEMON_URL) {
     process.env.PIGEON_DAEMON_URL = "http://127.0.0.1:1"
   }
-  if (
-    process.env.PIGEON_DAEMON_URL.includes(":4731") ||
-    process.env.TELEGRAM_WEBHOOK_PORT === "4731"
-  ) {
+  if (process.env.PIGEON_DAEMON_URL.includes(":4731")) {
     throw new Error(
-      "Test isolation guard: PIGEON_DAEMON_URL or TELEGRAM_WEBHOOK_PORT targets live production daemon port 4731!"
+      "Test isolation guard: PIGEON_DAEMON_URL targets live production daemon port 4731!"
     )
   }
 

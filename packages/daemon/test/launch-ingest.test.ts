@@ -25,7 +25,7 @@ function makeInput(overrides: Partial<LaunchCommandInput> = {}): LaunchCommandIn
     prompt: "Write a hello world program",
     chatId: "42",
     opencodeClient,
-    sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+    sendChatReply: vi.fn().mockResolvedValue(undefined),
     spawn: vi.fn(() => ({
       unref: vi.fn(),
       on: vi.fn(),
@@ -149,12 +149,12 @@ describe("ingestLaunchCommand", () => {
       );
     });
 
-    it("sends a confirmation Telegram reply containing the session id and directory with entities", async () => {
+    it("sends a confirmation chat reply containing the session id and directory with entities", async () => {
       const input = makeInput();
 
       await ingestLaunchCommand(input);
 
-      const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+      const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
       expect(chatId).toBe("42");
       expect(text).toContain("sess-123");
       expect(text).toContain("/home/user/project");
@@ -169,7 +169,7 @@ describe("ingestLaunchCommand", () => {
   });
 
   describe("server down", () => {
-    it("sends 'not running' Telegram reply when healthCheck returns false", async () => {
+    it("sends 'not running' chat reply when healthCheck returns false", async () => {
       const input = makeInput({
         opencodeClient: {
           healthCheck: vi.fn().mockResolvedValue(false),
@@ -180,7 +180,7 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+      expect(input.sendChatReply).toHaveBeenCalledWith(
         "42",
         "opencode serve is not running.",
       );
@@ -202,7 +202,7 @@ describe("ingestLaunchCommand", () => {
   });
 
   describe("session creation fails", () => {
-    it("sends 'Failed to launch' Telegram reply when createSession throws", async () => {
+    it("sends 'Failed to launch' chat reply when createSession throws", async () => {
       const input = makeInput({
         opencodeClient: {
           healthCheck: vi.fn().mockResolvedValue(true),
@@ -213,7 +213,7 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+      expect(input.sendChatReply).toHaveBeenCalledWith(
         "42",
         expect.stringContaining("Failed to launch session"),
       );
@@ -232,7 +232,7 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      const [chatId, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+      const [chatId, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
       expect(chatId).toBe("42");
       expect(text).toContain("Session started:");
       expect(text).toContain("sess-xyz");
@@ -254,7 +254,7 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+      expect(input.sendChatReply).toHaveBeenCalledWith(
         "42",
         "Launch may or may not have started: request timed out after 30000ms: http://localhost:4096/session",
       );
@@ -272,13 +272,13 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+      expect(input.sendChatReply).toHaveBeenCalledWith(
         "42",
         "Launch on devbox may or may not have started: request timed out after 30000ms: http://localhost:4096/session",
       );
     });
 
-    it("does not throw when sendTelegramReply fails for unconfirmed without id", async () => {
+    it("does not throw when sendChatReply fails for unconfirmed without id", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const input = makeInput({
         opencodeClient: {
@@ -286,7 +286,7 @@ describe("ingestLaunchCommand", () => {
           createSession: vi.fn().mockRejectedValue(new RequestTimeoutError(30000, "http://localhost:4096/session")),
           sendPrompt: vi.fn(),
         } as unknown as OpencodeClient,
-        sendTelegramReply: vi.fn().mockRejectedValue(new Error("telegram network error")),
+        sendChatReply: vi.fn().mockRejectedValue(new Error("chat network error")),
       });
 
       await expect(ingestLaunchCommand(input)).resolves.not.toThrow();
@@ -309,12 +309,12 @@ describe("ingestLaunchCommand", () => {
 
       await ingestLaunchCommand(input);
 
-      expect(input.sendTelegramReply).toHaveBeenCalledWith(
+      expect(input.sendChatReply).toHaveBeenCalledWith(
         "42",
         expect.stringContaining("Session started"),
         expect.anything(),
       );
-      const text = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0]![1];
+      const text = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0]![1];
       expect(text).not.toContain("Failed to launch session");
       expect(text).toContain("sess-123");
     });
@@ -508,7 +508,7 @@ describe("ingestLaunchCommand", () => {
   // touches ~/.local/share/oc-tags/tags.db.
   describe("tagging", () => {
     function lastReply(input: LaunchCommandInput): string {
-      const calls = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls;
       return calls[calls.length - 1]![1] as string;
     }
 
@@ -542,7 +542,7 @@ describe("ingestLaunchCommand", () => {
     it("announces the tag so a cache warmed before it can be refetched", async () => {
       // The session registers (and warms its tag cache) before the tag is
       // written, so without this its first notification shows no tag right
-      // after Telegram said the tag was applied.
+      // after the chat said the tag was applied.
       const onTagged = vi.fn();
       const runOcTags = vi.fn().mockResolvedValue({ code: 0, stdout: "Tagged\n", stderr: "" });
 
@@ -724,7 +724,7 @@ describe("ingestLaunchCommand", () => {
     const PARENT = "ses_parent01AbC";
 
     function lastReply(input: LaunchCommandInput): string {
-      const calls = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls;
+      const calls = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls;
       return calls[calls.length - 1]![1] as string;
     }
 

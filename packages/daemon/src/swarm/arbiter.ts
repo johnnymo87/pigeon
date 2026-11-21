@@ -38,7 +38,7 @@ export interface SessionOwner {
   machineId: string;
   /**
    * Epoch ms of the worker row's `updated_at`: bumped by registration and also by
-   * notifications and Telegram routing, from any machine. "Last active", not
+   * notifications and chat routing, from any machine. "Last active", not
    * "last registered".
    */
   lastSeen: number;
@@ -420,7 +420,7 @@ export class SwarmArbiter {
    *
    * processOnce runs every 500ms with NO reentrancy guard and awaits
    * sweepExpired BEFORE drainTarget. With the old inline alerts, N expired
-   * rows meant up to N×10s of Telegram latency inside the sweep, stalling live
+   * rows meant up to N×10s of chat latency inside the sweep, stalling live
    * deliveries behind it and stacking ~20 overlapping processOnce calls per
    * wedged send. Making the sweep synchronous removes that structurally.
    */

@@ -9,7 +9,7 @@ import { runAdditiveMigrations, SESSION_TTL_MS } from "./schema";
  * deliberately NOT a guarantee: retention >= the TTL secures "the ledger outlives the
  * session it describes" only for a session whose last activity WAS a delivery (final
  * event at t, reaped by t + TTL). A session that stays alive while delivering nothing
- * -- `touch` refreshes the TTL on paths that send no Telegram message -- still ages
+ * -- `touch` refreshes the TTL on paths that send no chat message -- still ages
  * out and renders as unknown. No finite constant fixes that; see the design doc for
  * why the session-scoped prune that would was rejected.
  *
@@ -19,7 +19,7 @@ import { runAdditiveMigrations, SESSION_TTL_MS } from "./schema";
 export const SESSION_EVENTS_RETENTION_MS = 2 * SESSION_TTL_MS;
 
 /**
- * The unread substrate: a durable log of what was actually delivered to a Telegram
+ * The unread substrate: a durable log of what was actually delivered to a chat
  * topic, plus a per-session read watermark.
  *
  * Deliberately WITHOUT a foreign key to sessions(session_id), for the same reason

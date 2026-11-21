@@ -19,7 +19,7 @@ import { gooseSessionId } from "./session-id.js";
  *    `session_id` on unregister. Two machines would silently repoint and then
  *    destroy each other's live sessions. See SessionRecord.backendSessionId.
  *  - **`notify` is forced true, not defaulted.** A goose session exists only to
- *    be driven from Telegram, and with notify=false the `/stop` route returns
+ *    be driven from the chat, and with notify=false the `/stop` route returns
  *    early, so the human never hears a turn finish -- indistinguishable from a
  *    broken adapter.
  *  - **The id is derived, not random** (`gooseSessionId`, pigeon-k0qn.13.4),

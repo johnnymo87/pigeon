@@ -3,7 +3,7 @@ import { openSync } from "fs";
 import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 import { OpencodeHttpError, type OpencodeClient } from "../opencode-client";
 import { RequestTimeoutError, TransportError, transportCode } from "../routing/serve-outcome";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
 import { isValidTag, truncate } from "./tag-ingest";
 import { parseWhichLine } from "../tag-resolver";
@@ -91,7 +91,7 @@ export interface LaunchCommandInput {
    * way, and this must not cost the confirmation message.
    */
   onTagged?: (sessionId: string) => void;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
   /** Injected for tests; defaults to node child_process.spawn. */
   spawn?: (cmd: string, args: ReadonlyArray<string>, opts?: { stdio?: "ignore" | "inherit" | "pipe" | Array<"ignore" | "inherit" | "pipe" | number>; detached?: boolean }) => ChildProcess;
 }
@@ -100,7 +100,7 @@ export interface LaunchCommandInput {
  * Last non-empty line, which for a Python traceback is the only useful one.
  *
  * Truncated with tag-ingest's surrogate-safe helper rather than slice(): a lone
- * surrogate makes the JSON body invalid UTF-8 and Telegram rejects the WHOLE
+ * surrogate makes the JSON body invalid UTF-8 and the chat rejects the WHOLE
  * message with a 400 — and on this path that message is the one carrying the
  * session id.
  */
@@ -341,7 +341,7 @@ export interface LaunchStartInput {
   createClients?: () => OpencodeClient[];
 }
 
-/** Create budget for a launch with no explicit budgets (Telegram /launch). */
+/** Create budget for a launch with no explicit budgets (the chat /launch). */
 export const DEFAULT_CREATE_BUDGET_MS = 30_000;
 
 /**
@@ -543,7 +543,7 @@ export function autoAttach(
   // absolute path to the binary. Required on hosts (e.g. cloudbox) where
   // the daemon's PATH is a locked-down nix-store list that does NOT
   // include ~/.nix-profile/bin — without it, spawn would silently ENOENT
-  // and the auto-attach to nvim+tmux for telegram /launch would never run.
+  // and the auto-attach to nvim+tmux for a chat /launch would never run.
   //
   // We route the child's stdout AND stderr to /tmp/oc-auto-attach.log
   // (the same log file the home.base.nix shell wrapper uses). Without
@@ -584,7 +584,7 @@ export function autoAttach(
 }
 
 export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<void> {
-  const { commandId, prompt, chatId, machineId, opencodeClient, sendTelegramReply } = input;
+  const { commandId, prompt, chatId, machineId, opencodeClient, sendChatReply } = input;
   const directory = resolveHome(expandShorthand(input.directory));
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
@@ -598,16 +598,16 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
 
   if (outcome.outcome === "refused") {
     if (outcome.reason === "serve_unavailable") {
-      await sendTelegramReply(chatId, `opencode serve is not running${machineLabel}.`);
+      await sendChatReply(chatId, `opencode serve is not running${machineLabel}.`);
       return;
     }
-    await sendTelegramReply(chatId, `Failed to launch session${machineLabel}: ${outcome.detail}`);
+    await sendChatReply(chatId, `Failed to launch session${machineLabel}: ${outcome.detail}`);
     return;
   }
 
   if (outcome.outcome === "unconfirmed" && outcome.sessionId === null) {
     try {
-      await sendTelegramReply(chatId, `Launch${machineLabel} may or may not have started: ${outcome.detail}`);
+      await sendChatReply(chatId, `Launch${machineLabel} may or may not have started: ${outcome.detail}`);
     } catch (err) {
       console.warn(`[launch-ingest] unconfirmed reply failed:`, err);
     }
@@ -626,7 +626,7 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
   const tagLine = await tagLaunchedSession(input, sessionId, machineLabel);
 
   try {
-    const builder = new TgMessageBuilder()
+    const builder = new ChatMessageBuilder()
       .append(`Session started${machineLabel}:\n🆔 `)
       .appendCode(sessionId)
       .append("\n📂 ")
@@ -640,7 +640,7 @@ export async function ingestLaunchCommand(input: LaunchCommandInput): Promise<vo
     const msg = builder
       .append("\n\nThe pigeon plugin will notify you when the session stops or has questions.")
       .build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
   } catch (err) {
     console.warn(`[launch-ingest] confirmation reply failed session=${sessionId}:`, err);
   }

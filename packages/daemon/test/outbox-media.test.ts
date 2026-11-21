@@ -44,7 +44,7 @@ describe("OutboxSender outbound media", () => {
   }
 
   function sender(sendFn: SendNotificationFn, uploadMedia?: UploadMediaFn, log = vi.fn()) {
-    return new OutboxSender({ storage, sendNotification: sendFn, uploadMedia, chatId: "chat-1", nowFn: () => now, log });
+    return new OutboxSender({ storage, sendNotification: sendFn, uploadMedia, nowFn: () => now, log });
   }
 
   const stored = () => JSON.parse(storage.outbox.getByNotificationId("stop-1")!.payload) as Record<string, unknown>;
@@ -252,7 +252,7 @@ describe("OutboxSender outbound media", () => {
   });
 
   it("rides with a rich chunk 0 that ends the entry", async () => {
-    seed({ messages: [{ text: "a" }, { text: "b" }], rich: { markdown: "| a |\n|---|\n| 1 |" } });
+    seed({ messages: [{ text: "a" }, { text: "b" }], rich: { markdown: "| a |\n|---|\n| 1 |", dialect: "slack" } });
     const sendFn = vi.fn().mockResolvedValue({ ...success, body: { ok: true, messageId: 1, rich: "sent" } });
     await sender(sendFn as unknown as SendNotificationFn, async (key) => ({ ok: true, key })).processOnce();
     expect(sendFn).toHaveBeenCalledTimes(1);

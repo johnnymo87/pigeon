@@ -58,7 +58,7 @@ describe("bankOrInsertSwarmMessage", () => {
     // NOT stored in swarm_messages (arbiter must never see it)
     expect(s.swarm.getByMsgId("msg_1")).toBeNull();
 
-    // Telegram notice enqueued in outbox
+    // Chat notice enqueued in outbox
     const outboxRow = s.outbox.getByNotificationId("w:msg_1");
     expect(outboxRow).not.toBeNull();
     expect(outboxRow!.sessionId).toBe("ses_pull");

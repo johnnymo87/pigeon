@@ -1,24 +1,24 @@
 /**
- * TgMessage types and TgMessageBuilder for constructing Telegram messages
+ * ChatMessage types and ChatMessageBuilder for constructing chat message
  * using the entities API instead of Markdown parse_mode.
  *
- * Offsets and lengths are UTF-16 code unit counts, matching the Telegram Bot API spec.
+ * Offsets and lengths are UTF-16 code unit counts, matching the entities spec of the wire format (Telegram's, kept as the wire shape).
  */
 
-export interface TgEntity {
+export interface ChatEntity {
   offset: number;
   length: number;
   type: "bold" | "italic" | "code" | "pre";
 }
 
-export interface TgMessage {
+export interface ChatMessage {
   text: string;
-  entities: TgEntity[];
+  entities: ChatEntity[];
 }
 
-export class TgMessageBuilder {
+export class ChatMessageBuilder {
   private text = "";
-  private entities: TgEntity[] = [];
+  private entities: ChatEntity[] = [];
 
   append(s: string): this {
     this.text += s;
@@ -46,11 +46,11 @@ export class TgMessageBuilder {
     return this;
   }
 
-  build(): TgMessage {
+  build(): ChatMessage {
     return { text: this.text, entities: [...this.entities] };
   }
 
-  private appendEntity(s: string, type: TgEntity["type"]): this {
+  private appendEntity(s: string, type: ChatEntity["type"]): this {
     const offset = this.text.length;
     this.text += s;
     this.entities.push({ offset, length: s.length, type });
@@ -58,9 +58,9 @@ export class TgMessageBuilder {
   }
 }
 
-export function concatMessages(messages: TgMessage[]): TgMessage {
+export function concatMessages(messages: ChatMessage[]): ChatMessage {
   let text = "";
-  const entities: TgEntity[] = [];
+  const entities: ChatEntity[] = [];
   for (const msg of messages) {
     const offset = text.length;
     text += msg.text;

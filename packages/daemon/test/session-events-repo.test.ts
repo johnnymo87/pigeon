@@ -165,7 +165,7 @@ describe("session events repo", () => {
   });
 });
 
-describe("markAllRead: what an inbound Telegram action does", () => {
+describe("markAllRead: what an inbound chat action does", () => {
   it("advances to this session's max, clearing the badge", () => {
     const { repo } = seeded();
     repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });
@@ -194,7 +194,7 @@ describe("markAllRead: what an inbound Telegram action does", () => {
   });
 
   // The semantic the whole feature rests on, and it was asserted nowhere
-  // end-to-end: acting in Telegram clears, and the NEXT delivery counts again.
+  // end-to-end: acting in the chat clears, and the NEXT delivery counts again.
   it("a delivery after the clear counts as unread again", () => {
     const { repo } = seeded();
     repo.append({ sessionId: "s1", notificationId: "n1", kind: "stop", sentAt: 1 });

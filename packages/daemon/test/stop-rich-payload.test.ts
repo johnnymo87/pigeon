@@ -4,7 +4,7 @@ import { openStorageDb, type StorageDb } from "../src/storage/database";
 
 /**
  * A stop whose body contains a pipe table carries `rich: {markdown}` in its outbox payload, so
- * the outbox can ask the worker for one Telegram rich message (pigeon-p909). Everything else
+ * the outbox can ask the worker for one chat rich message (pigeon-p909). Everything else
  * stays exactly as it was: no `rich` field at all.
  */
 describe("POST /stop rich payload", () => {
@@ -17,7 +17,7 @@ describe("POST /stop rich payload", () => {
 
   async function stopPayload(message: string): Promise<Record<string, unknown>> {
     storage = openStorageDb(":memory:");
-    const app = createApp(storage, { nowFn: () => 1_000, chatId: "chat-1", machineId: "devbox" });
+    const app = createApp(storage, { nowFn: () => 1_000, machineId: "devbox" });
     await app(new Request("http://localhost/session-start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -34,11 +34,13 @@ describe("POST /stop rich payload", () => {
 
   it("adds rich markdown when the message contains a table", async () => {
     const payload = await stopPayload("Costs:\n| tag | $ |\n|---|---|\n| a | $5 |");
-    const rich = payload.rich as { markdown: string };
-    expect(rich.markdown).toContain("| tag | \\$ |\n|---|---|\n| a | \\$5 |");
+    const rich = payload.rich as { markdown: string; dialect: string };
+    // Always the Slack dialect, and it says so: no escapes, no spacer paragraphs, no copy buttons.
+    expect(rich.dialect).toBe("slack");
+    expect(rich.markdown).toContain("| tag | $ |\n|---|---|\n| a | $5 |");
     expect(rich.markdown).toContain("Costs:\n\n| tag");
-    // Footer code converted to copy buttons, session id included.
-    expect(rich.markdown).toContain('🆔 <tg-button type="copy_text" text="sess-r">sess-r</tg-button>');
+    expect(rich.markdown).toContain("🆔 `sess-r`");
+    expect(rich.markdown).not.toContain("tg-button");
     // The plain chunks are still there, unchanged, for the fallback.
     const messages = payload.messages as Array<{ text: string }>;
     expect(messages[0]!.text).toContain("| tag | $ |");

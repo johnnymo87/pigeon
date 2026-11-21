@@ -33,19 +33,19 @@ function makeDeps(overrides: Partial<TagCommandDeps> = {}): TagCommandDeps {
     machineId: "cloudbox",
     homeDir: "/home/dev",
     runOcTags: vi.fn().mockResolvedValue({ code: 0, stdout: "", stderr: "" }),
-    sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+    sendChatReply: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
 
 function sentText(deps: TagCommandDeps): string {
-  const mock = deps.sendTelegramReply as ReturnType<typeof vi.fn>;
+  const mock = deps.sendChatReply as ReturnType<typeof vi.fn>;
   expect(mock.mock.calls.length).toBeGreaterThan(0);
   return mock.mock.calls[0]![1] as string;
 }
 
 function sentEntities(deps: TagCommandDeps): Array<{ type: string; offset: number; length: number }> {
-  const mock = deps.sendTelegramReply as ReturnType<typeof vi.fn>;
+  const mock = deps.sendChatReply as ReturnType<typeof vi.fn>;
   return (mock.mock.calls[0]![2] ?? []) as Array<{ type: string; offset: number; length: number }>;
 }
 
@@ -172,7 +172,7 @@ describe("ingestTagTopCommand", () => {
     expect(codes).toContain("/tag ses_f966a4af3ffeIXwkQcs07oAfBL");
   });
 
-  it("caps the number of rows so the reply fits in one Telegram message", async () => {
+  it("caps the number of rows so the reply fits in one chat message", async () => {
     const header = TOP_OUTPUT.split("\n").slice(0, 2);
     // Mirrors oc-tags' printf: {dollars:>10}  {session_id:<32}  {title:<40}  {directory}
     const many = Array.from({ length: 40 }, (_, i) => {
@@ -388,7 +388,7 @@ describe("rendering safety", () => {
     await ingestTagTopCommand(deps);
 
     const text = sentText(deps);
-    // An unpaired surrogate makes the JSON body invalid UTF-8 and Telegram
+    // An unpaired surrogate makes the JSON body invalid UTF-8 and the chat
     // rejects the whole message with a 400.
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(text)).toBe(false);
   });

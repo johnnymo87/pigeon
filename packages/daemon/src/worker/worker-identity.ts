@@ -5,7 +5,7 @@
  * At startup the daemon asks `GET /whoami` and logs one `[worker-identity]` line. That
  * line is the runbook's check that "the worker sees this daemon as machine X" after a key
  * is rotated. A mismatch or a rejection only warns here: the poller's refused-poll alarm
- * (`onPollAuthRejected`) is the one alert, so a bad key produces one Telegram message, not
+ * (`onPollAuthRejected`) is the one alert, so a bad key produces one chat message, not
  * two.
  */
 import type { WorkerIdentity } from "./poller";
@@ -44,11 +44,11 @@ export function describeWorkerIdentity(
   }
 }
 
-/** Telegram text for the poller's refused-poll alarm. */
+/** Chat text for the poller's refused-poll alarm. */
 export function formatPollAuthAlert(machineId: string, status: number, consecutive: number): string {
   return (
     `pigeon daemon on ${machineId}: the worker has refused its last ${consecutive} polls ` +
-    `(HTTP ${status}). Telegram commands for this machine are not being delivered. ` +
+    `(HTTP ${status}). Chat commands for this machine are not being delivered. ` +
     (status === 403
       ? "The credential is registered to a different machine than CCR_MACHINE_ID. "
       : "The credential is unknown or revoked, the shared key has been retired for this machine, " +

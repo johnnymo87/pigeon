@@ -17,7 +17,7 @@ describe("POST /stop media payload", () => {
 
   async function stop(extra: Record<string, unknown>): Promise<{ status: number; payload: Record<string, unknown> }> {
     storage = openStorageDb(":memory:");
-    const app = createApp(storage, { nowFn: () => 1_000, chatId: "chat-1", machineId: "devbox" });
+    const app = createApp(storage, { nowFn: () => 1_000, machineId: "devbox" });
     await app(new Request("http://localhost/session-start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

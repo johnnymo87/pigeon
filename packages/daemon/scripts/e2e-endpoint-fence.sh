@@ -12,8 +12,8 @@
 #  - No CCR_* vars, so the worker poller never starts and nothing registers.
 #  - PIGEON_SERVE_ENDPOINTS lists ports nothing is listening on, and
 #    PIGEON_SERVE_LIVENESS=self so the daemon never HTTP-probes them.
-#  - TELEGRAM_BOT_TOKEN is deliberately bogus, so the alert path is exercised for
-#    real but Telegram rejects it instead of paging a human.
+#  - PIGEON_SLACK_ALARM_WEBHOOK_URL is deliberately bogus, so the alert path is exercised
+#    for real but Slack rejects it instead of paging a human.
 set -uo pipefail
 
 WT=/home/dev/projects/pigeon/.worktrees/registry-fencing
@@ -42,8 +42,7 @@ env -u OPENCODE_SERVE_ID -u OPENCODE_ROUTING_DB -u OPENCODE_DB -u CCR_WORKER_URL
     PIGEON_SERVE_ENDPOINTS="http://127.0.0.1:34096,http://127.0.0.1:34097" \
     PIGEON_SERVE_LIVENESS=self \
     PIGEON_HEALTH_POLL_MS="$POLL_MS" \
-    TELEGRAM_BOT_TOKEN="000000:bogus-token-for-e2e" \
-    TELEGRAM_CHAT_ID="-1000000000000" \
+    PIGEON_SLACK_ALARM_WEBHOOK_URL="https://hooks.slack.com/services/T000/B000/bogus-for-e2e" \
     CCR_MACHINE_ID="" \
   setsid nohup node /home/dev/projects/pigeon/node_modules/tsx/dist/cli.mjs "$WT/packages/daemon/src/index.ts" \
   < /dev/null > "$LOG" 2>&1 &
@@ -83,7 +82,7 @@ process.stdout.write(r ? r.endpoint : "");' "$DB")
   if [ "$ep" = "http://127.0.0.1:34097" ]; then REPAIRED="yes (after ~$((i*250))ms)"; break; fi
 done
 
-# The alert is an awaited network call to the Telegram Bot API (direct-only host); give it a bounded
+# The alert is an awaited network call to the Slack webhook (direct-only host); give it a bounded
 # window to land rather than racing it (an unbounded assume-it-happened here
 # would be exactly the vacuous check this exercise is guarding against).
 for i in $(seq 1 60); do

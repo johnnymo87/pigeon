@@ -10,7 +10,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
  *
  * Pre-existing -- it already affected stop notifications -- but Phase 2 of
  * `pigeon-d95y` made it louder, because a misclassified subagent also MIRRORS
- * its prompts to Telegram, and a subagent prompt is a full task brief.
+ * its prompts to the chat, and a subagent prompt is a full task brief.
  *
  * These tests reproduce the symptom through the real plugin entrypoint rather
  * than by asserting on SessionManager directly: the claim under test is about

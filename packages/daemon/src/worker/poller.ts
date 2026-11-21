@@ -12,7 +12,6 @@ import type { TopicMap } from "../alert-links";
 
 export interface SendNotificationInput {
   sessionId: string;
-  chatId: string;
   text: string;
   replyMarkup: unknown;
   media?: Array<{ key: string; mime: string; filename: string }>;
@@ -23,11 +22,12 @@ export interface SendNotificationInput {
   threaded?: boolean;
   onTopicUnavailable?: "retry" | "general";
   /**
-   * Ask the worker to send the WHOLE notification as one Telegram rich message (pigeon-p909).
+   * Ask the worker to send the WHOLE notification as one rich message (pigeon-p909).
    * `text`/`entities` are still this chunk's plain rendering: the worker falls back to them on
    * a rich rejection, and a worker that predates rich ignores this field and sends them.
+   * The dialect is always Slack's markdown.
    */
-  rich?: { markdown: string; dialect?: "slack" };
+  rich?: { markdown: string; dialect: "slack" };
   /** Ask for the owner mention (Slack only; pigeon-4ogz.5). Sent only when true. */
   notifyOwner?: boolean;
 }
@@ -172,7 +172,6 @@ export interface PollerConfig {
   workerUrl: string;
   apiKey: string;
   machineId: string;
-  chatId?: string;
   /** Default 5000 ms */
   pollIntervalMs?: number;
   /**
@@ -193,8 +192,8 @@ export interface PollerConfig {
    */
   relayHeader?: string | null;
   /**
-   * Read per poll instead of `relayHeader` when set (pigeon-4ogz.5): launch capability now
-   * depends on the persisted `whoami.transport`, so a flip changes the header without a restart.
+   * Read per poll instead of `relayHeader` when set (pigeon-4ogz.5): launch capability is
+   * recomputed each time, so a config change shows in the header without a restart.
    */
   relayHeaderFn?: () => string | null;
 }
@@ -209,13 +208,13 @@ export interface ExecuteMessage {
   media?: { key: string; mime: string; filename: string; size: number };
   metadata?: {
     questionRequestId?: string;
-    /** Telegram user id of the sender. Absent from older workers and button taps. */
+    /** Chat user id of the sender. Absent from older workers and button taps. */
     senderId?: string;
-    /** True when the Telegram message was forwarded from someone else. */
+    /** True when the chat message was forwarded from someone else. */
     forwarded?: boolean;
     /** Up to 500 chars of the bot's own message the human swipe-replied to. */
     inReplyTo?: string;
-    /** Up to 500 chars of Telegram's partial quote when the human highlighted a span. */
+    /** Up to 500 chars of the chat's partial quote when the human highlighted a span. */
     inReplyToQuote?: string;
   };
 }
@@ -452,7 +451,7 @@ export interface PollerDeps {
    * row, and again only after a successful poll has reset the count (pigeon-k0qn.8). A
    * rotated credential that the worker does not know, or one registered to a different
    * machine, otherwise fails every 5s with nothing but a warn line: on an idle machine
-   * nobody would notice that Telegram commands had stopped arriving.
+   * nobody would notice that chat commands had stopped arriving.
    */
   onPollAuthRejected?: (status: number, consecutive: number) => void;
   /** Bound on `unregisterSession`'s worker call. Defaults to {@link UNREGISTER_TIMEOUT_MS}. */
@@ -481,7 +480,7 @@ export type WorkerIdentity =
 
 /**
  * A non-2xx from the worker's `POST /topics/rename`. Keeps the status and the worker's error
- * code apart so a caller can tell a retryable failure (503 storage, 502 Telegram) from a
+ * code apart so a caller can tell a retryable failure (503 storage, 502 the chat) from a
  * terminal one (403 machine_mismatch, 404 unknown_session, 409 bound_session).
  */
 export class TopicRenameError extends Error {
@@ -636,8 +635,8 @@ export class Poller {
       if (!response.ok) return { kind: "unknown", error: `status ${response.status}` };
       const body = (await response.json()) as { credential?: unknown; machine_id?: unknown; transport?: unknown };
       if (body.credential === "machine" && typeof body.machine_id === "string") {
-        // Absent (or anything but "slack") in a 200 is Telegram: the worker adds the field only
-        // for a machine on Slack, so a Telegram machine's identity stays exactly what it was.
+        // `transport` is informational only: nothing reads it, and its absence must never be
+        // taken to mean any particular transport (Telegram is gone, pigeon-4ogz.13).
         return body.transport === "slack"
           ? { kind: "machine", machineId: body.machine_id, transport: "slack" }
           : { kind: "machine", machineId: body.machine_id };
@@ -925,46 +924,45 @@ export class Poller {
     req: { key: string; name: string; staleThreadId?: number },
     signal?: AbortSignal,
   ): Promise<{ messageThreadId: number; created: boolean; chatId?: string }> {
-    if (!this.config.chatId) throw new Error("no chat configured");
     const response = await this.fetchFn(`${this.config.workerUrl}/topics/named`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.config.apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ chatId: this.config.chatId, ...req }),
+      body: JSON.stringify(req),
       ...(signal ? { signal } : {}),
     });
     if (!response.ok) throw new Error(`topics/named returned ${response.status}`);
     const body = (await response.json()) as { messageThreadId?: unknown; created?: unknown; chatId?: unknown };
     if (typeof body?.messageThreadId !== "number") throw new Error("topics/named returned no thread");
-    // The worker resolves the chat itself (a machine on Slack gets its workspace whatever we
-    // sent), so the returned one is where the topic is (pigeon-4ogz.5).
+    // The worker resolves the chat itself (the machine's workspace), so the returned one is
+    // where the topic is (pigeon-4ogz.5).
     return {
       messageThreadId: body.messageThreadId,
       created: body.created === true,
-      // Only a Slack address is surfaced: a Telegram topic is in our configured chat.
+      // The worker resolves the chat (the machine's workspace); a numeric chat id from an old
+      // worker is not an address this daemon can use, so only a Slack one is surfaced.
       ...(typeof body.chatId === "string" && body.chatId.startsWith("slack:") ? { chatId: body.chatId } : {}),
     };
   }
 
   /**
-   * Bind a named topic to a session. POSTs chatId/sessionId/key/name to
-   * `/topics/named/bind` in this daemon's chat. Throws on any failure (caller reports it).
+   * Bind a named topic to a session. POSTs sessionId/key/name (no chat id: the worker resolves it) to
+   * `/topics/named/bind`. Throws on any failure (caller reports it).
    * Not recorded in the worker-health monitor (same reasoning as resolveNamedTopic).
    */
   async bindNamedTopic(
     req: { sessionId: string; key: string; name: string },
     signal?: AbortSignal,
   ): Promise<{ messageThreadId: number; chatId?: string }> {
-    if (!this.config.chatId) throw new Error("no chat configured");
     const response = await this.fetchFn(`${this.config.workerUrl}/topics/named/bind`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.config.apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ chatId: this.config.chatId, ...req }),
+      body: JSON.stringify(req),
       ...(signal ? { signal } : {}),
     });
     if (!response.ok) {
@@ -983,7 +981,8 @@ export class Poller {
     }
     return {
       messageThreadId: body.messageThreadId,
-      // Only a Slack address is surfaced: a Telegram topic is in our configured chat.
+      // The worker resolves the chat (the machine's workspace); a numeric chat id from an old
+      // worker is not an address this daemon can use, so only a Slack one is surfaced.
       ...(typeof body.chatId === "string" && body.chatId.startsWith("slack:") ? { chatId: body.chatId } : {}),
     };
   }
@@ -1056,7 +1055,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner } = input;
+    const { sessionId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -1066,7 +1065,6 @@ export class Poller {
         },
         body: JSON.stringify({
           sessionId,
-          chatId,
           text,
           replyMarkup,
           ...(media && media.length > 0 ? { media } : {}),
@@ -1152,10 +1150,5 @@ export class Poller {
       console.warn(`[poller] uploadMedia failed key=${key}:`, error);
       return { ok: false, key: "", permanent: false, error };
     }
-  }
-
-  /** Returns the chatId from config. */
-  getConfiguredChatId(): string | undefined {
-    return this.config.chatId;
   }
 }

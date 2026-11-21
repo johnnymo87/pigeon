@@ -12,7 +12,7 @@ describe("ingestKillCommand", () => {
         deleteSession: vi.fn().mockResolvedValue(undefined),
         abortSession: vi.fn().mockResolvedValue(undefined),
       } as any,
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -23,7 +23,7 @@ describe("ingestKillCommand", () => {
     await ingestKillCommand(input);
 
     expect(input.opencodeClient.deleteSession).toHaveBeenCalledWith("sess-abc");
-    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(chatId).toBe("12345");
     expect(text).toContain("terminated");
     expect(text).toContain("sess-abc");
@@ -44,7 +44,7 @@ describe("ingestKillCommand", () => {
 
     await ingestKillCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("Failed to kill"),
     );
@@ -56,7 +56,7 @@ describe("ingestKillCommand", () => {
       opencodeClient: {
         deleteSession: vi.fn(async () => { callOrder.push("delete"); }),
       } as any,
-      sendTelegramReply: vi.fn(async () => { callOrder.push("reply"); }),
+      sendChatReply: vi.fn(async () => { callOrder.push("reply"); }),
     });
 
     await ingestKillCommand(input);
@@ -72,7 +72,7 @@ describe("ingestKillCommand", () => {
       opencodeClient: {
         deleteSession: vi.fn(async () => { callOrder.push("delete"); }),
       } as any,
-      sendTelegramReply: vi.fn(async () => { callOrder.push("reply"); }),
+      sendChatReply: vi.fn(async () => { callOrder.push("reply"); }),
       onTerminated: vi.fn(async (id: string) => { callOrder.push(`teardown:${id}`); }),
     });
 
@@ -84,7 +84,7 @@ describe("ingestKillCommand", () => {
   it("still tears down when the reply fails", async () => {
     const onTerminated = vi.fn(async () => {});
     const input = makeInput({
-      sendTelegramReply: vi.fn().mockRejectedValue(new Error("worker down")),
+      sendChatReply: vi.fn().mockRejectedValue(new Error("worker down")),
       onTerminated,
     });
 
@@ -115,8 +115,8 @@ describe("ingestKillCommand", () => {
 
     await expect(ingestKillCommand(input)).resolves.toBeUndefined();
 
-    expect(input.sendTelegramReply).toHaveBeenCalledTimes(1);
-    expect(input.sendTelegramReply).toHaveBeenCalledWith("12345", expect.stringContaining("terminated"), expect.anything());
+    expect(input.sendChatReply).toHaveBeenCalledTimes(1);
+    expect(input.sendChatReply).toHaveBeenCalledWith("12345", expect.stringContaining("terminated"), expect.anything());
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("teardown failed"));
     warn.mockRestore();
   });
@@ -170,7 +170,7 @@ describe("ingestKillCommand", () => {
     await ingestKillCommand(input);
 
     expect(onTerminated).toHaveBeenCalledWith("sess-abc");
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("already gone");
     expect(text).not.toContain("Failed");
   });

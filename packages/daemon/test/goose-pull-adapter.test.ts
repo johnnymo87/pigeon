@@ -9,7 +9,7 @@ const OWNER = "1001";
 const OWNERS: ReadonlySet<string> = new Set([OWNER]);
 
 /**
- * The goose-pull adapter: the point at which a Telegram reply stops trying to be
+ * The goose-pull adapter: the point at which a chat reply stops trying to be
  * pushed at a server that does not exist and is banked for collection instead.
  */
 describe("GoosePullAdapter", () => {
@@ -59,7 +59,7 @@ describe("GoosePullAdapter", () => {
 
     expect(result.ok).toBe(true);
     // The flag is what makes command-ingest tell the human the truth about
-    // latency. Without it the human sees Telegram's "Command sent" toast and
+    // latency. Without it the human sees the chat's "Command sent" toast and
     // nothing else, which is false by hours for this backend.
     expect(result.meta?.banked).toBe(true);
 
@@ -233,7 +233,7 @@ describe("command-ingest selects the goose-pull adapter", () => {
   async function ingest(s: StorageDb, msg: ExecuteMessage, allowed?: ReadonlySet<string>): Promise<string[]> {
     const replies: string[] = [];
     await ingestWorkerCommand(s, msg, {
-      sendTelegramReply: async (_chatId, text) => {
+      sendChatReply: async (_chatId, text) => {
         replies.push(text);
       },
       ...(allowed ? { pullAllowedSenderIds: allowed } : {}),
@@ -241,7 +241,7 @@ describe("command-ingest selects the goose-pull adapter", () => {
     return replies;
   }
 
-  it("banks a plain Telegram reply from the owner instead of dropping it as unreachable", async () => {
+  it("banks a plain chat reply from the owner instead of dropping it as unreachable", async () => {
     const s = pullDb();
     const replies = await ingest(s, makeMsg(), OWNERS);
 

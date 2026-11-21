@@ -417,7 +417,7 @@ describe("FlapDetector", () => {
     const r = repo();
     thrash(r);
     let now = T0;
-    const sendPlainAlert = vi.fn().mockRejectedValueOnce(new Error("telegram down"));
+    const sendPlainAlert = vi.fn().mockRejectedValueOnce(new Error("chat down"));
     const d = new FlapDetector({
       reassignments: r,
       notifier: { sendPlainAlert },
@@ -496,7 +496,7 @@ describe("FlapDetector", () => {
   });
 
   it("logs the detection even while the alert is cooling down", async () => {
-    // The cooldown throttles Telegram, never the record. The June incident was
+    // The cooldown throttles the chat, never the record. The June incident was
     // invisible precisely because nothing on this path logged anything.
     const r = repo();
     thrash(r);
@@ -512,7 +512,7 @@ describe("FlapDetector", () => {
     const r = repo();
     thrash(r);
     const { d } = detector(r, {
-      notifier: { sendPlainAlert: vi.fn().mockRejectedValue(new Error("telegram down")) },
+      notifier: { sendPlainAlert: vi.fn().mockRejectedValue(new Error("chat down")) },
     });
 
     await expect(d.tick()).resolves.toBeDefined();

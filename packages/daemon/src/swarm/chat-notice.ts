@@ -7,7 +7,7 @@ import {
   formatSwarmNotification,
   formatSwarmCancelNotification,
 } from "../notification-service";
-import { splitTelegramMessage } from "../split-message";
+import { splitChatMessage } from "../split-message";
 import { shouldEmitAncillaryFor } from "../ancillary-gate";
 
 export interface SwarmNoticeTarget {
@@ -26,21 +26,21 @@ export interface SwarmNoticeTarget {
   remoteSenderName?: string | null;
 }
 
-export function enqueueSwarmTelegramNotice(
+export function enqueueSwarmChatNotice(
   storage: StorageDb,
   record: SwarmNoticeTarget,
   now: number,
 ): void {
   try {
     if (!record.toSession) {
-      console.log("[pigeon-daemon] swarm telegram notice skipped for channel broadcast", record.msgId);
+      console.log("[pigeon-daemon] swarm chat notice skipped for channel broadcast", record.msgId);
       return;
     }
 
     // A session declared quiet suppresses its swarm feed too. lgtm re-prompts its
     // review sessions via /swarm/send on every reawaken, so without this the feed
     // reinstates exactly the noise the origin policy exists to remove -- and can
-    // create the session's Telegram topic in the first place.
+    // create the session's channel in the first place.
     if (!shouldEmitAncillaryFor(storage, record.toSession, now)) {
       console.log(
         `[swarm-notice] quieted msgId=${record.msgId} sessionId=${record.toSession} reason=origin`,
@@ -76,7 +76,7 @@ export function enqueueSwarmTelegramNotice(
       deliverAt: record.deliverAt,
     });
 
-    const chunks = splitTelegramMessage(
+    const chunks = splitChatMessage(
       notification.header,
       notification.body,
       notification.footer,
@@ -104,7 +104,7 @@ export function enqueueSwarmTelegramNotice(
       now,
     );
   } catch (err) {
-    console.error("[pigeon-daemon] swarm telegram notice failed", record.msgId, err);
+    console.error("[pigeon-daemon] swarm chat notice failed", record.msgId, err);
   }
 }
 
@@ -115,7 +115,7 @@ export function enqueueSwarmCancelNotice(
 ): void {
   try {
     if (!record.toSession) {
-      console.log("[pigeon-daemon] swarm telegram cancel notice skipped for channel broadcast", record.msgId);
+      console.log("[pigeon-daemon] swarm chat cancel notice skipped for channel broadcast", record.msgId);
       return;
     }
 
@@ -138,7 +138,7 @@ export function enqueueSwarmCancelNotice(
       toSessionId: record.toSession,
     });
 
-    const chunks = splitTelegramMessage(
+    const chunks = splitChatMessage(
       notification.header,
       notification.body,
       notification.footer,
@@ -167,6 +167,6 @@ export function enqueueSwarmCancelNotice(
       now,
     );
   } catch (err) {
-    console.error("[pigeon-daemon] swarm telegram cancel notice failed", record.msgId, err);
+    console.error("[pigeon-daemon] swarm chat cancel notice failed", record.msgId, err);
   }
 }

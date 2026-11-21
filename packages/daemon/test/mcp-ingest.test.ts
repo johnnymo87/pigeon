@@ -17,7 +17,7 @@ describe("ingestMcpListCommand", () => {
       opencodeClient: {
         mcpStatus: vi.fn().mockResolvedValue({}),
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -37,7 +37,7 @@ describe("ingestMcpListCommand", () => {
 
     await ingestMcpListCommand(input);
 
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("🔌 ");
     expect(text).toContain("MCP Servers:");
     expect(text).toContain("✅ filesystem — connected");
@@ -65,7 +65,7 @@ describe("ingestMcpListCommand", () => {
 
     await ingestMcpListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("sess-xyz");
     expect(text).not.toContain("`");
   });
@@ -80,7 +80,7 @@ describe("ingestMcpListCommand", () => {
 
     await ingestMcpListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("/mcp enable <server>");
     expect(text).toContain("/mcp disable <server>");
     // session ID removed from command hints (swipe-reply)
@@ -97,7 +97,7 @@ describe("ingestMcpListCommand", () => {
 
     await ingestMcpListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("MCP Servers:");
     expect(text).toContain("No MCP servers configured");
   });
@@ -111,7 +111,7 @@ describe("ingestMcpListCommand", () => {
 
     await ingestMcpListCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("Failed to list MCP servers: server unreachable"),
     );
@@ -142,7 +142,7 @@ describe("ingestMcpEnableCommand", () => {
         mcpConnect: vi.fn().mockResolvedValue(true),
         mcpDisconnect: vi.fn().mockResolvedValue(true),
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -161,7 +161,7 @@ describe("ingestMcpEnableCommand", () => {
 
     expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("slack", undefined);
     expect(input.opencodeClient.mcpDisconnect).not.toHaveBeenCalled();
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("🔌 ");
     expect(text).toContain("slack");
     expect(text).toContain("connected ✅");
@@ -187,7 +187,7 @@ describe("ingestMcpEnableCommand", () => {
 
     expect(input.opencodeClient.mcpConnect).toHaveBeenCalledWith("browser", undefined);
     expect(input.opencodeClient.mcpDisconnect).not.toHaveBeenCalled();
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("browser");
     expect(text).toContain("connected ✅");
     expect(text).not.toContain("`");
@@ -214,7 +214,7 @@ describe("ingestMcpEnableCommand", () => {
 
     expect(disconnectMock).toHaveBeenCalledWith("filesystem", undefined);
     expect(connectMock).toHaveBeenCalledWith("filesystem", undefined);
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("filesystem");
     expect(text).toContain("reconnected ✅");
     expect(text).not.toContain("`");
@@ -241,7 +241,7 @@ describe("ingestMcpEnableCommand", () => {
     await ingestMcpEnableCommand(input);
 
     expect(input.opencodeClient.mcpConnect).not.toHaveBeenCalled();
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("MCP server ");
     expect(text).toContain("unknown-server");
     expect(text).toContain("not found");
@@ -267,7 +267,7 @@ describe("ingestMcpEnableCommand", () => {
 
     await ingestMcpEnableCommand(input);
 
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("Failed to enable ");
     expect(text).toContain("filesystem");
     expect(text).toContain("API error");
@@ -311,7 +311,7 @@ describe("ingestMcpDisableCommand", () => {
       opencodeClient: {
         mcpDisconnect: vi.fn().mockResolvedValue(true),
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -322,7 +322,7 @@ describe("ingestMcpDisableCommand", () => {
     await ingestMcpDisableCommand(input);
 
     expect(input.opencodeClient.mcpDisconnect).toHaveBeenCalledWith("slack", undefined);
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("🔌 ");
     expect(text).toContain("slack");
     expect(text).toContain("disconnected");
@@ -344,7 +344,7 @@ describe("ingestMcpDisableCommand", () => {
 
     await ingestMcpDisableCommand(input);
 
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("Failed to disable ");
     expect(text).toContain("filesystem");
     expect(text).toContain("disconnect failed");

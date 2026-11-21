@@ -7,7 +7,7 @@ import { openStorageDb, type StorageDb } from "../src/storage/database";
  *
  * Without it the id is `s:<session>:<serverNow>`, so the "already queued" check is
  * idempotent with nothing: a plugin retry of a POST that timed out but was actually
- * processed produces a second outbox row and a second Telegram message. The plugin's
+ * processed produces a second outbox row and a second chat message. The plugin's
  * new retry queue makes that retry routine, so the key is a prerequisite for it.
  *
  * The key is an outbox PRIMARY KEY, so it is validated against the session that sent
@@ -28,7 +28,7 @@ describe("POST /stop idempotency key", () => {
 
   function newApp(now = 1_000) {
     storage = openStorageDb(":memory:");
-    return createApp(storage, { nowFn: () => now, chatId: "chat-1", machineId: "devbox" });
+    return createApp(storage, { nowFn: () => now, machineId: "devbox" });
   }
 
   async function startSession(app: ReturnType<typeof createApp>, sessionId: string) {
@@ -64,7 +64,7 @@ describe("POST /stop idempotency key", () => {
     expect(storage!.outbox.getByNotificationId("s:sess-a:msg_1.0")).not.toBeNull();
   });
 
-  it("makes a retry of the same key a no-op instead of a second Telegram message", async () => {
+  it("makes a retry of the same key a no-op instead of a second chat message", async () => {
     const app = newApp();
     await startSession(app, "sess-b");
 

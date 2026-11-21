@@ -1,19 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError } from "../src/notification-service";
+import { PLAIN_ALERT_TIMEOUT_MS, ChatSendError } from "../src/notification-service";
 import {
   createAlertNotifier,
   describeAlertDelivery,
   FALLBACK_ALERT_THROTTLE_MS,
-  TELEGRAM_MAX_TEXT,
+  DIRECT_ALERT_MAX_TEXT,
 } from "../src/alert-notifier";
-import { DirectTelegramAlarm } from "../src/direct-telegram-alarm";
+import { DirectSlackAlarm, SlackWebhookError } from "../src/direct-slack-alarm";
 import { WorkerMessageClient } from "../src/worker/worker-message-client";
 import { AlertDrainer } from "../src/swarm/alert-drainer";
 
 const WORKER = "https://worker.example";
-const CHAT = "-1001234567890";
+const HOOK = "https://hooks.slack.com/services/T0/B0/xyz";
 
 type Handler = (body: Record<string, unknown>, url: string) => Response | Promise<Response>;
 
@@ -21,14 +21,13 @@ type Handler = (body: Record<string, unknown>, url: string) => Response | Promis
  * One mocked fetch for both legs, routed by URL, so these tests exercise the REAL composed
  * notifier (worker client + direct alarm), not a mock of it.
  */
-function makeFetch(handlers: { worker?: Handler; unpin?: Handler; direct?: Handler }) {
-  const calls: Array<{ leg: "worker" | "unpin" | "direct"; url: string; body: Record<string, unknown> }> = [];
+function makeFetch(handlers: { worker?: Handler; direct?: Handler }) {
+  const calls: Array<{ leg: "worker" | "direct"; url: string; body: Record<string, unknown> }> = [];
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
-    let leg: "worker" | "unpin" | "direct";
+    let leg: "worker" | "direct";
     if (url === `${WORKER}/messages/send`) leg = "worker";
-    else if (url === `${WORKER}/topics/unpin`) leg = "unpin";
-    else if (url.startsWith("https://api.telegram.org/")) leg = "direct";
+    else if (url === HOOK) leg = "direct";
     else throw new Error(`unexpected url ${url}`);
     calls.push({ leg, url, body });
     const h = handlers[leg];
@@ -41,7 +40,7 @@ function makeFetch(handlers: { worker?: Handler; unpin?: Handler; direct?: Handl
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const workerOk: Handler = () => json({ ok: true, messageId: 1 });
-const directOk: Handler = () => json({ ok: true, result: { message_id: 2 } });
+const directOk: Handler = () => new Response("ok");
 const hang: Handler = () => new Promise<Response>(() => {});
 
 function build(
@@ -49,9 +48,8 @@ function build(
   opts: { worker?: boolean; direct?: boolean; storage?: StorageDb; machineId?: string } = {},
 ) {
   const worker = opts.worker === false ? undefined : new WorkerMessageClient({ workerUrl: WORKER, apiKey: "k", fetchFn });
-  const direct = opts.direct === false ? undefined : new DirectTelegramAlarm("tok", CHAT, fetchFn);
+  const direct = opts.direct === false ? undefined : new DirectSlackAlarm(HOOK, { fetchFn });
   return createAlertNotifier({
-    chatId: CHAT,
     worker,
     direct,
     alerts: opts.storage?.alerts,
@@ -84,7 +82,7 @@ describe("createAlertNotifier: mode", () => {
   });
 
   it("is undefined with neither path", () => {
-    expect(createAlertNotifier({ chatId: CHAT })).toBeUndefined();
+    expect(createAlertNotifier({})).toBeUndefined();
   });
 });
 
@@ -93,43 +91,45 @@ describe("AlertNotifier.sendPlainAlert", () => {
     const f = makeFetch({ worker: workerOk });
     await build(f.fetch, { storage })!.sendPlainAlert!("boom", "error");
     expect(f.calls.map((c) => c.leg)).toEqual(["worker"]);
-    expect(f.calls[0]!.body).toEqual({ chatId: CHAT, text: "❌ boom" });
+    // No chat id: the worker resolves it. An error alert asks for the owner mention.
+    expect(f.calls[0]!.body).toEqual({ text: "❌ boom", notifyOwner: true });
     expect(healthAlerts()).toHaveLength(0);
   });
 
   it("carries the thread and the url buttons to the worker", async () => {
     const f = makeFetch({ worker: workerOk });
-    const replyMarkup = { inline_keyboard: [[{ text: "a", url: "https://t.me/c/1/2" }]] };
-    await build(f.fetch)!.sendPlainAlert!("x", "info", { messageThreadId: 7, replyMarkup });
-    expect(f.calls[0]!.body).toEqual({ chatId: CHAT, text: "x", messageThreadId: 7, urlButtons: replyMarkup.inline_keyboard });
+    const replyMarkup = { inline_keyboard: [[{ text: "a", url: "https://acme.slack.com/archives/C1" }]] };
+    await build(f.fetch)!.sendPlainAlert!("x", "info", { messageThreadId: 7, chatId: "slack:T1", replyMarkup });
+    expect(f.calls[0]!.body).toEqual({ chatId: "slack:T1", text: "x", messageThreadId: 7, urlButtons: replyMarkup.inline_keyboard });
   });
 
-  it("Telegram 400 relayed by the worker throws TelegramSendError(400) with the description and does NOT go direct", async () => {
+  it("a 400 relayed by the worker (wire name `telegram`) throws ChatSendError(400) with the description and does NOT go direct", async () => {
     const f = makeFetch({
       worker: () => json({ ok: false, telegram: { status: 400, description: "Bad Request: message thread not found" } }),
       direct: directOk,
     });
     const err = await build(f.fetch, { storage })!.sendPlainAlert!("x", "info").catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(TelegramSendError);
-    expect((err as TelegramSendError).status).toBe(400);
-    expect((err as TelegramSendError).description).toBe("Bad Request: message thread not found");
+    expect(err).toBeInstanceOf(ChatSendError);
+    expect((err as ChatSendError).status).toBe(400);
+    expect((err as ChatSendError).description).toBe("Bad Request: message thread not found");
     expect(f.calls.map((c) => c.leg)).toEqual(["worker"]);
     expect(healthAlerts()).toHaveLength(0);
   });
 
-  it("Telegram 429 relayed by the worker throws TelegramSendError(429) and does NOT go direct", async () => {
+  it("a 429 relayed by the worker throws ChatSendError(429) and does NOT go direct", async () => {
     const f = makeFetch({
       worker: () => json({ ok: false, telegram: { status: 429, retryAfter: 5, description: "Too Many Requests" } }),
       direct: directOk,
     });
     const err = await build(f.fetch)!.sendPlainAlert!("x", "info").catch((e: unknown) => e);
-    expect((err as TelegramSendError).status).toBe(429);
+    expect((err as ChatSendError).status).toBe(429);
     expect(f.calls.map((c) => c.leg)).toEqual(["worker"]);
   });
 
   for (const [name, handler, reasonPart] of [
     ["worker 404 (route not deployed)", () => new Response("not found", { status: 404 }), "HTTP 404"],
-    ["worker 502 relaying a Telegram 401", () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502), "Telegram 401"],
+    ["worker 502 relaying a 401 (wire name `telegram`)", () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502), "chat 401"],
+    ["worker 502 with an errorClass", () => json({ error: "telegram_error", telegram: { status: 502 }, errorClass: "upstream" }, 502), "Slack upstream"],
     ["worker 200 with a non-JSON body", () => new Response("<html>", { status: 200 }), "non-JSON"],
     ["worker 403 chat_not_allowed", () => json({ error: "chat_not_allowed" }, 403), "chat_not_allowed"],
     ["worker transport error", () => { throw new TypeError("fetch failed"); }, "transport"],
@@ -141,20 +141,21 @@ describe("AlertNotifier.sendPlainAlert", () => {
       const text = String(f.calls[1]!.body.text);
       expect(text.startsWith("⚠️ boom · sent direct; worker: ")).toBe(true);
       expect(text).toContain(reasonPart);
-      expect(f.calls[1]!.body.chat_id).toBe(CHAT);
+      expect(f.calls[1]!.body).not.toHaveProperty("chat_id");
       expect(healthAlerts()).toHaveLength(1);
     });
   }
 
-  it("a direct-leg Telegram 400 still throws TelegramSendError(400) for the /alert ladder", async () => {
+  it("a direct-leg 400 throws SlackWebhookError, never ChatSendError, so the /alert ladder does not retry it", async () => {
     const f = makeFetch({
       worker: () => new Response("", { status: 404 }),
-      direct: () => json({ ok: false, description: "Bad Request: message thread not found" }, 400),
+      direct: () => new Response("invalid_payload", { status: 400 }),
     });
     const err = await build(f.fetch)!.sendPlainAlert!("x", "info", { messageThreadId: 3 }).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(TelegramSendError);
-    expect((err as TelegramSendError).description).toContain("thread not found");
-    expect(f.calls[1]!.body.message_thread_id).toBe(3);
+    expect(err).toBeInstanceOf(SlackWebhookError);
+    expect(err).not.toBeInstanceOf(ChatSendError);
+    // The webhook posts to #alerts only: a thread is ignored.
+    expect(f.calls[1]!.body).not.toHaveProperty("message_thread_id");
   });
 
   it("hung worker: gives up at 5s and lands direct within PLAIN_ALERT_TIMEOUT_MS overall", async () => {
@@ -206,7 +207,7 @@ describe("AlertNotifier.sendPlainAlert", () => {
     await expect(n.sendPlainAlert!("x", "info")).rejects.toThrow(/messages\/send.*503/);
     await expect(n.sendPlainAlert!("y", "info")).rejects.toThrow();
     expect(healthAlerts()).toHaveLength(1);
-    expect(healthAlerts()[0]!.text).toMatch(/no direct Telegram path/);
+    expect(healthAlerts()[0]!.text).toMatch(/no direct Slack path/);
   });
 
   it("direct-only host: posts direct with no suffix (nothing is broken)", async () => {
@@ -217,11 +218,11 @@ describe("AlertNotifier.sendPlainAlert", () => {
     expect(healthAlerts()).toHaveLength(0);
   });
 
-  it("truncates the body so text + suffix stays within Telegram's 4096", async () => {
+  it("truncates the body so text + suffix stays within the direct-alert cap", async () => {
     const f = makeFetch({ worker: () => new Response("", { status: 404 }), direct: directOk });
     await build(f.fetch)!.sendPlainAlert!("a".repeat(5_000), "error");
     const text = String(f.calls[1]!.body.text);
-    expect(text.length).toBeLessThanOrEqual(TELEGRAM_MAX_TEXT);
+    expect(text.length).toBeLessThanOrEqual(DIRECT_ALERT_MAX_TEXT);
     expect(text).toMatch(/… · sent direct; worker: HTTP 404$/);
   });
 
@@ -229,7 +230,7 @@ describe("AlertNotifier.sendPlainAlert", () => {
     const f = makeFetch({ worker: () => new Response("", { status: 404 }), direct: directOk });
     await build(f.fetch)!.sendPlainAlert!("😀".repeat(3_000), "info");
     const text = String(f.calls[1]!.body.text);
-    expect(text.length).toBeLessThanOrEqual(TELEGRAM_MAX_TEXT);
+    expect(text.length).toBeLessThanOrEqual(DIRECT_ALERT_MAX_TEXT);
     expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
   });
 });
@@ -272,12 +273,12 @@ describe("AlertNotifier: the fallback health alert cannot loop", () => {
     expect(healthAlerts()).toHaveLength(3);
   });
 
-  it("a Telegram stall behind a healthy worker is reported as Telegram being slow, not as a broken worker", async () => {
+  it("a provider stall behind a healthy worker is reported as the provider being slow, not as a broken worker", async () => {
     const f = makeFetch({ worker: () => json({ ok: false, error: "telegram call timed out after 4000ms" }, 502), direct: directOk });
     await build(f.fetch, { storage })!.sendPlainAlert!("a", "info");
     expect(String(f.calls[1]!.body.text)).toContain("telegram call timed out after 4000ms");
     const [row] = healthAlerts();
-    expect(row!.text).toMatch(/could not get a reply from Telegram/);
+    expect(row!.text).toMatch(/could not get a reply from Slack/);
     expect(row!.text).not.toMatch(/bypassing the worker/);
   });
 
@@ -321,25 +322,6 @@ describe("AlertNotifier: the fallback health alert cannot loop", () => {
   });
 });
 
-describe("AlertNotifier.unpinTopic", () => {
-  it("goes through the worker only", async () => {
-    const f = makeFetch({ unpin: () => json({ ok: true }), direct: directOk });
-    await build(f.fetch)!.unpinTopic!(12);
-    expect(f.calls).toEqual([{ leg: "unpin", url: `${WORKER}/topics/unpin`, body: { chatId: CHAT, messageThreadId: 12 } }]);
-  });
-
-  it("a failure rejects and does not fall back direct", async () => {
-    const f = makeFetch({ unpin: () => json({ error: "x" }, 502), direct: directOk });
-    await expect(build(f.fetch)!.unpinTopic!(12)).rejects.toThrow();
-    expect(f.calls.map((c) => c.leg)).toEqual(["unpin"]);
-  });
-
-  it("is absent on a direct-only host", () => {
-    const f = makeFetch({ direct: directOk });
-    expect(build(f.fetch, { worker: false })!.unpinTopic).toBeUndefined();
-  });
-});
-
 describe("POST /alert ladder against the real composed notifier", () => {
   function post(app: ReturnType<typeof createApp>, body: unknown) {
     return app(new Request("http://localhost/alert", {
@@ -349,13 +331,12 @@ describe("POST /alert ladder against the real composed notifier", () => {
     }));
   }
 
-  it("thread not found from the worker: recreate, then a second send into the new topic", async () => {
+  it("a conversation_gone from the worker: recreate, then a second send into the new topic", async () => {
     let n = 0;
     const f = makeFetch({
       worker: () => (n++ === 0
-        ? json({ ok: false, telegram: { status: 400, description: "Bad Request: message thread not found" } })
+        ? json({ ok: false, telegram: { status: 400, description: "is_archived" }, errorClass: "conversation_gone" })
         : json({ ok: true, messageId: 5 })),
-      unpin: () => json({ ok: true }),
       direct: directOk,
     });
     const resolveNamedTopic = vi.fn()
@@ -367,17 +348,16 @@ describe("POST /alert ladder against the real composed notifier", () => {
     const workerCalls = f.calls.filter((c) => c.leg === "worker");
     expect(workerCalls.map((c) => c.body.messageThreadId)).toEqual([77, 78]);
     expect(f.calls.some((c) => c.leg === "direct")).toBe(false);
-    expect(f.calls.filter((c) => c.leg === "unpin").map((c) => c.body.messageThreadId)).toEqual([78]);
   });
 
-  it("Telegram 401 via the worker: lands direct with the suffix, 204", async () => {
+  it("a 401 via the worker: lands direct with the suffix, 204", async () => {
     const f = makeFetch({
       worker: () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502),
       direct: directOk,
     });
     const app = createApp(storage, { nowFn: () => 1000, notifier: build(f.fetch, { storage }) });
     expect((await post(app, { text: "hello" })).status).toBe(204);
-    expect(String(f.calls.find((c) => c.leg === "direct")!.body.text)).toMatch(/^hello · sent direct; worker: HTTP 502 \(Telegram 401/);
+    expect(String(f.calls.find((c) => c.leg === "direct")!.body.text)).toMatch(/^hello · sent direct; worker: HTTP 502 \(chat 401/);
   });
 
   it("worker 200 non-JSON: direct, 204", async () => {
@@ -406,17 +386,23 @@ describe("POST /alert ladder against the real composed notifier", () => {
     expect(f.calls.map((c) => c.leg)).toEqual(["worker", "direct"]);
   });
 
-  it("a topic alert whose worker leg is broken still runs the ladder on the direct leg's 400s", async () => {
-    const f = makeFetch({
-      worker: () => new Response("", { status: 404 }),
-      direct: (body) => (body.message_thread_id === 77
-        ? json({ ok: false, description: "Bad Request: something" }, 400)
-        : directOk(body, "")),
-    });
+  it("a topic alert whose worker leg is broken lands in #alerts via the webhook (it has no thread)", async () => {
+    const f = makeFetch({ worker: () => new Response("", { status: 404 }), direct: directOk });
     const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
     const app = createApp(storage, { nowFn: () => 1000, notifier: build(f.fetch), resolveNamedTopic });
     expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
     const direct = f.calls.filter((c) => c.leg === "direct");
-    expect(direct.at(-1)!.body).not.toHaveProperty("message_thread_id");
+    expect(direct).toHaveLength(1);
+    expect(direct[0]!.body).not.toHaveProperty("message_thread_id");
+  });
+
+  it("a webhook 400 is not retried by the ladder: /alert answers 502", async () => {
+    const f = makeFetch({
+      worker: () => new Response("", { status: 404 }),
+      direct: () => new Response("invalid_payload", { status: 400 }),
+    });
+    const app = createApp(storage, { nowFn: () => 1000, notifier: build(f.fetch) });
+    expect((await post(app, { text: "x" })).status).toBe(502);
+    expect(f.calls.filter((c) => c.leg === "direct")).toHaveLength(1);
   });
 });

@@ -10,8 +10,6 @@ import { parseSlackWebhookUrl } from "./direct-slack-alarm";
 export interface DaemonConfig {
   port: number;
   dbPath: string;
-  telegramBotToken?: string;
-  telegramChatId?: string;
   workerUrl?: string;
   workerApiKey?: string;
   machineId?: string;
@@ -61,7 +59,7 @@ export interface DaemonConfig {
   /** Matches the serve's `GOOSE_SERVER__SECRET_KEY`. Absent is valid only for a serve run unauthenticated. */
   gooseAcpToken?: string;
   /**
-   * Telegram user ids allowed to bank a message for a pull-mode session
+   * Chat user id allowed to bank a message for a pull-mode session
    * (`PIGEON_PULL_ALLOWED_USER_IDS`, comma separated). EMPTY MEANS NOBODY: a pull
    * session's banked text is input to a client that is not watched while it
    * runs, so the default is closed. The worker's own chat allowlist admits every
@@ -153,8 +151,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     port: parsePort(env.PIGEON_DAEMON_PORT),
     dbPath: env.PIGEON_DAEMON_DB_PATH?.trim() || defaultDbPath,
-    telegramBotToken: env.TELEGRAM_BOT_TOKEN?.trim() || undefined,
-    telegramChatId: env.TELEGRAM_CHAT_ID?.trim() || env.TELEGRAM_GROUP_ID?.trim() || undefined,
     workerUrl: env.CCR_WORKER_URL?.trim() || undefined,
     workerApiKey: env.CCR_API_KEY?.trim() || undefined,
     machineId: env.CCR_MACHINE_ID?.trim() || undefined,

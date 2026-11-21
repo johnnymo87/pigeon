@@ -108,7 +108,7 @@ export class OutboxRepository {
          -- after a failed first attempt lands here. Both swarm producers are
          -- gated on a fresh insert (/swarm/send by an if-inserted guard,
          -- /swarm/schedule by an if-not-inserted 409) and swarm requeue
-         -- redelivers the ENVELOPE without re-enqueueing a Telegram notice, so
+         -- redelivers the ENVELOPE without re-enqueueing a chat notice, so
          -- swarm never re-upserts a w: id. An earlier version of this comment
          -- claimed it did; that was wrong.
          -- Pinned by the "never moves a stored anchor" test.

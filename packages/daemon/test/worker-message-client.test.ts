@@ -27,6 +27,14 @@ describe("WorkerMessageClient.sendMessage", () => {
     expect(body).toEqual({ chatId: "-100", text: "hi" });
   });
 
+  it("sends no chatId when it has none (the machine's #alerts), and still sends a worker-supplied one", async () => {
+    const f = vi.fn(async () => json({ ok: true, messageId: 1 }));
+    await client(f as unknown as typeof fetch).sendMessage({ text: "hi" }, { timeoutMs: 5_000 });
+    expect(call(f).body).toEqual({ text: "hi" });
+    await client(f as unknown as typeof fetch).sendMessage({ chatId: "slack:T1", text: "hi" }, { timeoutMs: 5_000 });
+    expect(call(f, 1).body).toEqual({ chatId: "slack:T1", text: "hi" });
+  });
+
   it("passes entities, thread, buttons and the worker-side timeoutMs through", async () => {
     const f = vi.fn(async () => json({ ok: true, messageId: 1 }));
     const urlButtons = [[{ text: "a", url: "https://t.me/c/1/2" }]];
@@ -50,35 +58,35 @@ describe("WorkerMessageClient.sendMessage", () => {
     expect(call(f).body).toEqual({ chatId: "-100", text: "hi" });
   });
 
-  it("200 ok:false with a Telegram 400 is telegram_rejected with the description", async () => {
+  it("200 ok:false with a chat 400 is chat_rejected with the description", async () => {
     const f = vi.fn(async () => json({ ok: false, telegram: { status: 400, description: "Bad Request: message thread not found" } }));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
-    expect(out).toEqual({ kind: "telegram_rejected", status: 400, description: "Bad Request: message thread not found" });
+    expect(out).toEqual({ kind: "chat_rejected", status: 400, description: "Bad Request: message thread not found" });
   });
 
-  it("200 ok:false with a Telegram 429 is telegram_rejected carrying retryAfter", async () => {
+  it("200 ok:false with a chat 429 is chat_rejected carrying retryAfter", async () => {
     const f = vi.fn(async () => json({ ok: false, telegram: { status: 429, retryAfter: 3, description: "Too Many Requests" } }));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
-    expect(out).toEqual({ kind: "telegram_rejected", status: 429, retryAfter: 3, description: "Too Many Requests" });
+    expect(out).toEqual({ kind: "chat_rejected", status: 429, retryAfter: 3, description: "Too Many Requests" });
   });
 
-  it("200 ok:false with any other Telegram status is a worker failure, not a rejection", async () => {
+  it("200 ok:false with any other chat status is a worker failure, not a rejection", async () => {
     const f = vi.fn(async () => json({ ok: false, telegram: { status: 401, description: "Unauthorized" } }));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
     expect(out.kind).toBe("worker_failed");
   });
 
-  it("502 relaying a Telegram 401 names both", async () => {
+  it("502 relaying a chat 401 names both", async () => {
     const f = vi.fn(async () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
-    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:tg401" });
-    if (out.kind === "worker_failed") expect(out.reason).toContain("Telegram 401");
+    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:chat401" });
+    if (out.kind === "worker_failed") expect(out.reason).toContain("chat 401");
   });
 
-  it("502 with no Telegram status (the worker's own Telegram abort) keeps the worker's error text and its own key", async () => {
+  it("502 with no chat status (the worker's own provider abort) keeps the worker's error text and its own key", async () => {
     const f = vi.fn(async () => json({ ok: false, error: "telegram call timed out after 4000ms" }, 502));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
-    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:telegram_unreachable", cause: "telegram_unreachable" });
+    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:chat_unreachable", cause: "chat_unreachable" });
     if (out.kind === "worker_failed") expect(out.reason).toContain("telegram call timed out after 4000ms");
   });
 
@@ -141,22 +149,5 @@ describe("WorkerMessageClient.sendMessage", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe("WorkerMessageClient.unpinTopic", () => {
-  it("POSTs /topics/unpin and resolves on 2xx", async () => {
-    const f = vi.fn(async () => json({ ok: true }));
-    await client(f as unknown as typeof fetch).unpinTopic({ chatId: "-100", messageThreadId: 12 }, { timeoutMs: 5_000 });
-    const { url, body } = call(f);
-    expect(url).toBe(`${URL_BASE}/topics/unpin`);
-    expect(body).toEqual({ chatId: "-100", messageThreadId: 12 });
-  });
-
-  it("throws on a non-2xx and on ok:false", async () => {
-    const c1 = client(vi.fn(async () => json({ error: "x" }, 502)) as unknown as typeof fetch);
-    await expect(c1.unpinTopic({ chatId: "-100", messageThreadId: 1 }, { timeoutMs: 5_000 })).rejects.toThrow(/502/);
-    const c2 = client(vi.fn(async () => json({ ok: false })) as unknown as typeof fetch);
-    await expect(c2.unpinTopic({ chatId: "-100", messageThreadId: 1 }, { timeoutMs: 5_000 })).rejects.toThrow();
   });
 });

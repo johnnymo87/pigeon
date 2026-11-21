@@ -15,7 +15,7 @@
  *     merely ending.
  *
  * Runs the real ingestGooseLaunchCommand with real clients against real goose,
- * faking only Telegram (there is nobody to message) and the worker registration
+ * faking only the chat (there is nobody to message) and the worker registration
  * (there is no worker here).
  *
  *   GOOSE_SERVER__SECRET_KEY=k goose serve --port 38910     # cwd = a real dir
@@ -76,7 +76,7 @@ async function main(): Promise<void> {
     createMintClient: (url, token) =>
       new GooseAcpClient({ url, transportFactory: webSocketTransport(token), log: () => {} }),
     onSessionStart: async (sessionId) => { registered.push(sessionId); },
-    sendTelegramReply: async (_c, text) => { replies.push(text); },
+    sendChatReply: async (_c, text) => { replies.push(text); },
   });
 
   const rows = storage.sessions.list({}).filter((s) => s.backendKind === GOOSE_BACKEND_KIND);

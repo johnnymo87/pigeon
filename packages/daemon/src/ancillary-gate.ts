@@ -2,7 +2,7 @@ import { resolveEffectivePolicy } from "./notify-policy";
 import type { StorageDb } from "./storage/database";
 
 /**
- * "Ancillary" Telegram posts are everything that is NOT a Stop/Error/Retry
+ * "Ancillary" chat posts are everything that is NOT a Stop/Error/Retry
  * notification: the TUI-prompt mirror (`kind='mirror'`) and the swarm feed
  * (`kind='swarm'`). They exist to make a topic two-sided and to show that a
  * cross-session message was dispatched.
@@ -10,7 +10,7 @@ import type { StorageDb } from "./storage/database";
  * WHY THEY NEED THE SAME GATE AS /stop:
  * A session with a quiet `session_origin` row (lgtm's automated reviews) had its
  * Stop suppressed but still emitted mirrors and swarm notices, which defeated the
- * suppression entirely -- and, because a Telegram topic is CREATED by a session's
+ * suppression entirely -- and, because a channel is CREATED by a session's
  * first notification, each leak also created a topic. The visible symptom was a new
  * forum topic per automated PR review even though every Stop was correctly silenced.
  *

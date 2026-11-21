@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { createCommandReplySender, COMMAND_REPLY_TELEGRAM_TIMEOUT_MS } from "../src/worker/command-reply";
+import { createCommandReplySender, COMMAND_REPLY_TIMEOUT_MS } from "../src/worker/command-reply";
 import { WorkerMessageClient } from "../src/worker/worker-message-client";
 
 function setup(handler: () => Response | Promise<Response>) {
@@ -20,9 +20,9 @@ describe("command replies via the worker", () => {
       text: "hello",
       entities: [{ type: "code", offset: 0, length: 5 }],
       messageThreadId: 4,
-      timeoutMs: COMMAND_REPLY_TELEGRAM_TIMEOUT_MS,
+      timeoutMs: COMMAND_REPLY_TIMEOUT_MS,
     });
-    expect(COMMAND_REPLY_TELEGRAM_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
+    expect(COMMAND_REPLY_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
     expect(log.warn).not.toHaveBeenCalled();
     expect(log.error).not.toHaveBeenCalled();
   });
@@ -41,7 +41,7 @@ describe("command replies via the worker", () => {
     expect(String(log.error.mock.calls[0]![0])).toMatch(/404/);
   });
 
-  it("a Telegram rejection is a warning carrying Telegram's description", async () => {
+  it("a chat rejection is a warning carrying the chat's description", async () => {
     const { send, log } = setup(() => Response.json({ ok: false, telegram: { status: 400, description: "Bad Request: can't parse entities" } }));
     await send("-100", "x", { messageThreadId: undefined });
     expect(String(log.warn.mock.calls[0]![0])).toContain("can't parse entities");

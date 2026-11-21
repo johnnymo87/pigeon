@@ -1,5 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 
 export interface CompactCommandInput {
   commandId: string;
@@ -7,7 +7,7 @@ export interface CompactCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "getSessionMessagesPage" | "summarize">;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 /** Shape returned by opencode GET /session/:id/message (MessageV2.WithParts) */
@@ -61,7 +61,7 @@ async function findCurrentModel(
 }
 
 export async function ingestCompactCommand(input: CompactCommandInput): Promise<void> {
-  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
+  const { commandId, sessionId, chatId, machineId, opencodeClient, sendChatReply } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   try {
@@ -69,11 +69,11 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
     const model = await findCurrentModel(opencodeClient, sessionId);
 
     if (!model) {
-      const msg = new TgMessageBuilder()
+      const msg = new ChatMessageBuilder()
         .append("No user messages found. Cannot determine model for compaction.\n🆔 ")
         .appendCode(sessionId)
         .build();
-      await sendTelegramReply(chatId, msg.text, msg.entities);
+      await sendChatReply(chatId, msg.text, msg.entities);
       return;
     }
 
@@ -82,6 +82,6 @@ export async function ingestCompactCommand(input: CompactCommandInput): Promise<
     console.log(`[compact-ingest] session compacted commandId=${commandId} sessionId=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to compact session${machineLabel}: ${message}`);
+    await sendChatReply(chatId, `Failed to compact session${machineLabel}: ${message}`);
   }
 }

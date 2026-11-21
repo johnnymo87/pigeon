@@ -19,7 +19,7 @@ describe("ingestModelListCommand", () => {
           connected: [],
         }),
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -51,7 +51,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("🤖 ");
     expect(text).toContain("Available models:");
     expect(text).toContain("anthropic");
@@ -74,7 +74,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("sess-xyz");
     expect(text).not.toContain("`");
   });
@@ -93,7 +93,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("Current: ");
     expect(text).toContain("anthropic/claude-opus-4-6");
     expect(text).toContain("/model <code>");
@@ -120,7 +120,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("anthropic");
     expect(text).toContain("openai");
     expect(text).not.toContain("google-vertex");
@@ -146,7 +146,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    const [, text] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
     expect(text).toContain("google-vertex");
     expect(text).toContain("google-vertex/gemini-3-pro");
     expect(text).toContain("google-vertex-anthropic/claude-sonnet-4-6");
@@ -162,7 +162,7 @@ describe("ingestModelListCommand", () => {
 
     await ingestModelListCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "12345",
       "Failed to list models: API unavailable",
     );
@@ -193,7 +193,7 @@ describe("ingestModelSetCommand", () => {
           setModelOverride: vi.fn(),
         },
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -210,7 +210,7 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(setModelOverride).toHaveBeenCalledWith("sess-abc", "anthropic/claude-opus-4-6");
-    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(chatId).toBe("12345");
     expect(text).toContain("🤖 Model set to ");
     expect(text).toContain("anthropic/claude-opus-4-6");
@@ -240,7 +240,7 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
-    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(chatId).toBe("12345");
     expect(text).toContain("anthropic/claude-nonexistent");
     expect(text).toContain("not found");
@@ -270,7 +270,7 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
-    const [, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(text).toContain("unknownprovider/some-model");
     expect(text).toContain("not found");
     expect(text).not.toContain("`");
@@ -291,7 +291,7 @@ describe("ingestModelSetCommand", () => {
     await ingestModelSetCommand(input);
 
     expect(input.storage.sessions.setModelOverride).not.toHaveBeenCalled();
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "12345",
       "Failed to set model: connection refused",
     );

@@ -135,10 +135,10 @@ describe("classifyWorkerHealthSample", () => {
   });
 
   /**
-   * A worker 400 is counted, which looks like it contradicts the 502/Telegram-400 carve-out
+   * A worker 400 is counted, which looks like it contradicts the 502/chat-400 carve-out
    * below. It does not, and the difference is mechanical rather than a matter of taste.
    *
-   * A Telegram 400 never reaches the daemon as an HTTP 400 -- it arrives as a 502 carrying
+   * A chat 400 never reaches the daemon as an HTTP 400 -- it arrives as a 502 carrying
    * `details.error_code` (delivery-policy.ts rule 6). A 502 is a 5xx, so `isTransportFailure`
    * calls it transient and it is NEVER charged an outbox attempt: one poisoned message
    * retries until the age cap and would trip the alarm by itself. Hence the carve-out.
@@ -164,17 +164,23 @@ describe("classifyWorkerHealthSample", () => {
   });
 
   /**
-   * The load-bearing exclusion. A Telegram client-error relayed by the worker arrives as
+   * The load-bearing exclusion. A chat client-error relayed by the worker arrives as
    * HTTP 502 carrying body.details.error_code in the 4xx range (see delivery-policy.ts
-   * rule 6). That is Telegram's verdict on OUR message, not the worker failing, and it can
+   * rule 6). That is the chat's verdict on OUR message, not the worker failing, and it can
    * repeat forever: a 5xx never charges the entry an attempt (isTransportFailure), so a
    * poisoned message retries until the age cap. Counting it would produce a "worker is
    * down" alert naming the wrong component.
    */
-  it("treats a 502 relaying a Telegram 400 as neutral, not a server error", () => {
+  it("treats a 502 relaying a rejected payload (errorClass rejected_format) as neutral, not a server error", () => {
+    expect(
+      classifyWorkerHealthSample(serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } })),
+    ).toBe("neutral");
+  });
+
+  it("counts a 502 carrying only details.error_code 400: the Telegram carve-out is gone", () => {
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 400 } })),
-    ).toBe("neutral");
+    ).toBe("server_error");
   });
 
   it("treats a 502 with error 'topic_unavailable' as neutral, not a server error (pigeon-iqpd)", () => {
@@ -191,14 +197,14 @@ describe("classifyWorkerHealthSample", () => {
   });
 
   /**
-   * The exclusion is exactly 400 and nothing wider. The worker relays EVERY Telegram
-   * error as 502 carrying that code (worker/telegram.ts getTelegramErrorDetails), so a
+   * The exclusion is exactly 400 and nothing wider. The worker relays EVERY provider
+   * error as 502 carrying that code (its `details.error_code`), so a
    * blanket 4xx exclusion would swallow 401 (bot token revoked or mis-rotated) and 403
    * (bot removed from the group). Those are verdicts on the deployment, not on one
    * message: they fail every send until a human intervenes, which is precisely the
    * sustained-total-failure shape this alarm exists to record.
    */
-  it("counts a 502 relaying a Telegram 401 or 403 — those are account-level, not per-message", () => {
+  it("counts a 502 relaying a chat 401 or 403 — those are account-level, not per-message", () => {
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 401 } })),
     ).toBe("server_error");
@@ -207,7 +213,7 @@ describe("classifyWorkerHealthSample", () => {
     ).toBe("server_error");
   });
 
-  it("still counts a 502 relaying a Telegram 5xx, and a bare 502", () => {
+  it("still counts a 502 relaying a chat 5xx, and a bare 502", () => {
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 500 } })),
     ).toBe("server_error");
@@ -325,9 +331,9 @@ describe("WorkerHealthMonitor — server error episodes", () => {
     const { sink, monitor } = createMonitor(clock);
 
     driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD - 1, 30_000);
-    // A 502 relaying a Telegram 400 is the neutral case that survives pigeon-5typ; a plain
+    // A 502 relaying a rejected payload is the neutral case that survives pigeon-5typ; a plain
     // 4xx is no longer neutral and would now open an episode of its own class.
-    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
+    monitor.record("send", serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } }));
     clock.now += 30_000;
     expect(sink.alerts).toHaveLength(0);
 
@@ -674,11 +680,11 @@ describe("WorkerHealthMonitor — robustness", () => {
       log: (msg, fields) => logged.push({ msg, ...(fields ? { fields } : {}) }),
     });
 
-    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
+    monitor.record("send", serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } }));
 
     expect(logged).toHaveLength(1);
     expect(logged[0]!.msg).toContain("not counted");
-    expect(logged[0]!.fields?.telegramErrorCode).toBe(400);
+    expect(logged[0]!.fields?.errorCode).toBe(400);
   });
 
   it("does not log an uncounted 5xx below the alarm, nor a routine 4xx that clears", () => {
@@ -711,8 +717,8 @@ describe("WorkerHealthMonitor — robustness", () => {
     const sendAlert = sink.alerts.find((a) => a.text.includes("/notifications/send"))!;
 
     expect(registerAlert.text).toContain("session");
-    expect(registerAlert.text).not.toContain("Telegram delivery through the worker is down");
-    expect(sendAlert.text).toContain("Telegram delivery through the worker is down");
+    expect(registerAlert.text).not.toContain("Chat delivery through the worker is down");
+    expect(sendAlert.text).toContain("Chat delivery through the worker is down");
   });
 
   it("logs the trip so there is durable journal evidence even with no alert egress", () => {

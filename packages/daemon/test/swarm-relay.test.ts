@@ -339,7 +339,7 @@ describe("receiving relay items (pigeon-k0qn.6)", () => {
     spy.mockRestore();
   });
 
-  it("names the remote sender by label and machine in the Telegram notice", async () => {
+  it("names the remote sender by label and machine in the chat notice", async () => {
     const s = db();
     s.sessions.upsert({ sessionId: TARGET, notify: true }, NOW);
     (await receive(s, [message()]));

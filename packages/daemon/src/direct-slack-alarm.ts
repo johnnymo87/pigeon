@@ -1,18 +1,17 @@
 /**
- * The daemon's ONE direct line to Slack (chat-transport phase 2, pigeon-4ogz.5; design
- * docs/plans/2026-11-20-slack-transport-design.md §6): the Slack twin of
- * `direct-telegram-alarm.ts`.
+ * The daemon's ONE direct line to chat (chat-transport phase 2, pigeon-4ogz.5; design
+ * docs/plans/2026-11-20-slack-transport-design.md §6). It is the only direct path since
+ * Telegram's was deleted (pigeon-4ogz.13).
  *
- * Everything else the daemon sends to Slack goes through the worker. This exists for the same
- * reason the Telegram alarm does: the alarms that report a broken worker must still get out
- * while the worker is broken, so `AlertNotifier` uses it as the FALLBACK leg of an operational
- * alert. It posts to the incoming webhook of the machine's `#alerts`
- * (`PIGEON_SLACK_ALARM_WEBHOOK_URL`), which can post to that one channel only: a narrower
- * credential than the bot token the daemon holds for Telegram. A thread is therefore ignored, and
- * link buttons become `<url|label>` lines.
+ * Everything else the daemon sends to Slack goes through the worker. This exists because the
+ * alarms that report a broken worker must still get out while the worker is broken, so
+ * `AlertNotifier` uses it as the FALLBACK leg of an operational alert. It posts to the incoming
+ * webhook of the machine's `#alerts` (`PIGEON_SLACK_ALARM_WEBHOOK_URL`), which can post to that
+ * one channel only: a narrow credential. A thread is therefore ignored, and link buttons become
+ * `<url|label>` lines.
  *
  * It is the only file under `daemon/src` allowed to contain the webhook host; a guard test
- * enforces that, as it does the Bot API host for the Telegram file.
+ * enforces that.
  *
  * Pushes (D7, off by default): the owner is mentioned only when `PIGEON_SLACK_NOTIFY_OWNER=1`
  * and `PIGEON_SLACK_OWNER_USER_ID` are set, and only on an error-severity alert: the same
@@ -21,7 +20,11 @@
  */
 
 import { PLAIN_ALERT_TIMEOUT_MS, type AlertSeverity, type PlainAlertOptions } from "./notification-service";
-import { severityPrefix } from "./direct-telegram-alarm";
+
+/** The severity emoji both legs put in front of an alert, so they render identically. */
+export function severityPrefix(severity: AlertSeverity): string {
+  return severity === "error" ? "❌ " : severity === "warning" ? "⚠️ " : "";
+}
 
 const WEBHOOK_URL_RE = /^https:\/\/hooks\.slack\.com\/\S+$/;
 
@@ -33,9 +36,9 @@ export function parseSlackWebhookUrl(value: string | undefined): string | undefi
 }
 
 /**
- * A failed webhook post. Deliberately NOT a `TelegramSendError`: the `/alert` ladder retries a
- * Telegram 400 without its buttons or topic, which changes nothing for a webhook that ignores
- * both.
+ * A failed webhook post. Deliberately NOT a `ChatSendError`: the `/alert` ladder retries a
+ * worker-relayed 400 without its buttons or topic, which changes nothing for a webhook that
+ * ignores both.
  */
 export class SlackWebhookError extends Error {
   constructor(
@@ -100,7 +103,7 @@ export class DirectSlackAlarm {
   }
 
   /**
-   * Bounded the same way as the Telegram alarm (pigeon-wfj1): the AbortSignal bounds a fetch
+   * Bounded (pigeon-wfj1): the AbortSignal bounds a fetch
    * that honours it, and the raced deadline bounds one that does not, because the drainer and
    * the watchdog await this.
    */
@@ -147,7 +150,7 @@ export class DirectSlackAlarm {
   }
 }
 
-/** Slack's error slug (`invalid_payload`, `no_service`, ...), bounded like the Telegram read. */
+/** Slack's error slug (`invalid_payload`, `no_service`, ...), read under a short bound. */
 async function readError(response: Response): Promise<string> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

@@ -160,7 +160,7 @@ describe("goose runner rotation and session deletion cleanup", () => {
       sessionId: "gse_mixed",
       backendSessionId: "20261031_mixed",
       isHonk: true,
-      promptText: "telegram payload",
+      promptText: "chat payload",
       state: "queued",
     });
 
@@ -197,7 +197,7 @@ describe("goose runner rotation and session deletion cleanup", () => {
           sessionId: "gse_mixed",
           backendSessionId: "20261031_mixed",
           isHonk: true,
-          promptText: "telegram payload",
+          promptText: "chat payload",
           recoveryAttempts: 0,
           createdAt: now,
           updatedAt: now,

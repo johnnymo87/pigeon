@@ -5,11 +5,11 @@ import {
   buildAlertKeyboard,
   parseAlertLinks,
   resolveAlertKeyboard,
-  topicUrl,
   type TopicLookup,
 } from "../src/alert-links";
 
-const CHAT = "-1001234567890";
+const CHAT = "slack:T1";
+const URL = (c: string) => `https://acme.slack.com/archives/${c}`;
 
 describe("parseAlertLinks", () => {
   it("returns [] for anything that is not an array", () => {
@@ -60,26 +60,6 @@ describe("parseAlertLinks", () => {
   });
 });
 
-describe("topicUrl", () => {
-  it("strips the -100 supergroup prefix", () => {
-    expect(topicUrl(CHAT, 42)).toBe("https://t.me/c/1234567890/42");
-  });
-
-  it("refuses a chat id that is not a -100 supergroup id", () => {
-    expect(topicUrl("1234567890", 42)).toBeNull();
-    expect(topicUrl("-1234567890", 42)).toBeNull();
-    expect(topicUrl("-100", 42)).toBeNull();
-    expect(topicUrl("-100abc", 42)).toBeNull();
-  });
-
-  it("refuses a missing or non-positive thread id", () => {
-    expect(topicUrl(CHAT, null)).toBeNull();
-    expect(topicUrl(CHAT, 0)).toBeNull();
-    expect(topicUrl(CHAT, -3)).toBeNull();
-    expect(topicUrl(CHAT, 1.5)).toBeNull();
-  });
-});
-
 describe("buildAlertKeyboard", () => {
   const links = [
     { label: "alpha", sessionId: "s1" },
@@ -90,17 +70,27 @@ describe("buildAlertKeyboard", () => {
 
   it("one url button per row, in link order, skipping unlinkable sessions", () => {
     const keyboard = buildAlertKeyboard(links, {
-      s1: { chatId: CHAT, messageThreadId: 10, state: "open" },
+      s1: { chatId: CHAT, messageThreadId: 10, state: "open", url: URL("C1") },
       s2: null,
-      s3: { chatId: CHAT, messageThreadId: null, state: "open" },
-      s4: { chatId: CHAT, messageThreadId: 40, state: "closed" },
+      s3: { chatId: CHAT, messageThreadId: null, state: "open", url: null },
+      s4: { chatId: CHAT, messageThreadId: 40, state: "closed", url: URL("C4") },
     });
     expect(keyboard).toEqual({
       inline_keyboard: [
-        [{ text: "alpha", url: "https://t.me/c/1234567890/10" }],
-        [{ text: "delta", url: "https://t.me/c/1234567890/40" }],
+        [{ text: "alpha", url: URL("C1") }],
+        [{ text: "delta", url: URL("C4") }],
       ],
     });
+  });
+
+  it("builds no link itself: a row without a url string gets no button (no t.me builder)", () => {
+    expect(
+      buildAlertKeyboard(links, {
+        s1: { chatId: "-1001234567890", messageThreadId: 10, state: "open" },
+        s2: { chatId: CHAT, messageThreadId: 11, state: "open", url: null },
+        s3: { chatId: CHAT, messageThreadId: 12, state: "open", url: "http://acme.slack.com/x" },
+      }),
+    ).toBeUndefined();
   });
 
   it("returns undefined when nothing is linkable", () => {
@@ -114,7 +104,7 @@ describe("resolveAlertKeyboard (fail open)", () => {
 
   it("looks up the parsed session ids once and builds the keyboard", async () => {
     const lookup = vi.fn<TopicLookup>().mockResolvedValue({
-      s1: { chatId: CHAT, messageThreadId: 10, state: "open" },
+      s1: { chatId: CHAT, messageThreadId: 10, state: "open", url: URL("C1") },
     });
     const keyboard = await resolveAlertKeyboard(raw, lookup, 1000);
     expect(lookup).toHaveBeenCalledTimes(1);

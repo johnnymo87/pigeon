@@ -37,7 +37,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -46,7 +45,6 @@ describe("OutboxSender.processOnce()", () => {
     expect(sendNotification).toHaveBeenCalledTimes(1);
     expect(sendNotification).toHaveBeenCalledWith({
       sessionId: "sess-1",
-      chatId: "chat-123",
       text: "Which option?",
       replyMarkup: { inline_keyboard: [] },
       notificationId: "notif-1",
@@ -83,7 +81,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: sendNotificationClosure,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -91,7 +88,6 @@ describe("OutboxSender.processOnce()", () => {
 
     expect(pollerSendNotification).toHaveBeenCalledWith({
       sessionId: "sess-1",
-      chatId: "chat-123",
       text: "Hello formatted",
       replyMarkup: { inline_keyboard: [] },
       notificationId: "notif-entities-1",
@@ -121,7 +117,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -129,7 +124,6 @@ describe("OutboxSender.processOnce()", () => {
 
     expect(sendNotification).toHaveBeenCalledWith({
       sessionId: "sess-topic-1",
-      chatId: "chat-123",
       text: "Done",
       replyMarkup: { inline_keyboard: [] },
       notificationId: "notif-topic-1",
@@ -148,7 +142,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -176,7 +169,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -209,7 +201,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -244,7 +235,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -276,7 +266,6 @@ describe("OutboxSender.processOnce()", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -295,7 +284,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -321,7 +309,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -346,7 +333,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -374,7 +360,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -408,7 +393,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -434,7 +418,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -461,7 +444,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -488,7 +470,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -517,7 +498,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -555,7 +535,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -581,7 +560,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => resurrectTime,
     });
 
@@ -603,7 +581,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -625,7 +602,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -648,7 +624,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now, // still 5_000, before 65_000
     });
 
@@ -668,7 +643,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 10_000,
     });
 
@@ -697,7 +671,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: sendFn,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -719,21 +692,38 @@ describe("OutboxSender.processOnce()", () => {
     expect(record?.state).toBe("sent");
   });
 
-  it("does not call sendNotification when chatId is not configured", async () => {
+  it("delivers with no chat id configured anywhere, and sends none: the worker resolves the chat", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
-
-    const sendNotification = makeSendNotification({ ok: true });
-    const sender = new OutboxSender({
-      storage,
-      sendNotification,
-      // no chatId
-      nowFn: () => 5_000,
-    });
+    const sendNotification = vi.fn(async () => ({ ok: true })) as unknown as SendNotificationFn;
+    const sender = new OutboxSender({ storage, sendNotification, nowFn: () => 5_000 });
 
     await sender.processOnce();
 
-    // No chatId means can't send, entry should not be processed
-    expect(sendNotification).not.toHaveBeenCalled();
+    expect(sendNotification).toHaveBeenCalledTimes(1);
+    const input = (sendNotification as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]![0];
+    expect(input).not.toHaveProperty("chatId");
+    expect(storage.outbox.getByNotificationId(BASE_OUTBOX_INPUT.notificationId)!.state).toBe("sent");
+  });
+
+  it("drops a pre-deletion Telegram-dialect rich payload (no dialect) and sends the plain chunks", async () => {
+    storage.outbox.upsert(
+      {
+        ...BASE_OUTBOX_INPUT,
+        notificationId: "legacy-rich",
+        payload: JSON.stringify({
+          messages: [{ text: "plain chunk", entities: [] }],
+          replyMarkup: { inline_keyboard: [] },
+          notificationId: "legacy-rich",
+          rich: { markdown: "| a |\n|---|\n| \\$5 |" },
+        }),
+      },
+      1_000,
+    );
+    const sendNotification = vi.fn(async () => ({ ok: true })) as unknown as SendNotificationFn;
+    await new OutboxSender({ storage, sendNotification, nowFn: () => 5_000 }).processOnce();
+    const input = (sendNotification as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls[0]![0];
+    expect(input).not.toHaveProperty("rich");
+    expect(input.text).toBe("plain chunk");
   });
 
   it("prevents overlapping processOnce runs", async () => {
@@ -751,7 +741,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -800,7 +789,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -845,7 +833,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: sendFn,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -873,7 +860,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: sendFn,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -900,7 +886,6 @@ describe("OutboxSender.processOnce()", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: sendFn,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -915,7 +900,7 @@ describe("OutboxSender.processOnce()", () => {
 
 describe("OutboxSender rich messages (pigeon-p909)", () => {
   let storage: StorageDb;
-  const RICH = { markdown: "| a | b |\n|---|---|\n| 1 | 2 |" };
+  const RICH = { markdown: "| a | b |\n|---|---|\n| 1 | 2 |", dialect: "slack" as const };
 
   beforeEach(() => {
     storage = openStorageDb(":memory:");
@@ -937,7 +922,7 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
   }
 
   function senderWith(sendFn: SendNotificationFn, log?: (m: string, f?: Record<string, unknown>) => void) {
-    return new OutboxSender({ storage, sendNotification: sendFn, chatId: "chat-123", nowFn: () => 5_000, log });
+    return new OutboxSender({ storage, sendNotification: sendFn, nowFn: () => 5_000, log });
   }
 
   const success = (body: unknown) => ({ ok: true, kind: "success", status: 200, body });
@@ -998,17 +983,17 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
     expect((sendFn.mock.calls[0]![0] as SendNotificationInput).rich).toBeUndefined();
   });
 
-  it("drops rich after a second failed rich attempt, so a persistent Telegram 5xx cannot cost the notification", async () => {
+  it("drops rich after a second failed rich attempt, so a persistent upstream 5xx cannot cost the notification", async () => {
     seed([{ text: "only" }]);
-    const telegram5xx = {
+    const provider5xx = {
       ok: false,
       kind: "http_error",
       status: 502,
       body: { error: "Telegram API error", details: { ok: false, error_code: 500 } },
     };
     let now = 5_000;
-    const sendFn = vi.fn().mockResolvedValue(telegram5xx);
-    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, chatId: "chat-123", nowFn: () => now });
+    const sendFn = vi.fn().mockResolvedValue(provider5xx);
+    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, nowFn: () => now });
 
     await sender.processOnce();
     // First failure: a glitch is worth one more rich try.
@@ -1035,7 +1020,7 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
       .mockResolvedValueOnce({ ok: false, kind: "transport_error", error: "ECONNREFUSED" })
       .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 502, body: { error: "topic_unavailable", reason: "poll_exhausted" } })
       .mockResolvedValueOnce({ ok: false, kind: "http_error", status: 502, body: { error: "topic_unavailable", reason: "poll_exhausted" } });
-    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, chatId: "chat-123", nowFn: () => now });
+    const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, nowFn: () => now });
     for (let i = 0; i < 4; i++) {
       await sender.processOnce();
       now += 10 * 60_000;
@@ -1111,7 +1096,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1130,7 +1114,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1163,7 +1146,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1195,7 +1177,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1218,7 +1199,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1249,7 +1229,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1285,7 +1264,6 @@ describe("OutboxSender start/stop", () => {
       const sender = new OutboxSender({
         storage,
         sendNotification,
-        chatId: "chat-123",
         nowFn: () => now,
       });
 
@@ -1315,7 +1293,7 @@ describe("OutboxSender start/stop", () => {
     const sendNotification = vi.fn().mockImplementation(async () => {
       sendCount++;
       if (sendCount === 1) {
-        // Exactly what the worker returns when Telegram rate-limits the group:
+        // Exactly what the worker returns when the chat rate-limits the group:
         // HTTP 429 with a JSON body carrying retryAfter. See packages/worker/src/notifications.ts.
         return {
           ok: false,
@@ -1332,7 +1310,6 @@ describe("OutboxSender start/stop", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1390,7 +1367,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1421,7 +1397,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1459,7 +1434,6 @@ describe("classified delivery failure actions", () => {
       sendNotification,
       registerSession,
       unregisterSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1497,7 +1471,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1535,7 +1508,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1573,7 +1545,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1611,7 +1582,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1647,7 +1617,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1671,7 +1640,6 @@ describe("classified delivery failure actions", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1687,8 +1655,8 @@ describe("classified delivery failure actions", () => {
     expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(2);
 
     // Attempt 2: STILL retrying. A 403 reflects worker config (ALLOWED_CHAT_IDS), not the
-    // message, and never reaches Telegram (rejected at notifications.ts:202, before
-    // createTelegramClient at :248), so it costs none of the shared 20/min group budget.
+    // message, and never reaches the chat (rejected by the worker before any provider
+    // call), so it costs none of the shared send budget.
     // Killing it early would only convert a recoverable misconfiguration into permanent loss.
     now += 12_000;
     await sender.processOnce();
@@ -1709,7 +1677,6 @@ describe("classified delivery failure actions", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1721,7 +1688,7 @@ describe("classified delivery failure actions", () => {
     expect(record!.lastError).toBe('HTTP 400 - {"error":"sessionId, chatId, and text required"}');
   });
 
-  it("502 with details.error_code 400 and entities -> payload rewritten WITHOUT entities and markRetry", async () => {
+  it("502 with errorClass rejected_format and entities -> payload rewritten WITHOUT entities and markRetry", async () => {
     const payloadWithEntities = JSON.stringify({
       messages: [
         { text: "Hello", entities: [{ type: "bold", offset: 0, length: 5 }] },
@@ -1736,13 +1703,12 @@ describe("classified delivery failure actions", () => {
       ok: false,
       kind: "http_error",
       status: 502,
-      body: { details: { error_code: 400, description: "Bad Request: can't parse entities" } },
+      body: { errorClass: "rejected_format", details: { error_code: 400, description: "invalid_blocks" } },
     }) as unknown as SendNotificationFn;
 
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -1763,8 +1729,8 @@ describe("classified delivery failure actions", () => {
         sessionId: "sess-1",
         attempts: 1,
         nextRetryIn: 5000,
-        telegramErrorCode: 400,
-        telegramErrorDescription: "Bad Request: can't parse entities",
+        errorCode: 400,
+        errorDescription: "invalid_blocks",
       }),
     );
   });
@@ -1772,7 +1738,7 @@ describe("classified delivery failure actions", () => {
   // The legacy singular 'message' payload shape is still production-reachable (question
   // notifications write it), and the strip arm handles it. Adversarial
   // review noted it was only ever verified by reading the code, never by a test.
-  it("502 entity-400 strips the LEGACY singular message shape too, preserving replyMarkup", async () => {
+  it("502 rejected_format strips the LEGACY singular message shape too, preserving replyMarkup", async () => {
     const legacyPayload = JSON.stringify({
       message: { text: "Hello", entities: [{ type: "bold", offset: 0, length: 5 }] },
       replyMarkup: { inline_keyboard: [[{ text: "Reply", callback_data: "cmd:abc" }]] },
@@ -1784,13 +1750,12 @@ describe("classified delivery failure actions", () => {
       ok: false,
       kind: "http_error",
       status: 502,
-      body: { details: { error_code: 400, description: "Bad Request: can't parse entities" } },
+      body: { errorClass: "rejected_format", details: { error_code: 400, description: "invalid_blocks" } },
     }) as unknown as SendNotificationFn;
 
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -1838,7 +1803,6 @@ describe("classified delivery failure actions", () => {
       sendNotification,
       registerSession,
       unregisterSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: (msg) => logged.push(msg),
     });
@@ -1875,7 +1839,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1909,7 +1872,7 @@ describe("classified delivery failure actions", () => {
           ok: false,
           kind: "http_error",
           status: 502,
-          body: { details: { error_code: 400, description: "Can't parse entities" } },
+          body: { errorClass: "rejected_format", details: { error_code: 400, description: "invalid_blocks" } },
         };
       }
       return { ok: true, kind: "success", status: 200, body: { ok: true } };
@@ -1927,7 +1890,6 @@ describe("classified delivery failure actions", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -1980,7 +1942,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2006,7 +1967,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2039,7 +1999,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2067,7 +2026,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2103,7 +2061,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2144,7 +2101,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2179,7 +2135,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2235,7 +2190,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2300,7 +2254,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2381,7 +2334,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2402,7 +2354,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2431,7 +2382,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2477,7 +2427,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2515,7 +2464,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2546,7 +2494,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2602,7 +2549,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => currentTime,
     });
 
@@ -2667,7 +2613,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logSpy,
     });
@@ -2698,7 +2643,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -2722,7 +2666,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2753,7 +2696,6 @@ describe("OutboxSender rate governor", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -2798,7 +2740,6 @@ describe("outbox terminal drop uniform logging", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification(),
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -2828,7 +2769,6 @@ describe("outbox terminal drop uniform logging", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification(),
-      chatId: "chat-123",
       nowFn: () => 1_000 + 4 * 3600 * 1000 + 1,
       log: logFn,
     });
@@ -2862,7 +2802,6 @@ describe("outbox terminal drop uniform logging", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification(),
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -2892,7 +2831,6 @@ describe("outbox terminal drop uniform logging", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification(),
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -2929,7 +2867,6 @@ describe("outbox terminal drop uniform logging", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -2976,7 +2913,6 @@ describe("outbox terminal drop uniform logging", () => {
       sendNotification,
       registerSession,
       unregisterSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -3022,7 +2958,6 @@ describe("outbox terminal drop uniform logging", () => {
       storage,
       sendNotification,
       registerSession,
-      chatId: "chat-123",
       nowFn: () => 5_000,
       log: logFn,
     });
@@ -3059,7 +2994,6 @@ describe("OutboxSender ledger append (unread substrate)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification({ ok: true }),
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3072,13 +3006,12 @@ describe("OutboxSender ledger append (unread substrate)", () => {
   });
 
   // The whole correctness argument for the ledger: a row exists only because
-  // Telegram accepted the message. If delivery failed, there must be nothing.
+  // the chat accepted the message. If delivery failed, there must be nothing.
   it("records nothing when delivery fails", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification({ ok: false }) as unknown as SendNotificationFn,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3092,7 +3025,6 @@ describe("OutboxSender ledger append (unread substrate)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification: makeSendNotification({ ok: true }),
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3179,7 +3111,7 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
     );
   const sender = (now: () => number, send = makeSendNotification({ ok: true })) => ({
     send,
-    s: new OutboxSender({ storage, sendNotification: send, chatId: "c", nowFn: now, gateSwarmOnLocalSession: true }),
+    s: new OutboxSender({ storage, sendNotification: send, nowFn: now, gateSwarmOnLocalSession: true }),
   });
 
   it("a foreign session's notice is never sent, and is dropped after the grace", async () => {
@@ -3235,7 +3167,7 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
   it("off by default", async () => {
     swarmEntry("ses_foreign", 1_000);
     const send = makeSendNotification({ ok: true });
-    const s = new OutboxSender({ storage, sendNotification: send, chatId: "c", nowFn: () => 2_000 });
+    const s = new OutboxSender({ storage, sendNotification: send, nowFn: () => 2_000 });
     await s.processOnce();
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -3265,7 +3197,6 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
       storage,
       sendNotification: send,
       registerSession,
-      chatId: "c",
       nowFn: () => 2_000,
     });
 
@@ -3296,7 +3227,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3323,7 +3253,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3360,7 +3289,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3406,7 +3334,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3438,7 +3365,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
       gateSwarmOnLocalSession: true,
     });
@@ -3484,7 +3410,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3512,7 +3437,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3539,7 +3463,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => 5_000,
     });
 
@@ -3573,7 +3496,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3621,7 +3543,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3669,7 +3590,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3708,7 +3628,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3750,7 +3669,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3796,7 +3714,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3845,7 +3762,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3901,7 +3817,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -3977,7 +3892,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -4020,7 +3934,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => now,
     });
 
@@ -4048,7 +3961,7 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sendCalls: SendNotificationInput[] = [];
     const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
       sendCalls.push(input);
-      // Simulate 57s Telegram call latency inside each send
+      // Simulate 57s chat call latency inside each send
       currentTime += 57_000;
       if (input.onTopicUnavailable === "general") {
         return { ok: true, kind: "success", status: 200, body: {} };
@@ -4064,7 +3977,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => currentTime,
     });
 
@@ -4133,7 +4045,6 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sender = new OutboxSender({
       storage,
       sendNotification,
-      chatId: "chat-123",
       nowFn: () => currentTime,
     });
 

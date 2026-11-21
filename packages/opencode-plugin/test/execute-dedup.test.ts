@@ -19,7 +19,7 @@ function makeEnvelope(
     commandId,
     sessionId: "sess-1",
     command: "do thing",
-    source: OpencodeDirectSource.TelegramReply,
+    source: OpencodeDirectSource.ChatReply,
     issuedAt: 0,
     ...overrides,
   }

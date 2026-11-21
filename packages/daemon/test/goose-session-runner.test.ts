@@ -370,7 +370,7 @@ describe("GooseSessionRunner turn lifecycle", () => {
 
   it("touches the session on delivery so the reaper does not collect it", async () => {
     // Every writer of last_seen today is opencode-plugin-driven. A goose session
-    // nobody touches is reaped and its Telegram topic unregistered while the
+    // nobody touches is reaped and its channel unregistered while the
     // goose session on disk is still perfectly alive.
     const { runner, touches } = makeRunner();
     await runner.deliver("c1", "hi");
@@ -2978,7 +2978,7 @@ describe("GooseSessionRunner session title", () => {
       // Verify no steer was attempted
       expect(client.steers).toHaveLength(0);
 
-      // Verify NO "Queued" Telegram notice was posted
+      // Verify NO "Queued" chat notice was posted
       const queuedStops = stops.filter((s) => s.event === "Queued");
       expect(queuedStops).toHaveLength(0);
     });
@@ -3222,21 +3222,21 @@ describe("GooseSessionRunner session title", () => {
       expect(settledSwarm[1]!.outcome).toEqual({ kind: "delivered" });
     });
 
-    it("preserves telegram-origin behaviour unchanged (steers, posts Queued notice, human wording)", async () => {
+    it("preserves chat-origin behaviour unchanged (steers, posts Queued notice, human wording)", async () => {
       const { runner, client, stops } = makeRunner();
       client.setRunId("20260918_1", "run_tg");
       client.ownership = "own";
 
       await runner.deliver("tg_1", "turn 1 prompt");
 
-      // Telegram origin steer
+      // chat-origin steer
       client.steerOutcome = { kind: "steered", messageId: "steer_msg_1" };
       const outcome = await runner.deliver("tg_2", "steer prompt", { origin: "telegram" });
       expect(outcome.ok).toBe(true);
       expect(outcome.meta?.mode).toBe("steered");
       expect(client.steers).toHaveLength(1);
 
-      // Inflight queued notice for telegram
+      // Inflight queued notice for chat
       const { runner: runner2, client: client2, stops: stops2 } = makeRunner();
       client2.isHonk = true;
       await runner2.deliver("tg_busy", "prompt");

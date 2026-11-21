@@ -2,9 +2,9 @@
  * Text helpers that are safe against UTF-16 surrogate pairs.
  *
  * Why this exists: an unpaired surrogate survives `JSON.stringify` — which escapes it as a
- * well-formed `\udXXX` — so it reaches Telegram intact, but it cannot be encoded as UTF-8.
- * Telegram then either rejects the request (HTTP 400, which the outbox retries 10× and then
- * drops) or mojibakes it to U+FFFD. `splitTelegramMessage` already shipped this exact bug
+ * well-formed `\udXXX` — so it reaches the chat intact, but it cannot be encoded as UTF-8.
+ * The chat then either rejects the request (HTTP 400, which the outbox retries 10× and then
+ * drops) or mojibakes it to U+FFFD. `splitChatMessage` already shipped this exact bug
  * once; see the guard in `split-message.ts` (`sliceBodyMessage`), which this mirrors.
  *
  * Sibling copies exist in `@pigeon/opencode-plugin` (`session-state.ts`) and, from Phase 2,
@@ -32,7 +32,7 @@ export function clampPreservingSurrogates(s: string, max: number): string {
  *
  * The excerpt exists so the drill-down can show something readable instead of a
  * bare timestamp. It is captured PRE-FORMAT: by the time a payload reaches
- * commitDelivery it is a JSON envelope of split Telegram chunks -- each with its
+ * commitDelivery it is a JSON envelope of split chat chunks -- each with its
  * own text and entity offset table, behind a session-prefixed header -- so its
  * first 150 characters are wrapper rather than content.
  */
@@ -57,7 +57,7 @@ export function excerptOf(text: string | null | undefined): string | null {
 
 /**
  * Maximum session title length (200 characters).
- * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
+ * Bounded to prevent header overhead from breaking the chat's 4096-char message limit
  * and to accommodate Phase 2 forum topic names (capped at 128 chars).
  */
 export const MAX_TITLE_LENGTH = 200;
@@ -69,7 +69,7 @@ export function parseTitle(val: unknown): string | undefined {
   const trimmed = val.trim();
   if (trimmed === "") return undefined;
   if (PLACEHOLDER_TITLE_PATTERN.test(trimmed)) return undefined;
-  // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that Telegram
+  // Surrogate-safe: a bare .slice() here can leave a lone high surrogate that the chat
   // cannot encode, silently killing every notification for the session.
   return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH);
 }

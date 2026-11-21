@@ -120,7 +120,7 @@ export const DEFAULT_SLOW_BURN_MOVES = 8;
  */
 export const DEFAULT_SUMMARY_MS = 60 * 60 * 1000;
 
-/** Telegram throttle. Detection still logs every tick; only delivery is capped. */
+/** The chat throttle. Detection still logs every tick; only delivery is capped. */
 export const DEFAULT_ALERT_COOLDOWN_MS = 30 * 60 * 1000;
 
 /** How long the event log is kept. Bounded because this is an append-only table. */
@@ -413,7 +413,7 @@ export class FlapDetector {
     });
 
     if (verdict.flapping) {
-      // Logged on EVERY tick. The cooldown below throttles Telegram only — the
+      // Logged on EVERY tick. The cooldown below throttles the chat only — the
       // record is the thing whose absence made June invisible, so it is never
       // suppressed.
       this.log("serve reassignment flapping detected", {

@@ -24,7 +24,7 @@ export interface WorkerCommandIngestOptions {
   /** Override adapter selection for testing */
   createAdapter?: (session: SessionRecord) => CommandDeliveryAdapter | null;
   /**
-   * The owner's Telegram user ids: allowed to bank for a pull-mode session and
+   * The owner's chat user id: allowed to bank for a pull-mode session and
    * to prompt a goose-acp session. Absent or empty means pull sessions get no
    * adapter (the "not reachable" reply); see GooseAcpAdapterOptions for goose.
    */
@@ -51,7 +51,7 @@ export interface WorkerCommandIngestOptions {
   apiKey?: string;
   /** Override fetch for testing */
   fetchFn?: typeof fetch;
-  /** Edit an existing Telegram notification (for wizard step transitions) */
+  /** Edit an existing chat notification (for wizard step transitions) */
   editNotification?: (notificationId: string, text: string, replyMarkup: unknown, entities?: unknown[]) => Promise<{ ok: boolean }>;
   /** Machine ID for formatting wizard steps */
   machineId?: string;
@@ -63,8 +63,8 @@ export interface WorkerCommandIngestOptions {
   tagLookup?: { get(sessionId: string): string | null };
   /** OpenCode client for plugin-free fallback delivery on plugin death. */
   opencodeClient?: ReviveAndDeliverDeps["opencodeClient"];
-  /** Send a reply to Telegram (used for revive-on-reply error notifications). */
-  sendTelegramReply?: (chatId: string, text: string) => Promise<void>;
+  /** Send a reply to the chat (used for revive-on-reply error notifications). */
+  sendChatReply?: (chatId: string, text: string) => Promise<void>;
   /** Unregister session worker-side when local session is deleted. */
   unregisterSession?: (sessionId: string) => Promise<unknown>;
   /** Injected spawn for testing (passed through to reviveAndDeliver). */
@@ -114,9 +114,9 @@ export function formatDeliveryMeta(meta?: Record<string, unknown>): string {
 function directSourceForMessage(msg: ExecuteMessage): OpencodeDirectSourceType {
   const command = msg.command.trim();
   if (QUESTION_OPTION_RE.test(command)) {
-    return OpencodeDirectSource.TelegramCallback;
+    return OpencodeDirectSource.ChatCallback;
   }
-  return OpencodeDirectSource.TelegramReply;
+  return OpencodeDirectSource.ChatReply;
 }
 
 /**
@@ -183,7 +183,7 @@ export function selectAdapter(
  * A throw out of ingest is deliberately not acked, so the worker's 60s lease
  * lapses and redelivers. Six tries at ~60s is about five minutes, which is both
  * longer than any real serve restart and about as long as a human will sit in
- * front of Telegram wondering whether their message went anywhere.
+ * front of the chat wondering whether their message went anywhere.
  */
 export const MAX_REDELIVERIES = 5;
 
@@ -264,7 +264,7 @@ async function ingestWorkerCommandInner(
         `Gave up delivering your message after ${redeliveries} attempts (~${redeliveries} min).\n\n`
           + `Last error: ${cause}\n\n`
           + `Your message was: ${excerpt}${ellipsis}`,
-        options.sendTelegramReply,
+        options.sendChatReply,
       );
       return;
     }
@@ -280,7 +280,7 @@ async function ingestWorkerCommandInner(
       commandId,
       msg.chatId,
       `Session no longer exists on this machine. It may have been closed or reaped.`,
-      options.sendTelegramReply,
+      options.sendChatReply,
     );
     return;
   }
@@ -327,7 +327,7 @@ async function ingestWorkerCommandInner(
         commandId,
         msg.chatId,
         supersededQuestionMessage(msg.command.trim()),
-        options.sendTelegramReply,
+        options.sendChatReply,
       );
       return;
     }
@@ -382,7 +382,7 @@ async function ingestWorkerCommandInner(
         commandId,
         msg.chatId,
         mismatchedOptionTokenMessage(),
-        options.sendTelegramReply,
+        options.sendChatReply,
       );
       return;
     }
@@ -466,7 +466,7 @@ async function ingestWorkerCommandInner(
             `[command-ingest] wizard step edit failed commandId=${commandId} notificationId=${notificationId} version=${updated.version}`,
           );
           await sendBestEffort(
-            options.sendTelegramReply,
+            options.sendChatReply,
             msg.chatId,
             staleKeyboardStepMessage(pendingQuestion.questions, updated.currentStep),
             commandId,
@@ -488,7 +488,7 @@ async function ingestWorkerCommandInner(
 
       if (!adapter || !adapter.deliverQuestionReply) {
         console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-        await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendTelegramReply, options.editNotification);
+        await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendChatReply, options.editNotification);
         return;
       }
 
@@ -520,7 +520,7 @@ async function ingestWorkerCommandInner(
             `[command-ingest] wizard completion edit failed commandId=${commandId} notificationId=${notificationId}`,
           );
           await sendBestEffort(
-            options.sendTelegramReply,
+            options.sendChatReply,
             msg.chatId,
             STALE_KEYBOARD_DONE_MESSAGE,
             commandId,
@@ -548,7 +548,7 @@ async function ingestWorkerCommandInner(
         commandId,
         msg.chatId,
         questionReplyFailedMessage(result.error),
-        options.sendTelegramReply,
+        options.sendChatReply,
       );
       return;
     }
@@ -562,7 +562,7 @@ async function ingestWorkerCommandInner(
 
     if (!adapter || !adapter.deliverQuestionReply) {
       console.warn(`[command-ingest] session adapter does not support question replies commandId=${commandId}`);
-      await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendTelegramReply, options.editNotification);
+      await dropUnanswerableQuestion(storage, commandId, msg, pendingQuestion.requestId, options.sendChatReply, options.editNotification);
       return;
     }
 
@@ -595,7 +595,7 @@ async function ingestWorkerCommandInner(
       commandId,
       msg.chatId,
       questionReplyFailedMessage(result.error),
-      options.sendTelegramReply,
+      options.sendChatReply,
     );
     return;
   }
@@ -603,7 +603,7 @@ async function ingestWorkerCommandInner(
   // No pending question was resolved and the command is a raw option token, so
   // there is nothing left to map it against. Drop it, and tell the user —
   // silence here is the original defect: a press landing after the row expired
-  // was acked and discarded while Telegram had already toasted "Command sent".
+  // was acked and discarded while the chat had already toasted "Command sent".
   //
   // MUST STAY AHEAD OF THE METADATA FALLBACK BELOW. Reordering these silently
   // reintroduces a transcript-corruption bug: the single-question success path
@@ -620,7 +620,7 @@ async function ingestWorkerCommandInner(
       commandId,
       msg.chatId,
       "That question is no longer answerable — it was already answered, or the session has moved on.",
-      options.sendTelegramReply,
+      options.sendChatReply,
     );
     return;
   }
@@ -714,7 +714,7 @@ async function ingestWorkerCommandInner(
       // Deliberately backend-agnostic: this also fires for nvim-only and
       // backend-less sessions, where "plugin registration" would be wrong.
       `Session is not reachable: no usable delivery backend is registered for it. Restart the session to re-register.`,
-      options.sendTelegramReply,
+      options.sendChatReply,
     );
     return;
   }
@@ -857,7 +857,7 @@ function classifyExecuteFailure(
  * invisible (W2 / pigeon-2k1) — the command showed up as `acked` in D1, which is
  * indistinguishable from success.
  *
- * The Telegram send is deliberately best-effort. If it threw, the exception would
+ * The chat send is deliberately best-effort. If it threw, the exception would
  * propagate out of ingestWorkerCommand, the Poller would skip the ack, and a
  * permanently-undeliverable command would retry forever. Notifying is important;
  * it is not important enough to build an infinite loop out of.
@@ -912,7 +912,7 @@ function pullDeps(
  * kind, so the notice can only appear for a delivery that really was a bank --
  * one fact, asserted by the code that performed it.
  *
- * WHY IT EXISTS. On success this path sends nothing, because Telegram has
+ * WHY IT EXISTS. On success this path sends nothing, because the chat has
  * already toasted "Command sent" and a second confirmation would be noise. For a
  * pull backend that toast can be false by days (the client runs only when
  * scheduled). Silence here would leave the human believing an unattended agent
@@ -931,7 +931,7 @@ async function notifyIfBanked(
 ): Promise<void> {
   if (!result.ok || result.meta?.banked !== true) return;
   await sendBestEffort(
-    options.sendTelegramReply,
+    options.sendChatReply,
     msg.chatId,
     bankedReplyMessage(session),
     commandId,
@@ -939,13 +939,13 @@ async function notifyIfBanked(
 }
 
 async function sendBestEffort(
-  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  sendChatReply: ((chatId: string, text: string) => Promise<void>) | undefined,
   chatId: string,
   text: string,
   commandId: string,
 ): Promise<void> {
   try {
-    await sendTelegramReply?.(chatId, text);
+    await sendChatReply?.(chatId, text);
   } catch (err) {
     console.warn(`[command-ingest] failed to notify user commandId=${commandId}:`, err);
   }
@@ -965,7 +965,7 @@ const STALE_KEYBOARD_DONE_MESSAGE =
  * which is the entire point here. Two details that are load-bearing:
  *
  * - It points at the ORIGINAL question message. This reply is sent straight to
- *   the Telegram API, so it has no `messages` row and a swipe-reply to it
+ *   the chat provider, so it has no `messages` row and a swipe-reply to it
  *   resolves no session.
  * - It asks for the option TEXT, not its number. A typed answer is stored
  *   verbatim, so "2" would be recorded as the literal string "2".
@@ -1004,10 +1004,10 @@ async function dropCommand(
   commandId: string,
   chatId: string,
   userMessage: string,
-  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  sendChatReply: ((chatId: string, text: string) => Promise<void>) | undefined,
 ): Promise<void> {
   try {
-    await sendTelegramReply?.(chatId, userMessage);
+    await sendChatReply?.(chatId, userMessage);
   } catch (err) {
     console.warn(`[command-ingest] failed to notify user about dropped commandId=${commandId}:`, err);
   }
@@ -1061,7 +1061,7 @@ async function refuseUnanswerableQuestionInput(
     : `If that question is still open, tap an option on it, or reply with text.`;
   const trailer = msg.media ? ` Then send the file again.` : ``;
 
-  await dropCommand(storage, commandId, msg.chatId, `${cause}\n\n${next}${trailer}`, options.sendTelegramReply);
+  await dropCommand(storage, commandId, msg.chatId, `${cause}\n\n${next}${trailer}`, options.sendChatReply);
   return true;
 }
 
@@ -1087,7 +1087,7 @@ async function warnMediaNotDelivered(
 ): Promise<void> {
   if (!msg.media) return;
   await sendBestEffort(
-    options.sendTelegramReply,
+    options.sendChatReply,
     msg.chatId,
     `Your answer was delivered, but the attached file was not — a question answer can only carry text.\n\nSend the file again now that the question is answered.`,
     commandId,
@@ -1164,7 +1164,7 @@ async function dropResurrectedQuestionThatIsGone(
     commandId,
     msg.chatId,
     message,
-    options.sendTelegramReply,
+    options.sendChatReply,
   );
   return true;
 }
@@ -1262,14 +1262,14 @@ async function dropUnreachableQuestionRegistration(
     commandId,
     msg.chatId,
     unreachableQuestionRegistrationMessage(),
-    options.sendTelegramReply,
+    options.sendChatReply,
   );
   return true;
 }
 
 /**
  * The session's adapter cannot accept question replies at all, so this pending
- * question is permanently unanswerable from Telegram.
+ * question is permanently unanswerable from the chat.
  *
  * Unlike a delivery failure, the row is DELETED here. While it exists, every
  * plain-text message to this session is hijacked into the question-reply path
@@ -1289,7 +1289,7 @@ async function dropUnanswerableQuestion(
   commandId: string,
   msg: ExecuteMessage,
   requestId: string,
-  sendTelegramReply: ((chatId: string, text: string) => Promise<void>) | undefined,
+  sendChatReply: ((chatId: string, text: string) => Promise<void>) | undefined,
   editNotification: WorkerCommandIngestOptions["editNotification"],
 ): Promise<void> {
   storage.pendingQuestions.delete(msg.sessionId, requestId);
@@ -1300,15 +1300,15 @@ async function dropUnanswerableQuestion(
   await tryEditNotification(
     editNotification,
     `q:${msg.sessionId}:${requestId}`,
-    "This session can't receive question answers from Telegram.",
+    "This session can't receive question answers from the chat.",
     { inline_keyboard: [] },
   );
   await dropCommand(
     storage,
     commandId,
     msg.chatId,
-    "This session can't receive question answers from Telegram. Answer it directly in the TUI instead.",
-    sendTelegramReply,
+    "This session can't receive question answers from the chat. Answer it directly in the TUI instead.",
+    sendChatReply,
   );
 }
 
@@ -1353,7 +1353,7 @@ async function deliverViaAdapter(
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const budgetMs = options.deliveryBudgetMs ?? DEFAULT_DELIVERY_BUDGET_MS;
 
-  // Telegram-side facts, coerced rather than trusted: metadata is JSON the
+  // Chat-side facts, coerced rather than trusted: metadata is JSON the
   // worker built. Each coercion leans closed: a sender id must be exactly a
   // non-empty string to count, and ANY truthy forward marker counts as a forward.
   const meta = (msg.metadata ?? {}) as Record<string, unknown>;
@@ -1465,7 +1465,7 @@ async function deliverViaAdapter(
             commandId,
             msg.chatId,
             `Session no longer exists. The opencode session was deleted from this machine.`,
-            options.sendTelegramReply,
+            options.sendChatReply,
           );
           return;
         }
@@ -1476,7 +1476,7 @@ async function deliverViaAdapter(
             commandId,
             msg.chatId,
             `opencode-serve is unreachable. Try again in a moment.`,
-            options.sendTelegramReply,
+            options.sendChatReply,
           );
           return;
         }
@@ -1487,7 +1487,7 @@ async function deliverViaAdapter(
             commandId,
             msg.chatId,
             `Delivery failed: ${revived.error}`,
-            options.sendTelegramReply,
+            options.sendChatReply,
           );
           return;
         }
@@ -1526,7 +1526,7 @@ async function deliverViaAdapter(
       commandId,
       msg.chatId,
       `Session is no longer reachable and was removed. Start a new session and try again.`,
-      options.sendTelegramReply,
+      options.sendChatReply,
     );
     return;
   }
@@ -1538,7 +1538,7 @@ async function deliverViaAdapter(
     commandId,
     msg.chatId,
     `Command rejected: ${result.error ?? "unknown reason"}`,
-    options.sendTelegramReply,
+    options.sendChatReply,
   );
   return;
 }

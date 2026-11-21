@@ -1286,7 +1286,7 @@ describe("OpencodeClient", () => {
       const relativeFiles = promptAsyncFiles.map((f) => relative(resolve(__dirname, ".."), f));
       expect(
         relativeFiles,
-        "sendPrompt in opencode-client.ts must be the ONLY daemon-side prompt_async call site so all daemon-injected prompts are recorded to suppress Telegram echo",
+        "sendPrompt in opencode-client.ts must be the ONLY daemon-side prompt_async call site so all daemon-injected prompts are recorded to suppress the chat echo",
       ).toEqual(["src/opencode-client.ts"]);
     });
   });

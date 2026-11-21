@@ -1,6 +1,6 @@
 /**
  * Maximum session title length (200 characters).
- * Bounded to prevent header overhead from breaking Telegram's 4096-char message limit
+ * Bounded to prevent header overhead from breaking the chat's 4096-char message limit
  * and to accommodate Phase 2 forum topic names (capped at 128 chars).
  */
 export const MAX_TITLE_LENGTH = 200
@@ -9,7 +9,7 @@ export const MAX_TITLE_LENGTH = 200
  * Clamp to at most `max` UTF-16 code units without splitting a surrogate pair.
  *
  * An unpaired surrogate survives JSON.stringify (escaped as a well-formed \udXXX) and so
- * reaches Telegram, but cannot be encoded as UTF-8 — Telegram rejects it or mojibakes it to
+ * reaches the chat, but cannot be encoded as UTF-8 — the chat rejects it or mojibakes it to
  * U+FFFD. Mirrors `clampPreservingSurrogates` in @pigeon/daemon's `text.ts`; the packages
  * share no library, so this is duplicated deliberately. Keep them in sync.
  */
@@ -50,7 +50,7 @@ type State = (typeof State)[keyof typeof State]
  *     genuine main session goes permanently silent, which is the unrecoverable
  *     direction (§1.6 of the visibility roadmap; and see the `ensureRegistered`
  *     docblock in index.ts for the incident that established it).
- *   - The Telegram prompt mirror must fail CLOSED. A misclassified subagent would post
+ *   - The the chat prompt mirror must fail CLOSED. A misclassified subagent would post
  *     its full task brief into a topic, and Phase 2 already chose silence over noise
  *     for its own leak direction.
  *
@@ -172,7 +172,7 @@ export class SessionManager {
 
     // Reported so the caller can log it. A demotion after registration is the moment we
     // learn a registration we already made was wrong: the daemon holds a row for a
-    // subagent, and if it had already notified, a Telegram topic exists that nothing
+    // subagent, and if it had already notified, a channel exists that nothing
     // reclaims. See `pigeon-umyr`.
     return wasRegistered
   }

@@ -17,9 +17,9 @@ export interface CommandDeliveryContext {
   chatId?: string | number;
   modelOverride?: string;
   /**
-   * Telegram-side facts about the message, forwarded by the worker. Only the
+   * Chat-side facts about the message, forwarded by the worker. Only the
    * pull and goose-acp adapters read them; opencode adapters ignore them.
-   *   senderId   the Telegram user id that sent it (absent for a button tap)
+   *   senderId   the chat user id that sent it (absent for a button tap)
    *   forwarded  the message was forwarded, so its author is someone else
    *   inReplyTo  text of the BOT message the human replied to, if any
    */
@@ -47,7 +47,7 @@ export interface CommandDeliveryAdapter {
    * connection-shaped ("fetch failed", "econnrefused", "network error") is taken
    * as proof the opencode plugin is gone, which triggers revive and — whether or
    * not an opencodeClient is available — ultimately DELETES the session row, the
-   * assignment, and the Telegram topic registration.
+   * assignment, and the channel registration.
    *
    * `"surface"` says: this adapter's errors mean nothing to that machinery, so do
    * not classify them and do not touch the session. Report the failure to the

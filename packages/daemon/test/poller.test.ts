@@ -5,16 +5,15 @@ const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
   apiKey: "test-key",
   machineId: "devbox",
-  chatId: "chat-42",
 };
 
 function makeExecuteMsg(overrides?: Partial<ExecuteMessage>): ExecuteMessage {
   return {
     commandId: "cmd-1",
+    chatId: "chat-1",
     commandType: "execute",
     sessionId: "sess-1",
     command: "ls",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -22,10 +21,10 @@ function makeExecuteMsg(overrides?: Partial<ExecuteMessage>): ExecuteMessage {
 function makeLaunchMsg(overrides?: Partial<LaunchMessage>): LaunchMessage {
   return {
     commandId: "cmd-2",
+    chatId: "chat-1",
     commandType: "launch",
     directory: "/home/user/project",
     prompt: "Hello world",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -33,9 +32,9 @@ function makeLaunchMsg(overrides?: Partial<LaunchMessage>): LaunchMessage {
 function makeKillMsg(overrides?: Partial<KillMessage>): KillMessage {
   return {
     commandId: "cmd-3",
+    chatId: "chat-1",
     commandType: "kill",
     sessionId: "sess-1",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -43,9 +42,9 @@ function makeKillMsg(overrides?: Partial<KillMessage>): KillMessage {
 function makeInterruptMsg(overrides?: Partial<InterruptMessage>): InterruptMessage {
   return {
     commandId: "cmd-interrupt",
+    chatId: "chat-1",
     commandType: "interrupt",
     sessionId: "sess-1",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -53,9 +52,9 @@ function makeInterruptMsg(overrides?: Partial<InterruptMessage>): InterruptMessa
 function makeCompactMsg(overrides?: Partial<CompactMessage>): CompactMessage {
   return {
     commandId: "cmd-4",
+    chatId: "chat-1",
     commandType: "compact",
     sessionId: "sess-1",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -83,9 +82,9 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
 function makeMcpListMsg(overrides?: Partial<McpListMessage>): McpListMessage {
   return {
     commandId: "cmd-5",
+    chatId: "chat-1",
     commandType: "mcp_list",
     sessionId: "sess-1",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -93,9 +92,9 @@ function makeMcpListMsg(overrides?: Partial<McpListMessage>): McpListMessage {
 function makeMcpEnableMsg(overrides?: Partial<McpEnableMessage>): McpEnableMessage {
   return {
     commandId: "cmd-6",
+    chatId: "chat-1",
     commandType: "mcp_enable",
     sessionId: "sess-1",
-    chatId: "chat-1",
     serverName: "filesystem",
     ...overrides,
   };
@@ -104,9 +103,9 @@ function makeMcpEnableMsg(overrides?: Partial<McpEnableMessage>): McpEnableMessa
 function makeMcpDisableMsg(overrides?: Partial<McpDisableMessage>): McpDisableMessage {
   return {
     commandId: "cmd-7",
+    chatId: "chat-1",
     commandType: "mcp_disable",
     sessionId: "sess-1",
-    chatId: "chat-1",
     serverName: "filesystem",
     ...overrides,
   };
@@ -115,9 +114,9 @@ function makeMcpDisableMsg(overrides?: Partial<McpDisableMessage>): McpDisableMe
 function makeModelListMsg(overrides?: Partial<ModelListMessage>): ModelListMessage {
   return {
     commandId: "cmd-8",
+    chatId: "chat-1",
     commandType: "model_list",
     sessionId: "sess-1",
-    chatId: "chat-1",
     ...overrides,
   };
 }
@@ -125,9 +124,9 @@ function makeModelListMsg(overrides?: Partial<ModelListMessage>): ModelListMessa
 function makeModelSetMsg(overrides?: Partial<ModelSetMessage>): ModelSetMessage {
   return {
     commandId: "cmd-9",
+    chatId: "chat-1",
     commandType: "model_set",
     sessionId: "sess-1",
-    chatId: "chat-1",
     model: "anthropic/claude-3-5-sonnet",
     ...overrides,
   };
@@ -576,14 +575,15 @@ describe("Poller.sendNotification()", () => {
     ) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
-    const result = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-123", text: "Hello!", replyMarkup: { inline_keyboard: [] } });
+    const result = await poller.sendNotification({ sessionId: "sess-1", text: "Hello!", replyMarkup: { inline_keyboard: [] } });
 
     expect(result.ok).toBe(true);
     const [url, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://localhost:8787/notifications/send");
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
     expect(body.sessionId).toBe("sess-1");
-    expect(body.chatId).toBe("chat-123");
+    // The worker resolves the chat: none is sent.
+    expect(body).not.toHaveProperty("chatId");
     expect(body.text).toBe("Hello!");
     expect(body.media).toBeUndefined();
   });
@@ -595,7 +595,7 @@ describe("Poller.sendNotification()", () => {
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
     const media = [{ key: "outbound/123/photo.png", mime: "image/png", filename: "photo.png" }];
-    await poller.sendNotification({ sessionId: "sess-2", chatId: "chat-456", text: "With media!", replyMarkup: { inline_keyboard: [] }, media });
+    await poller.sendNotification({ sessionId: "sess-2", text: "With media!", replyMarkup: { inline_keyboard: [] }, media });
 
     const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -608,7 +608,7 @@ describe("Poller.sendNotification()", () => {
     ) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });
 
-    await poller.sendNotification({ sessionId: "sess-3", chatId: "chat-789", text: "No media!", replyMarkup: { inline_keyboard: [] }, media: [] });
+    await poller.sendNotification({ sessionId: "sess-3", text: "No media!", replyMarkup: { inline_keyboard: [] }, media: [] });
 
     const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
     const body = JSON.parse(String(init.body)) as Record<string, unknown>;
@@ -623,7 +623,6 @@ describe("Poller.sendNotification()", () => {
 
     await poller.sendNotification({
       sessionId: "sess-1",
-      chatId: "chat-123",
       text: "Hello!",
       replyMarkup: { inline_keyboard: [] },
       onTopicUnavailable: "retry",
@@ -642,7 +641,6 @@ describe("Poller.sendNotification()", () => {
 
     await poller.sendNotification({
       sessionId: "sess-1",
-      chatId: "chat-123",
       text: "Hello!",
       replyMarkup: { inline_keyboard: [] },
     });
@@ -755,23 +753,6 @@ describe("Poller.editNotification()", () => {
 
     const result = await poller.editNotification("q:sess:req", "text", { inline_keyboard: [] });
     expect(result.ok).toBe(false);
-  });
-});
-
-// ============================================================
-// getConfiguredChatId
-// ============================================================
-
-describe("Poller.getConfiguredChatId()", () => {
-  it("returns chatId from config", () => {
-    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {});
-    expect(poller.getConfiguredChatId()).toBe("chat-42");
-  });
-
-  it("returns undefined when chatId not provided", () => {
-    const { chatId: _chatId, ...configWithoutChatId } = BASE_CONFIG;
-    const poller = new Poller(configWithoutChatId, makeCallbacks(), {});
-    expect(poller.getConfiguredChatId()).toBeUndefined();
   });
 });
 
@@ -940,7 +921,7 @@ describe("Poller.sendNotification() rate limits", () => {
     );
     (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
     expect(res).toEqual({
       ok: false,
       kind: "http_error",
@@ -970,7 +951,7 @@ describe("Poller.sendNotification() rate limits", () => {
       );
       (poller as unknown as { fetchFn: typeof fetch }).fetchFn = fetchMock as unknown as typeof fetch;
 
-      const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
+      const res = await poller.sendNotification({ sessionId: "sess-1", text: "hello", replyMarkup: { inline_keyboard: [] } });
       expect(res).toEqual({
         ok: false,
         kind: "http_error",
@@ -987,7 +968,7 @@ describe("Poller.sendNotification() structured results", () => {
     const fetchMock = vi.fn().mockRejectedValue(new TypeError("fetch failed", { cause }));
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: false,
       kind: "transport_error",
@@ -1005,7 +986,7 @@ describe("Poller.sendNotification() structured results", () => {
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: false,
       kind: "http_error",
@@ -1023,7 +1004,7 @@ describe("Poller.sendNotification() structured results", () => {
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: false,
       kind: "http_error",
@@ -1041,7 +1022,7 @@ describe("Poller.sendNotification() structured results", () => {
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: false,
       kind: "app_rejection",
@@ -1059,7 +1040,7 @@ describe("Poller.sendNotification() structured results", () => {
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: true,
       kind: "success",
@@ -1078,7 +1059,7 @@ describe("Poller.sendNotification() structured results", () => {
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchMock as unknown as typeof fetch });
 
-    const res = await poller.sendNotification({ sessionId: "sess-1", chatId: "chat-1", text: "hi", replyMarkup: {} });
+    const res = await poller.sendNotification({ sessionId: "sess-1", text: "hi", replyMarkup: {} });
     expect(res).toEqual({
       ok: true,
       kind: "success",
@@ -1188,7 +1169,6 @@ describe("Poller — worker health instrumentation", () => {
 
     await poller.sendNotification({
       sessionId: "sess-1",
-      chatId: "chat-1",
       text: "hi",
       replyMarkup: {},
     });
@@ -1209,7 +1189,6 @@ describe("Poller — worker health instrumentation", () => {
     await poller.registerSession("sess-1");
     await poller.sendNotification({
       sessionId: "sess-1",
-      chatId: "chat-1",
       text: "hi",
       replyMarkup: {},
     });
@@ -1230,7 +1209,6 @@ describe("Poller — worker health instrumentation", () => {
 
     const res = await poller.sendNotification({
       sessionId: "sess-1",
-      chatId: "chat-1",
       text: "hi",
       replyMarkup: {},
     });
@@ -1388,39 +1366,48 @@ describe("Poller.lookupTopics()", () => {
 });
 
 describe("Poller.resolveNamedTopic()", () => {
-  it("POSTs chatId/key/name to /topics/named and returns the thread", async () => {
+  it("POSTs key/name (no chat id: the worker resolves it) to /topics/named and returns the thread", async () => {
     const fetchFn = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ chatId: "chat-42", messageThreadId: 9, created: true }), { status: 200 }),
+      new Response(JSON.stringify({ chatId: "slack:T1", messageThreadId: 9, created: true }), { status: 200 }),
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
-    expect(await poller.resolveNamedTopic({ key: "k", name: "n", staleThreadId: 3 })).toEqual({ messageThreadId: 9, created: true });
+    expect(await poller.resolveNamedTopic({ key: "k", name: "n", staleThreadId: 3 })).toEqual({
+      messageThreadId: 9,
+      created: true,
+      chatId: "slack:T1",
+    });
     const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://localhost:8787/topics/named");
-    expect(JSON.parse(init.body as string)).toEqual({ chatId: "chat-42", key: "k", name: "n", staleThreadId: 3 });
+    expect(JSON.parse(init.body as string)).toEqual({ key: "k", name: "n", staleThreadId: 3 });
   });
 
-  it("throws on non-2xx, a bad body, or no chat configured", async () => {
+  it("does not surface a numeric (pre-deletion) chat id", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ chatId: "-100123", messageThreadId: 9, created: false }), { status: 200 }),
+    );
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
+    expect(await poller.resolveNamedTopic({ key: "k", name: "n" })).toEqual({ messageThreadId: 9, created: false });
+  });
+
+  it("throws on non-2xx or a bad body", async () => {
     const f1 = vi.fn().mockResolvedValue(new Response("{}", { status: 502 }));
     await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f1 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
     const f2 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ messageThreadId: "x" }), { status: 200 }));
     await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f2 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
-    const f3 = vi.fn();
-    await expect(new Poller({ ...BASE_CONFIG, chatId: undefined }, makeCallbacks(), { fetchFn: f3 as unknown as typeof fetch }).resolveNamedTopic({ key: "k", name: "n" })).rejects.toThrow();
-    expect(f3).not.toHaveBeenCalled();
   });
 });
 
 describe("Poller.bindNamedTopic()", () => {
-  it("POSTs chatId/sessionId/key/name to /topics/named/bind and returns the thread", async () => {
+  it("POSTs sessionId/key/name (no chat id) to /topics/named/bind and returns the thread", async () => {
     const fetchFn = vi.fn().mockResolvedValue(
       new Response(
-        JSON.stringify({ chatId: "chat-42", messageThreadId: 17, created: false, bound: true, sessionId: "ses_1" }),
+        JSON.stringify({ chatId: "slack:T1", messageThreadId: 17, created: false, bound: true, sessionId: "ses_1" }),
         { status: 200 },
       ),
     );
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: fetchFn as unknown as typeof fetch });
     const result = await poller.bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" });
-    expect(result).toEqual({ messageThreadId: 17 });
+    expect(result).toEqual({ messageThreadId: 17, chatId: "slack:T1" });
     const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("http://localhost:8787/topics/named/bind");
     expect(init.headers).toMatchObject({
@@ -1428,14 +1415,13 @@ describe("Poller.bindNamedTopic()", () => {
       "Content-Type": "application/json",
     });
     expect(JSON.parse(init.body as string)).toEqual({
-      chatId: "chat-42",
       sessionId: "ses_1",
       key: "k1",
       name: "Topic 1",
     });
   });
 
-  it("throws when bound is not true, on non-2xx, or when no chat is configured", async () => {
+  it("throws when bound is not true, or on non-2xx", async () => {
     // Missing or false bound flag
     const f1 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ messageThreadId: 17, bound: false }), { status: 200 }));
     await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f1 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow();
@@ -1443,11 +1429,6 @@ describe("Poller.bindNamedTopic()", () => {
     // 409 session not registered
     const f2 = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "session not registered" }), { status: 409 }));
     await expect(new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: f2 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow("session not registered");
-
-    // No chat configured
-    const f3 = vi.fn();
-    await expect(new Poller({ ...BASE_CONFIG, chatId: undefined }, makeCallbacks(), { fetchFn: f3 as unknown as typeof fetch }).bindNamedTopic({ sessionId: "ses_1", key: "k1", name: "Topic 1" })).rejects.toThrow("no chat configured");
-    expect(f3).not.toHaveBeenCalled();
   });
 });
 
@@ -1654,7 +1635,6 @@ describe("Poller dispatch — tag commands", () => {
       commandId: "cmd-stale-dir",
       commandType: "tag_set_dir" as const,
       sessionId: "sess-1",
-      chatId: "chat-1",
       pattern: "/home/dev/projects/mono/*",
       tag: "fbm",
     };
@@ -1687,7 +1667,6 @@ describe("Poller dispatch — tag commands", () => {
       commandId: "cmd-stale-dir-reply",
       commandType: "tag_set_dir" as const,
       sessionId: "sess-1",
-      chatId: "chat-1",
       pattern: "/home/dev/projects/mono/*",
       tag: "fbm",
     };

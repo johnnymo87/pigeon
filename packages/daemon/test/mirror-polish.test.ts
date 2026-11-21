@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { hashPrompt } from "../src/hash-prompt";
-import { splitTelegramMessage } from "../src/split-message";
-import { TgMessageBuilder } from "../src/telegram-message";
+import { splitChatMessage } from "../src/split-message";
+import { ChatMessageBuilder } from "../src/chat-message";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 
 describe("pigeon-pre9 mirror polish", () => {
@@ -35,17 +35,17 @@ describe("pigeon-pre9 mirror polish", () => {
 
   /**
    * pre9 item 2 — an empty footer still contributes its "\n\n" separator, so every mirror ends
-   * in a trailing blank line. Telegram trims it on display, which is why this is cosmetic and
+   * in a trailing blank line. the chat trims it on display, which is why this is cosmetic and
    * was deferred; the separator is nonetheless wrong, and it also over-counts the chunk-budget
    * overhead by two characters.
    */
   describe("item 2 — an empty footer contributes no separator", () => {
     it("omits the trailing separator at the split-message level", () => {
-      const header = new TgMessageBuilder().append("🧑 Session").build();
-      const body = new TgMessageBuilder().append("hello world").build();
-      const footer = new TgMessageBuilder().build();
+      const header = new ChatMessageBuilder().append("🧑 Session").build();
+      const body = new ChatMessageBuilder().append("hello world").build();
+      const footer = new ChatMessageBuilder().build();
 
-      const chunks = splitTelegramMessage(header, body, footer);
+      const chunks = splitChatMessage(header, body, footer);
 
       expect(chunks).toHaveLength(1);
       expect(chunks[0]!.text).toBe("🧑 Session\n\nhello world");
@@ -53,11 +53,11 @@ describe("pigeon-pre9 mirror polish", () => {
     });
 
     it("still separates a non-empty footer", () => {
-      const header = new TgMessageBuilder().append("head").build();
-      const body = new TgMessageBuilder().append("body").build();
-      const footer = new TgMessageBuilder().append("foot").build();
+      const header = new ChatMessageBuilder().append("head").build();
+      const body = new ChatMessageBuilder().append("body").build();
+      const footer = new ChatMessageBuilder().append("foot").build();
 
-      const chunks = splitTelegramMessage(header, body, footer);
+      const chunks = splitChatMessage(header, body, footer);
 
       expect(chunks[0]!.text).toBe("head\n\nbody\n\nfoot");
     });
@@ -69,21 +69,21 @@ describe("pigeon-pre9 mirror polish", () => {
      * the separator correctly gone, nothing trimmed it. The clamp now runs unconditionally.
      */
     it("strips a trailing unpaired high surrogate even when the chunk is under maxLen", () => {
-      const empty = new TgMessageBuilder().build();
-      const body = new TgMessageBuilder().append("abc\uD83D").build();
+      const empty = new ChatMessageBuilder().build();
+      const body = new ChatMessageBuilder().append("abc\uD83D").build();
 
-      const chunks = splitTelegramMessage(empty, body, empty, 4096);
+      const chunks = splitChatMessage(empty, body, empty, 4096);
 
       expect(chunks).toHaveLength(1);
       expect(chunks[0]!.text).toBe("abc");
     });
 
     it("applies the conditional separator to every chunk of a multi-chunk body", () => {
-      const header = new TgMessageBuilder().append("🧑 Session").build();
-      const body = new TgMessageBuilder().append("x".repeat(9_000)).build();
-      const footer = new TgMessageBuilder().build();
+      const header = new ChatMessageBuilder().append("🧑 Session").build();
+      const body = new ChatMessageBuilder().append("x".repeat(9_000)).build();
+      const footer = new ChatMessageBuilder().build();
 
-      const chunks = splitTelegramMessage(header, body, footer);
+      const chunks = splitChatMessage(header, body, footer);
 
       expect(chunks.length).toBeGreaterThan(1);
       for (const chunk of chunks) {
@@ -94,19 +94,19 @@ describe("pigeon-pre9 mirror polish", () => {
     });
 
     it("keeps chunks within maxLen when truncation runs against an empty counterpart", () => {
-      const longHeader = new TgMessageBuilder().append("H".repeat(300)).build();
-      const body = new TgMessageBuilder().append("b".repeat(500)).build();
-      const empty = new TgMessageBuilder().build();
+      const longHeader = new ChatMessageBuilder().append("H".repeat(300)).build();
+      const body = new ChatMessageBuilder().append("b".repeat(500)).build();
+      const empty = new ChatMessageBuilder().build();
 
       // Header truncation, empty footer.
-      for (const chunk of splitTelegramMessage(longHeader, body, empty, 260)) {
+      for (const chunk of splitChatMessage(longHeader, body, empty, 260)) {
         expect(chunk.text.length).toBeLessThanOrEqual(260);
         expect(chunk.text.endsWith("\n")).toBe(false);
       }
 
       // Footer truncation, empty header.
-      const longFooter = new TgMessageBuilder().append("F".repeat(300)).build();
-      for (const chunk of splitTelegramMessage(empty, body, longFooter, 260)) {
+      const longFooter = new ChatMessageBuilder().append("F".repeat(300)).build();
+      for (const chunk of splitChatMessage(empty, body, longFooter, 260)) {
         expect(chunk.text.length).toBeLessThanOrEqual(260);
         expect(chunk.text.startsWith("\n")).toBe(false);
       }
