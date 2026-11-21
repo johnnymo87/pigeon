@@ -36,7 +36,7 @@ Two consequences worth keeping in mind:
 - An OOM in *your* scope now reports **exit 137** and kills only your command. Retrying
   unchanged will fail identically; reduce parallelism instead (`--maxWorkers`, fewer jobs).
 - The historical hazard this section was written for — `OOMPolicy=stop` on the serve cgroup
-  taking out the plugin, so `session.idle` never fires and Telegram notifications stop
+  taking out the plugin, so `session.idle` never fires and chat (Slack or Telegram) notifications stop
   **silently**, looking like a pigeon bug rather than an OOM (`pigeon-8bif`) — no longer
   applies to normal agent commands. It still applies if you ever see the wrapper's
   `WARNING: ... running UNSCOPED` line, which means the scoping degraded.
@@ -114,25 +114,47 @@ at this root is the deploy step. So the hook is a backstop, not a guarantee —
 the convention above is what actually keeps production clean.
 
 A read-only detector (`trunk-drift-detector`, every 30 minutes on cloudbox)
-pages Telegram when any primary root is sitting on commits that exist on no
+pages the chat (`#alerts` on Slack, General on Telegram) when any primary root is sitting on commits that exist on no
 remote, or has tracked edits while parked on trunk. If you get such an alert for
 pigeon, move the work into a worktree; do **not** reset, stash or clean the root.
 
 ## Architecture
 
-Pigeon is a Telegram bot that routes commands to machines running opencode.
+Pigeon is a chat bot that routes commands to machines running opencode. The chat is Slack on
+devbox and cloudbox (one personal Slack workspace per machine, one channel per session) and
+Telegram (a forum supergroup, one topic per session) on the Mac, until the Mac flips
+(`pigeon-4ogz.11`) and Telegram is deleted (`pigeon-4ogz.13`).
 
 ```
-Telegram → Webhook → Worker → D1 (SQLite)
-                                 ↑
-              Daemon polls:  GET  /machines/:id/next    (every 5s)
-              Daemon acks:   POST /commands/:id/ack
-              Daemon sends:  POST /notifications/send
-                                 ↓
-                           Plugin → OpenCode
+Slack events/commands/interactivity ─→ POST /slack/<machine>/{events,commands,interactivity} ─┐
+Telegram → POST /webhook/telegram ────────────────────────────────────────────────────────────┤
+                                                                                              ↓
+                                                                            Worker → D1 (SQLite)
+                                                                                       ↑
+                                    Daemon polls:  GET  /machines/:id/next    (every 5s)
+                                    Daemon acks:   POST /commands/:id/ack
+                                    Daemon sends:  POST /notifications/send   (→ Slack or Telegram)
+                                                                                       ↓
+                                                                                 Plugin → OpenCode
 ```
 
-Messages flow: Telegram → Worker (Cloudflare) → D1 ← Daemon (polls every 5s) → opencode serve.
+Messages flow: Slack (or Telegram) → Worker (Cloudflare) → D1 ← Daemon (polls every 5s) → opencode serve.
+
+**Which transport a machine is on.** It is a per-machine choice made by the worker, not by the
+daemon: a machine is on Slack exactly when the worker holds a `SLACK_WORKSPACE_<MACHINE>` secret for
+it (machine id upper-cased, `-` becomes `_`; JSON `{teamId, appId, domain, botToken, userToken,
+signingSecret, ownerUserId}`; an unparseable or incomplete one counts as absent and is logged once
+by `chat/slack-config.ts`), and otherwise on Telegram. Everything the worker resolves itself (a
+session's channel/topic, a named topic, a send with no thread) uses the machine's *current*
+transport, whatever `chatId` the daemon sent; anything already stored (an edit, a button, a reply
+to an older post) goes where it lives, so a flip never strands old conversation. A machine asks
+which it is with `GET /whoami`: `transport: "slack"` for a Slack machine, no `transport` field for
+a Telegram one. The daemon re-reads it every 60 s and persists it (`chat-transport-state.ts`), and
+uses it only to pick its direct alarm, the markdown dialect and launch capability, so a flip needs
+no daemon restart. Put the secret and move the machine's coordinator bindings with
+`packages/worker/scripts/slack-flip.mjs <machine> on|off` (see "Slack transport" below); setup is
+`docs/runbooks/slack-workspace-setup.md`. In this file, where a mechanic says "topic" or "General"
+and the machine is on Slack, read "channel" and `#alerts`; the Slack section lists the differences.
 
 The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon short-polls for commands via HTTP. No long-lived connections. If the worker restarts, the next poll succeeds against the new instance. If the daemon restarts, pending commands wait in D1 until it comes back.
 
@@ -173,7 +195,7 @@ Mechanics worth knowing before changing it:
   shell metacharacters (inert) but *argument injection* — a tag named `--dir` — which the
   validators reject by requiring a leading alphanumeric.
 - **Nothing here throws.** Every failure — not installed, spawn failure, non-zero exit —
-  becomes a Telegram message, because a throw skips the poller ack and the command is then
+  becomes a chat message, because a throw skips the poller ack and the command is then
   redelivered every lease expiry for 24h. Note the direction that failure takes: the retry
   loop is *silent*, so the user sees the worker's ack and then nothing at all, which is far
   harder to diagnose than a visible error.
@@ -198,11 +220,13 @@ form. Every call passes `--` before its positional arguments.
 **A stall-watch coordinator passes on its program, not its own tag.** A coordinator is tagged
 `stall-watcher-runs`, which says nothing about the work. When a `/launch` (either backend)
 inherits from a session whose `bound_topic_key` is `stallwatch:<tag>`, typically by
-swipe-replying to a coordinator's notification, the new session gets `<tag>`. No `which` is run.
+swipe-replying to a coordinator's notification (Telegram) or typing `/launch` in the coordinator's bound channel (Slack), the new session gets `<tag>`. No `which` is run.
 As a backstop, a `which` answer of `stall-watcher-runs` (a coordinator row that has lost its
 binding) is never inherited either.
 
 ### Telegram Forum Topics
+
+**This is the Telegram path: live on the Mac only, until it flips (`pigeon-4ogz.11`), and deleted with Telegram (`pigeon-4ogz.13`).** A machine on Slack gets channels instead of topics, `#alerts` instead of General, and archive instead of close; where a mechanic below is transport-neutral (the topic hold, the supersede, the close window, named topics and bindings) it applies to Slack rows too, and the "Slack transport" section after this one lists the differences. A Slack-only reader can skip to it.
 
 Pigeon supports operating in a Telegram forum supergroup (`TELEGRAM_TOPICS_ENABLED = "true"` in worker `wrangler.toml`). Each opencode session maps to a dedicated forum topic thread named after the session's TUI title. Inbound commands, outbound notifications, and media pass through thread-aware worker endpoints referencing `commands.message_thread_id` and the D1 `topics` table. For migration details, see [`docs/runbooks/telegram-forum-migration.md`](docs/runbooks/telegram-forum-migration.md).
 
@@ -268,7 +292,7 @@ Cross-session messaging between opencode sessions, delivered locally and, where 
 - **A row already at the derived id for a different goose session is refused (409), never overwritten.** A hash collision cannot cause this in practice. A hand-edited row, or a machine id reused from another machine, can. The namespace and the name format are frozen: changing either changes every future id.
 - **A stale named-topic binding can come back with the address.** The worker's sweep keeps `named_topic_bindings` rows after their session is gone, so a goose session re-registered at the same id without `named_topic` can revive a binding its new, unpinned local row knows nothing about. Rebinding the key clears it. The sweep fix is `pigeon-k0qn.15`.
 
-Swarm messages are mirrored into the receiver's Telegram topic at insert time via outbox `kind='swarm'` (`w:<msg_id>` notice, `wc:<msg_id>` retraction). This feed is best-effort and indicates message dispatch rather than transcript delivery. Outbox rate limits (`SWARM_SUB_BUDGET = 6`/60s) prevent swarm bursts from starving conversational notifications or triggering Telegram topic rate limits.
+Swarm messages are mirrored into the receiver's chat topic or channel (Telegram topic; Slack session channel) at insert time via outbox `kind='swarm'` (`w:<msg_id>` notice, `wc:<msg_id>` retraction). This feed is best-effort and indicates message dispatch rather than transcript delivery. Outbox rate limits (`SWARM_SUB_BUDGET = 6`/60s) prevent swarm bursts from starving conversational notifications or triggering Telegram topic rate limits.
 
 This fixes the prompt_async race architecturally — the daemon is the single writer to opencode serve for cross-session messages, so the "concurrent prompt_async from different `x-opencode-directory` headers bypasses the busy guard" race that bit COPS-6107 cannot occur for daemon-routed traffic. See the `swarm-architecture` skill for tables/routes/algorithm and `swarm-operations` for ops + debugging.
 
@@ -276,7 +300,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 
 - **Sending** (`PIGEON_REMOTE_LAUNCH_SEND=1` on A's daemon). Allows `POST /swarm/launch`. When unset or off, the daemon answers 403 `launch_send_disabled`. If worker credentials are not configured, it returns 503 `no_worker`.
 - **Receiving** (`PIGEON_REMOTE_LAUNCH_FROM=<machine,…>` on B's daemon). Lists machines whose remote launches B accepts (self is dropped). Empty by default.
-- **Receiver capability check.** Setting `PIGEON_REMOTE_LAUNCH_FROM` alone is not enough: B must be "launch-capable" (active `opencodeClient`, both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` configured for info alerts, and worker credentials). If any piece is missing, the daemon logs a warning naming it and leaves the `launch=` token out of its poll header (`X-Pigeon-Swarm-Relay: accept=<…>; launch=<…>; failures=1`), so the worker hands it no launches. Results for its own requests still arrive, since they ride on `failures=1`. Receiving also strictly requires `PIGEON_SWARM_RELAY_SEND=1` on B; otherwise B refuses with `no_return_path` because the launched session must be able to swarm-send its report back to A (design §9.3).
+- **Receiver capability check.** Setting `PIGEON_REMOTE_LAUNCH_FROM` alone is not enough: B must be "launch-capable" (active `opencodeClient`, an alarm path for the transport it is on for info alerts, and worker credentials: on Telegram `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, on Slack `PIGEON_SLACK_ALARM_WEBHOOK_URL` (plus, for now, `TELEGRAM_CHAT_ID`, because the outbox and alert notifier are built only when it is set), recomputed per poll from `GET /whoami`, so a flip needs no restart; `launch-capability.ts`). If any piece is missing, the daemon logs a warning naming it and leaves the `launch=` token out of its poll header (`X-Pigeon-Swarm-Relay: accept=<…>; launch=<…>; failures=1`), so the worker hands it no launches. Results for its own requests still arrive, since they ride on `failures=1`. Receiving also strictly requires `PIGEON_SWARM_RELAY_SEND=1` on B; otherwise B refuses with `no_return_path` because the launched session must be able to swarm-send its report back to A (design §9.3).
 - **Worker validation and check order:** (1) machine key required (shared `CCR_API_KEY` gets 401); (2) body validation (`machine`, `directory` ≤ 512 chars with no control characters, `prompt` ≤ 16,000 code points, valid tag, `from` is `ses_` or `gse_…`, `launch_id` without `:`; a `gse_` requester must have a local goose row, tag inheritance maps via `goose:<native>` or coordinator program, and an accepted launch request grants remote reachability; the launched session on B is always opencode, `ses_`); (3) duplicate check on `(from_machine, launch_id)`: same payload hash returns `202 duplicate` immediately (even if B is offline), different hash returns `409 launch_id_conflict`; (4) `from` session registered to another machine returns `403 sender_not_yours`; (5) `to_machine` = caller returns `409 same_machine` (use `opencode-launch` locally); (6) target not in `SHARED_KEY_REFUSED_MACHINES` returns `403 receiver_not_retired`; (7) target's `machine_launch_accept` lacks caller returns `403 not_accepted`; (8) target last poll older than 60s returns `503 target_offline`; (9) return path reachability target→caller not available returns `409 no_return_path`; (10) target queue ≥ 10 queued/leased rows returns `429 queue_full`; (11) caller created ≥ 30 launches in the last hour returns `429 rate_limited`.
 - **Result messages back to requester:** The requester daemon formats the incoming `launch_result` into a `launch.result` swarm message using one of five authoritative strings:
   - `launched`: `REMOTE LAUNCH STARTED: launch <id> started session <sessionId> on <machine> in <dir>. Message it with swarm_send to <sessionId>.`
@@ -285,7 +309,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
   - `unconfirmed` (with session id): `REMOTE LAUNCH UNCONFIRMED: launch <id> created session <sessionId> on <machine>, but its prompt may not have arrived. swarm_send it the task if it does not report in. Do NOT launch again.`
   - `unconfirmed` (without session id): `REMOTE LAUNCH UNCONFIRMED: launch <id> may or may not have started on <machine>. Check swarm_list remote: true before retrying.`
 - **Deadlines and never-downgrade rule:** A launch request lives 15 minutes on the worker (expiring to `never_collected` if queued, or `unconfirmed` if leased). A's local outbound deadline is 15 minutes + 180s (60s lease + 120s buffer); if no result arrives by then, A mints its own `unconfirmed` (no id) swarm message. Once an outbound launch is resolved to `launched` or `refused`, an incoming `unconfirmed` item is never allowed to downgrade it.
-- **Telegram notice on B:** On launch, B's daemon enqueues a durable info alert to General: `🚀 Remote launch from <machine> (<from>): session <sid> in <dir>\n<prompt...>` (truncated to 300 chars; suffixes ` (prompt may not have arrived)` for unconfirmed). The launched session notifies under normal policy in its own topic.
+- **Chat notice on B:** On launch, B's daemon enqueues a durable info alert to General (`#alerts` on a Slack machine): `🚀 Remote launch from <machine> (<from>): session <sid> in <dir>\n<prompt...>` (truncated to 300 chars; suffixes ` (prompt may not have arrived)` for unconfirmed). The launched session notifies under normal policy in its own topic.
 - **The pool-restart trap:** The launched session runs inside B's `opencode-serve` pool. Restarting B's serve pool kills the launched session immediately. For remote upgrade workflows, restarting the serve pool must be the last step, scheduled via a delayed `systemd-run` job (e.g. `--on-active=60`) after reporting results back via `swarm_send`.
 - **Known limits.** A refusal that the worker makes before its duplicate check (`unauthorized`, `machine_mismatch`, `worker_too_old`, `launch_unavailable`) is final only on the first attempt. On a retry an earlier attempt may have landed, so the requester keeps retrying and lets the deadline answer UNCONFIRMED. B's `createSession` budget is 20s. With a serve pool, the session is created on a healthy serve, serve-0 first. A failed or timed-out create is retried once on a second healthy serve: the first attempt gets the budget minus a 5s reserve (15s, what it had before failover existed) and the second gets the rest. The prompt then goes to an owner placed off the serve that failed. Telegram `/launch` does the same in a 30s total. This exists because on 2026-11-03 devbox's serve-0 answered `/global/health` but hung every session-DB route for 2.5h, which the pool's liveness signal cannot see. With no pool, the old path (5s health check, then create) is unchanged apart from the longer budget, so a launch takes at most about 45s of its 60s lease. A start that overruns the budget on every attempt is reported unconfirmed with no id. A timed-out attempt can leave an idle, unprompted session on its serve even when the failover succeeds. There is no hop rule: a launched session can itself `swarm_launch`, bounded only by the worker's queue and rate caps. The Telegram notice on B is not an audit record, because it truncates the prompt; the full prompt is in B's transcript.
 - **Browser requests are refused.** `POST /swarm/launch` answers 403 `browser_request_refused` to any request carrying an `Origin` header and 415 to a body not declared `application/json`, before the request is parsed. The Mac's daemon has no auth token, so without this any web page open in its browser could start an agent on another machine with a no-cors `text/plain` POST, which needs no CORS preflight. Browsers always send `Origin` on a cross-origin POST, and no legitimate caller (the plugin, curl) does. Only this route has the guard; the other routes of a token-less daemon are still reachable that way (`pigeon-k0qn.21`).
@@ -293,6 +317,8 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 - **Deployment and rollback:** Deployment order for enabling: worker schema (`d1-schema.sql` tables `remote_launch` and `machine_launch_accept`) applied and worker deployed first; then daemons; receive-side flags (`PIGEON_REMOTE_LAUNCH_FROM`) before send-side (`PIGEON_REMOTE_LAUNCH_SEND`). Flags are configured in the workstation repo's host configuration (env of `pigeon-daemon.service`) — not in this repo. Rollback: unset the env flag(s) and restart the daemon; queued launches for a machine that stops polling expire and return to the requester as `never_collected`.
 
 ### Commands
+
+Where a command is typed: on Telegram, as a reply to a session notification or in the session's topic; on Slack, in the session's channel (or anywhere, with an explicit session id). Slack's app slash commands **do not work inside a thread**, so a command typed in a thread reply is not run; a plain message in a thread is routed to the session like one in the channel. In Slack the "reply to a session notification" column below means "typed in the session's channel". `/rename` is a Slack built-in, so on Slack it is **`/retitle`** (the app's commands are `/launch /kill /interrupt /compact /retitle /mcp /model /tag`, `slack-inbound.ts` `SLACK_APP_COMMANDS`); unlike Telegram's `/rename`, `/retitle` keeps the ` · ~/dir` suffix, which on Slack is the channel's topic line.
 
 | Command | Example | What it does |
 |---------|---------|--------------|
@@ -307,7 +333,7 @@ This fixes the prompt_async race architecturally — the daemon is the single wr
 | `/mcp disable <server>` | *(reply to a session notification)* | Disconnects an MCP server |
 | `/model` | *(reply to a session notification)* | Lists available models from allowed providers |
 | `/model <provider/model>` | *(reply to a session notification)* | Sets model override for the session |
-| `/rename <new title>` | *(reply to a session notification)* | Renames the session's forum topic to the given title. Worker-only — never reaches opencode |
+| `/rename <new title>` (Slack: `/retitle <new title>`) | *(reply to a session notification)* | Renames the session's forum topic (Slack: its channel and topic line) to the given title. Worker-only — never reaches opencode |
 | `/tag` | *(reply to a session notification)* | Lists untagged sessions ranked by list-price dollars, each with a tap-to-copy `/tag <id>` |
 | `/tag list` | *(reply to a session notification)* | Lists tags defined so far, with session counts |
 | `/tag <tag>` | *(reply to a session notification)* | Tags the replied-to session |
@@ -337,7 +363,7 @@ creation**: every session always has exactly one tag. Five things about it are l
   `tags.db` at read time, so a tag written a second late still covers every dollar the session ever
   spends. The tag branch has its own `try`/`catch` — a throw would skip the poller ack, and a
   redelivered `launch` is a *duplicate session*.
-- **Every failure names a reason in the Telegram reply**, because nobody reads stderr from a phone:
+- **Every failure names a reason in the chat reply**, because nobody reads stderr from a phone:
   not installed, `oc-tags timed out after 20s` (execFile's timeout kill prints nothing else), or the
   *last* line of stderr (a locked `tags.db` prints a 20-line traceback). Success prints oc-tags' own
   confirmation line, since oc-tags lowercases and a line of pigeon's own could name a tag the chart
@@ -348,7 +374,7 @@ creation**: every session always has exactly one tag. Five things about it are l
   old worker cannot emit the flag at all. The same holds for `--backend goose --tag`, which the
   worker refused until 555.29.7: an older daemon's goose branch had no tag handling.
 
-**The `@BotName` suffix.** In a group, Telegram's autocomplete sends `/kill@mohrbacher_01_bot` rather than `/kill`. Every command above accepts either form. The suffix attaches to the **command token**, not the subcommand — Telegram emits `/mcp@mohrbacher_01_bot list`, never `/mcp list@...`. Three things follow from how this is matched (worker `parseTelegramCommand`):
+**The `@BotName` suffix (Telegram only).** In a group, Telegram's autocomplete sends `/kill@mohrbacher_01_bot` rather than `/kill`. Every command above accepts either form. The suffix attaches to the **command token**, not the subcommand — Telegram emits `/mcp@mohrbacher_01_bot list`, never `/mcp list@...`. Three things follow from how this is matched (worker `parseTelegramCommand`):
 
 - **Only our own username is accepted**, from `TELEGRAM_BOT_USERNAME` in worker `wrangler.toml`. Pigeon is a group *admin*, so Telegram delivers it every message including commands addressed to other bots; accepting any `@name` would let a command aimed at a different bot trigger a real `/kill` here. A command addressed elsewhere is dropped, never injected into the session as a prompt.
 - **If that var is unset the suffixed form fails closed** — commands are dropped, not executed and not injected — and each drop emits a `console.warn` naming the command token. If autocompleted commands ever silently stop working, check that var first and look for that warning in `wrangler tail`.
@@ -362,13 +388,13 @@ From a terminal on the machine, connect to a session launched via `/launch`:
 opencode attach http://localhost:4096 --session <session-id>
 ```
 
-The session ID is included in the Telegram confirmation message.
+The session ID is included in the confirmation message the chat shows (Slack or Telegram).
 
 Where the daemon can resolve `oc-auto-attach` (on its PATH, or pinned by `OC_AUTO_ATTACH_BIN`; today only cloudbox), both `/launch` and `/launch --backend goose` also open the new session in nvim+tmux: the opencode TUI once the prompt was sent or is unconfirmed, `honk chat` once goose accepted the first prompt (via `oc-auto-attach goose:<goose id>`, honk-9qf.30). It logs to `/tmp/oc-auto-attach.log`. Best-effort; a failure to open never affects the launch or its reply.
 
 ### Notifications
 
-Opencode events (stop, question, error) are sent back to Telegram as replies, tagged with the machine name. Each notification includes the session ID on its own line for easy copy-paste.
+Opencode events (stop, question, error) are sent back to the chat, tagged with the machine name: a post in the session's own Slack channel (a threaded reply on Telegram). A thread reply under a post is routed to the session like any message in its channel. Each notification includes the session ID on its own line for easy copy-paste.
 
 **Durable notification delivery:** Stop, question, and swarm mirror notifications are routed through the daemon's durable outbox. The daemon accepts the event (HTTP 202), stores it in a SQLite outbox, and returns immediately. A background OutboxSender delivers to Telegram every 5s, retrying with backoff on failure. The worker deduplicates by `notificationId` so retries are safe.
 
@@ -435,7 +461,7 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 
 **Rate limit retry notifications:** When OpenCode hits a rate limit and retries, the plugin detects `session.status` events of type `"retry"` and sends a notification with the attempt number, error message, and next retry time.
 
-**Message splitting:** When a notification body exceeds Telegram's 4096-character limit, it is split into multiple messages at natural boundaries (paragraph breaks, line breaks, sentence ends). Reply markup is attached only to the last chunk.
+**Message splitting:** When a notification body exceeds 4096 characters (Telegram's limit, kept on Slack, which accepts it), it is split into multiple messages at natural boundaries (paragraph breaks, line breaks, sentence ends). Reply markup is attached only to the last chunk.
 
 **Tables and goose markdown render natively (`pigeon-p909`, `pigeon-6mkr`).** A stop notification is sent as **one** Telegram rich message (`sendRichMessage`, Bot API 10.1) instead of plain chunks when its body contains a GFM pipe table, or when it comes from a **goose-acp session** (honkd hook turns, pigeon's goose runner turns and its notices), whatever the body contains. Design: `docs/plans/2026-11-02-telegram-rich-tables-design.md`, `docs/plans/2026-11-03-goose-rich-markdown-design.md`. Five things are deliberate:
 
@@ -447,7 +473,7 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 
 **Buttons for mentioned sessions (`pigeon-ylx3`).** Any notification whose text mentions another session's id gets a url button to that session's forum topic, the same kind of button `POST /alert` `links` produce. It is aimed at coordinators reporting on workers, but applies to every `/notifications/send` (opencode stops, goose turns, swarm notices, mirrors). The worker does it (`worker/src/mention-links.ts`), so it needs no daemon deploy. An id is `ses_`/`gse_` plus at least 8 characters, and is matched as a prefix, so the shortened `ses_e71285de` that coordinators write works. The label is the topic's title. Mentioning the session's own id, a prefix matching more than one topic, a session with no topic, and a worker named only by description all get no button. A request that carries its own keyboard (a question's answer buttons) is left alone. Like alert links it fails open: a lookup error sends without buttons, and a Telegram 400 on the added keyboard is resent once without it. A message the daemon splits gets, on each chunk, buttons for the ids in that chunk.
 
-**Plain alerts and link buttons (`POST /alert`):** `{text, severity, links?}`. The daemon posts `text` to Telegram in its configured chat — through the worker's `POST /messages/send`, falling back to a direct Bot API call when the *worker* fails, in which case the alert ends `· sent direct; worker: <reason>` and one `worker-health-fallback` alert per failure kind per hour is recorded (chat-transport phase 1, `pigeon-lenr`; `daemon/src/alert-notifier.ts`) — no topic, so in a forum it lands in General — and is not split, so callers keep it under 4096 characters. `links: [{label, sessionId}]` is optional. For each session that has a forum topic, it adds one url button (`https://t.me/c/<chat id without -100>/<thread id>`), so a digest that names sessions lets you tap straight into a session's thread and answer there. The mapping lives only in the worker's D1, so the daemon asks per alert with one `POST /topics/lookup`, bounded at 2s (`daemon/src/alert-links.ts`). The lookup's time is taken out of the send's own 10s bound, so a links-bearing alert answers within the same ~10s as a plain one. Callers should still set their HTTP timeout somewhat above 10s, because a timeout of exactly 10s can report failure for an alert that was posted. Four things are deliberate:
+**Plain alerts and link buttons (`POST /alert`):** `{text, severity, links?}`. The daemon posts `text` to the chat — Slack's `#alerts` on a Slack machine, Telegram's configured chat otherwise — through the worker's `POST /messages/send`, falling back to a direct call when the *worker* fails (Telegram's Bot API, or on Slack the `#alerts` incoming webhook `PIGEON_SLACK_ALARM_WEBHOOK_URL`, picked from the persisted `whoami.transport`; `direct-slack-alarm.ts`, which can post to that one channel only), in which case the alert ends `· sent direct; worker: <reason>` and one `worker-health-fallback` alert per failure kind per hour is recorded (chat-transport phase 1, `pigeon-lenr`; `daemon/src/alert-notifier.ts`) — no topic, so in a forum it lands in General (on Slack, `#alerts`) — and is not split, so callers keep it under 4096 characters. `links: [{label, sessionId}]` is optional. For each session that has a forum topic or channel, it adds one url button (`https://t.me/c/<chat id without -100>/<thread id>` on Telegram; on Slack the `url` the lookup returns, `https://<domain>.slack.com/archives/<channel>`), so a digest that names sessions lets you tap straight into a session's thread and answer there. The mapping lives only in the worker's D1, so the daemon asks per alert with one `POST /topics/lookup`, bounded at 2s (`daemon/src/alert-links.ts`). The lookup's time is taken out of the send's own 10s bound, so a links-bearing alert answers within the same ~10s as a plain one. Callers should still set their HTTP timeout somewhat above 10s, because a timeout of exactly 10s can report failure for an alert that was posted. Four things are deliberate:
 
 - **It fails open, always.** If `links` is malformed or names a session with no topic, if the worker is unreachable or slow, or if this host has no worker connection, the alert is still sent, just without those buttons. Status codes are unchanged, and a bad `links` can never turn a 204 into a 4xx. Without a keyboard the send is byte-identical to an alert with no `links`.
 - **A Telegram 400 on the keyboard is retried once without it.** A 400 means nothing was posted. A timeout or 5xx is *not* retried, because it may have posted. (One deliberate exception sits underneath this ladder: a *worker* leg that times out or fails is re-sent once on the direct path, because for an operational alert a duplicate beats silence. A Telegram 400 or 429 relayed by the worker is never re-sent direct.)
@@ -476,7 +502,7 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 
 **Inbound to a goose-acp session.** Three rules apply in `GooseAcpAdapter` before anything is sent:
 
-- **Owner only, never forwarded** (`555.19`), the same rule as goose-pull. With `PIGEON_PULL_ALLOWED_USER_IDS` set (cloudbox), the sender must be in it; a missing sender id fails closed. With it empty (devbox and macOS today), a session bound to a topic accepts nothing and says so, naming the setting, while an unbound session accepts any sender the worker admits, as before. A forwarded message is refused either way. This covers prompts to an existing goose session only: `/launch --backend goose` carries no sender id and is not gated here.
+- **Owner only, never forwarded** (`555.19`), the same rule as goose-pull. With `PIGEON_PULL_ALLOWED_USER_IDS` set (cloudbox), the sender must be in it (it is compared with the message's `senderId`, so on a Slack machine the list must hold the owner's Slack user id, the workspace secret's `ownerUserId`; the error text still says "Telegram account", `goose/adapter.ts`); a missing sender id fails closed. With it empty (devbox and macOS today), a session bound to a topic accepts nothing and says so, naming the setting, while an unbound session accepts any sender the worker admits, as before. A forwarded message is refused either way. This covers prompts to an existing goose session only: `/launch --backend goose` carries no sender id and is not gated here.
 - **No goose commands into a pinned session** (`555.22`). goose runs text whose first word is `/name` (built-ins such as `/clear`, `/goal`, `/grind`, `/prompt`, `/skills`, `/status`, and any recipe or skill name) and the phrase "Please compact this conversation" as commands. The worker intercepts only its own commands, so for a session with `bound_topic_key` set pigeon refuses those (`goose/builtin-commands.ts`). The rule is on the shape, not a list, because recipe and skill names depend on what is installed. A path like `/tmp/x` is not a command to goose and still goes through. Unbound goose sessions are unchanged.
 - **Reply context** (`555.21`): a swipe-reply's bot message (or the highlighted part of it) is prefixed to the prompt as `[Replying to this earlier message in the topic: "<text>"]` (deliberately not "your" message: the bot also posts digests and pigeon's own replies there), capped at 500 characters. A goose command is passed through without it, so it still runs as one on an unbound session.
 
@@ -501,16 +527,16 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 - **Pending counts (`GET /pull/pending?session=<id>`)**: Returns `pending` (total unacked unexpired messages, excluding held swarm rows when the session is not opted in) and `by_source: {"telegram-reply": n, "swarm": m}` (where `swarm` is 0 when held), always including both keys. Also returns additive fields `swarm_pending: [{msg_id, sender_id, kind, reply_to, created_at, claimed_at, claim_count}]` (newest-first envelope metadata, at most the 50 newest rows, so a fresh message is never hidden behind a backlog; empty `[]` when swarm is held or session unknown) and `swarm_pending_truncated: boolean`. `claimed_at` is the time of the *first* claim and is never refreshed by a re-claim; a row still claimed but unacked usually means its reader died before acking. The consumer is stall-watch's coordinator-mail wake (eng-agent-platform bead g3y2), peeking who sent pending swarm mail without consuming it.
 - **Expiry and maintenance (`runPullInboxMaintenance`)**: A periodic sweep reaps expired unacked rows:
   - Expired unread `swarm` rows notify a `ses_` sender with a `delivery.failed` swarm message via the helper (which banks if the sender is also an opted-in pull session). Wording distinguishes evidence: never collected (`claim_count === 0`: "was never collected and was NOT received... safe to resend") vs unconfirmed (`claim_count > 0`: "handed to the target N time(s) but it never confirmed receiving it... unconfirmed, resend only if a duplicate would be harmless"). Non-`ses_` or `pigeon` senders and `delivery.failed` rows are logged without notice. Swarm row expiry does **not** raise a pigeon alert; the sender gets a `delivery.failed` swarm message, which like any swarm message may appear as a notice in the sender's own topic.
-  - Expired `telegram-reply` rows alert the human on Telegram as before.
-  - Claimed-but-unacked alerts (30 minutes) are **unchanged for all sources**: if a message was claimed but never acked, the daemon alerts the human on Telegram because an unconfirmed claim means the client crashed or wedged.
+  - Expired `telegram-reply` rows alert the human in the chat as before (the source name is Telegram's, kept on Slack until the cross-repo rename after `pigeon-4ogz.13`).
+  - Claimed-but-unacked alerts (30 minutes) are **unchanged for all sources**: if a message was claimed but never acked, the daemon alerts the human in the chat because an unconfirmed claim means the client crashed or wedged.
 
 **`strict_topic: true` on `POST /alert`** (only meaningful with `topic`) makes the alert refuse rather than fall back to General: an unresolvable topic returns `502 {error: "topic_unavailable"}` with nothing sent, and a Telegram 400 that survives dropping the buttons returns `502 {error: "rejected_in_topic"}`. Recreating a deleted thread still happens, since that stays in a topic. Use it when the text belongs only to that topic, for example because it quotes something typed there.
 
 ### Media Relay
 
-Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:
+Photos, documents, audio, video, and voice messages sent to the bot (Telegram) or posted in a session's channel (Slack, up to 10 files per message) are relayed to OpenCode sessions via R2:
 
-- **Inbound**: Telegram media → Worker (downloads from Telegram API, stores in R2) → Daemon (fetches from R2, converts to data URI) → Plugin (sends as file part to `prompt_async`)
+- **Inbound**: Telegram or Slack media → Worker (downloads from Telegram's API, or from `files.slack.com` with the bot token, and stores in R2) → Daemon (fetches from R2, converts to data URI) → Plugin (sends as file part to `prompt_async`)
 - **Outbound**: OpenCode file attachments → Plugin (captures FileParts and tool attachments) → Daemon (uploads to R2) → Worker (sends as `sendPhoto`/`sendDocument` reply in Telegram, a file in the text post's thread in Slack)
 
 Outbound was silently dead from March to November 2026 (`pigeon-4ogz.23`): the upload left with the MachineAgent client in `d9d70fe`, and `/stop` ignored the plugin's `media`. Now `/stop` only validates the files (base64 data URIs only, at most 10, 20 MB each, 30 MB in all, filename reduced to a basename) and parks them in the outbox payload as `mediaPending`, because the plugin gives `/stop` 3s. The outbox sender uploads them before the entry's first send (30s budget per tick), persists the keys as `media`, and sends them with chunk 0. A 4xx refusal drops that file; a transient failure holds the entry, uncounted and with its session's later entries waiting behind it, for up to 3 ticks, after which the text goes without the file. The rate governor counts each file as a post. Note the plugin forwards every file of the current message, so every image or PDF the agent *reads*, not just screenshots it takes, is posted.

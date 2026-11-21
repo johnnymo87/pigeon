@@ -88,13 +88,13 @@ journalctl --namespace=pigeon -u pigeon-daemon --no-pager --since '2 minutes ago
 
 If you ever see two `delivered` events for the same target with timestamps closer together than the actual `prompt_async` round-trip, the at-most-one-in-flight invariant is broken — file an issue and check `arbiter.ts:inflight`.
 
-## Tracing Telegram Swarm Posts
+## Tracing Chat Swarm Posts (Slack channel / Telegram topic)
 
-Swarm IPC messages are mirrored to the **receiver's** Telegram topic at insert time. Post delivery is best-effort via the daemon's outbox and independent of swarm IPC arbiter delivery — a missing or backlogged Telegram post does **not** mean the swarm message itself failed to reach the target's transcript.
+Swarm IPC messages are mirrored to the **receiver's** chat conversation (Slack session channel on devbox/cloudbox, Telegram topic on the Mac) at insert time. Post delivery is best-effort via the daemon's outbox and independent of swarm IPC arbiter delivery — a missing or backlogged chat post does **not** mean the swarm message itself failed to reach the target's transcript.
 
 ### Outbox Querying
 
-Swarm Telegram notifications use `notification_id` prefixes:
+Swarm chat notifications use `notification_id` prefixes (same on both transports):
 - `w:<msg_id>` — original swarm post notice
 - `wc:<msg_id>` — cancellation retraction notice (`🚫 cancelled <msg_id>`)
 - Multi-chunk posts suffix earlier chunks via `chunkNotificationId` (`w:<msg_id>:c0`, etc.)
@@ -112,7 +112,7 @@ Outbox rows use `kind='swarm'` (24h TTL).
 
 ### Sub-Budget Deferral Logs
 
-Swarm posts are rate-governed (`SWARM_SUB_BUDGET = 6` of the outbox governor's 12 sends/60s ceiling across `swarm`+`mirror` kinds) so swarm bursts cannot starve questions/stops or trigger Telegram topic rate limits (429s).
+Swarm posts are rate-governed (`SWARM_SUB_BUDGET = 6` of the outbox governor's 12 sends/60s ceiling across `swarm`+`mirror` kinds) so swarm bursts cannot starve questions/stops or trigger topic/channel creation rate limits (429s).
 
 When the sub-budget is exhausted, the outbox sender logs a once-per-tick debug/info line:
 
@@ -325,7 +325,7 @@ Key log lines and their meaning:
 | Log line | Meaning |
 |---|---|
 | `[remote-launch] launch_from=<list> launch_send=<on|off>` | Boot banner indicating configured remote launch accept list and send capability. |
-| `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: <list>` | Receiver warning: `remoteLaunchFrom` is set, but receiving is disabled because one or more prerequisites (`opencodeClient`, `telegramBotToken`, `telegramChatId`, `remoteLaunchClient`) are missing. The daemon leaves `launch=` out of its poll header. |
+| `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: <list>` | Receiver warning: `remoteLaunchFrom` is set, but receiving is disabled because one or more prerequisites (`opencodeClient`, `remoteLaunchClient`, and the alarm path for the machine's transport: `telegramBotToken` + `telegramChatId` on Telegram; `slackAlarmWebhookUrl` + `telegramChatId` on Slack, per `launch-capability.ts`) are missing. The daemon leaves `launch=` out of its poll header. |
 | `[remote-launch] remoteLaunchSend is enabled but worker credentials are missing...` | Sender warning: `PIGEON_REMOTE_LAUNCH_SEND=1` is set, but daemon lacks worker credentials. |
 | `[remote-launch] from_machine not accepted` | Receiver refused launch: sending machine is not listed in `PIGEON_REMOTE_LAUNCH_FROM` or equals self. |
 | `[remote-launch] relaySendEnabled is false, refusing no_return_path` | Receiver refused launch: B's `PIGEON_SWARM_RELAY_SEND` is not `1`, so the launched session would have no return path to report back to A. |

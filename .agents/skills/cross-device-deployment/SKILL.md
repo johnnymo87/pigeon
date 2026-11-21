@@ -54,7 +54,7 @@ including the unattended nightly one on devbox/cloudbox, runs it. The script say
 fetches its binary for whichever `node` is first on PATH (its install scripts call `node`, so
 naming the `npm` binary alone is not enough). If that is a different Node major than the one the
 service runs, the daemon dies at the next restart with a `NODE_MODULE_VERSION` mismatch and takes
-the host's Telegram and swarm relay with it. Every host's service runs a pinned nix node:
+the host's chat notifications (Slack or Telegram) and swarm relay with it. Every host's service runs a pinned nix node:
 
 | Machine | Daemon's node comes from |
 |---------|--------------------------|
@@ -99,10 +99,10 @@ The script runs these; they are listed for the manual path.
 > **Daemon before serve, always.** The plugin (in the serve process) and the daemon share the
 > stop idempotency key (`pigeon-mavq`): the plugin sends `notification_id` on `POST /stop` and
 > the daemon uses it as the outbox key, which is what makes a retry a no-op instead of a second
-> Telegram message. A **new plugin against an old daemon** is the one skew that could duplicate,
+> chat message. A **new plugin against an old daemon** is the one skew that could duplicate,
 > since the old daemon ignores the field. The plugin defends itself — an ambiguous timeout stays
 > terminal until it has seen a daemon echo a key back — so the worst case is a dropped stop
-> rather than a duplicate in every topic. Restarting the daemon first removes even that.
+> rather than a duplicate in every topic or channel. Restarting the daemon first removes even that.
 >
 > **Rolling the daemon BACK is the mirror case**, and the plugin handles it the same way: a
 > response carrying a `notificationId` that is not the one we sent is positive evidence of a
@@ -201,7 +201,7 @@ swarm_launch({
 
 Before ending your own turn on A, schedule a wake (`swarm_schedule`, about 20 minutes) that
 checks B shows `available` in `swarm_list remote: true` and that its report arrived. A daemon
-that fails to come back up cannot send that report, and takes B's Telegram and relay down with
+that fails to come back up cannot send that report, and takes B's chat notifications and relay down with
 it, so silence is the failure signal and nothing else will raise it.
 
 If the plugin changed and Jonathan wants it live before the nightly reset, the prompt's last

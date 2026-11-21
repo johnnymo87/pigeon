@@ -42,7 +42,7 @@ the gap.
   Enqueue is synchronous, delivery asynchronous with jittered backoff, no breaker.
 - **Client idempotency key**, `s:<sessionId>:<dedupToken>.<seq>`, minted by `StopKeyMinter` and
   sent as `notification_id`. The daemon uses it as the outbox key, which is what makes a retry
-  a no-op rather than a second Telegram message. The `seq` is required: a late `message.updated`
+  a no-op rather than a second chat message. The `seq` is required: a late `message.updated`
   clears the dedup guard and the next idle legitimately re-notifies the SAME message with newly
   accumulated text, which a message-id-only key would swallow.
 - **`sendStop` classifies outcomes**: any 2xx is success (including `{ok:true, notified:false}`
@@ -88,7 +88,7 @@ Question notifications use a dedicated path that bypasses the circuit breaker to
 
 ## Question Reply (Direct Channel)
 
-The plugin's direct channel server (`direct-channel.ts`) exposes `/pigeon/direct/question-reply` for the daemon to deliver answers back from Telegram. The handler calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
+The plugin's direct channel server (`direct-channel.ts`) exposes `/pigeon/direct/question-reply` for the daemon to deliver answers back from the chat (Slack or Telegram). The handler calls OpenCode's `/question/{requestId}/reply` API to unblock the question tool.
 
 **Critical: in-process fetch.** In TUI mode, OpenCode does NOT run an HTTP server. The SDK client injected into plugins uses a custom `fetch` that calls `Server.App().fetch()` in-process (bypassing the network). `ctx.serverUrl` resolves to `http://localhost:4096` but nothing listens there.
 
@@ -129,18 +129,18 @@ return {
 
 ## Media Handling
 
-### Outbound (OpenCode → Telegram)
+### Outbound (OpenCode → Slack or Telegram)
 
 `MessageTail` in `message-tail.ts` captures files from AI responses:
 
 - **FileParts**: when a message part has `type: "file"` with `mime` and `url`, pushed to `tail.files`.
 - **Tool attachments**: when a tool result has `status: "completed"` and `attachments[]`, each attachment's `{ mime, filename, url }` is captured.
 
-On `session.idle`, the plugin includes `media: FileInfo[]` (data URIs) in the `/stop` payload. The daemon uploads these to R2 and the worker sends them to Telegram as photo/document replies.
+On `session.idle`, the plugin includes `media: FileInfo[]` (data URIs) in the `/stop` payload. The daemon uploads these to R2 and the worker sends them as photo/document replies in Telegram, or as files in the text post's thread in Slack.
 
-### Inbound (Telegram → OpenCode)
+### Inbound (Telegram or Slack → OpenCode)
 
-When the daemon delivers an execute command with a `media` field (from a Telegram photo/document relayed through R2):
+When the daemon delivers an execute command with a `media` field (from a Telegram photo/document, or a Slack file, relayed through R2):
 
 1. The direct channel server receives the `ExecuteCommandEnvelope` at `/pigeon/direct/execute`.
 2. The `onExecute` handler builds a `parts` array for OpenCode's `prompt_async` endpoint:

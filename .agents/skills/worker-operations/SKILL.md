@@ -42,9 +42,9 @@ Expected: HTTP `200`
 1. Confirm worker health endpoint.
 2. Confirm auth path (`/sessions` with valid bearer).
 3. Confirm webhook auth behavior:
-   - wrong secret -> `401`
-   - correct secret -> `200`
-4. Confirm notification path with a test session.
+   - Telegram: wrong secret -> `401`, correct secret -> `200`
+   - Slack (a machine with a `SLACK_WORKSPACE_<MACHINE>` secret): `POST /slack/<machine>/events` with a bad or missing `X-Slack-Signature` -> `401`; a machine with no secret -> the router's ordinary `404`
+4. Confirm notification path with a test session. On a Slack machine the proof is a post in that session's channel (or `#alerts` for an unthreaded send), not a topic.
 5. Confirm daemon is polling (check `machines` table for recent `last_poll_at`).
 
 ## Logs
@@ -59,7 +59,7 @@ When reading logs, prioritize:
 
 - auth failures (401)
 - webhook parse/validation failures
-- Telegram API failures
+- Telegram API failures, and on Slack the `[worker] slack ...` lines (`slack rejected the blocks, retrying as plain text`, `slack owner invite failed`, `slow slack call`, `slack workspace secret ignored` for a malformed `SLACK_WORKSPACE_<MACHINE>`). Failure responses on Slack carry a top-level `errorClass` (`rate_limited`, `conversation_gone`, `rejected_format`, `upstream`)
 - queue retry spikes
 
 ## Deploy Verification Checklist
@@ -69,7 +69,14 @@ After deploy:
 1. `GET /health` returns `ok`.
 2. Authenticated `/sessions` returns `200`.
 3. Webhook secret check behaves as expected.
-4. Notification send returns `{ ok: true, messageId, token }`.
+4. Notification send returns `{ ok: true, messageId, token }` (on Slack the `messageId` is a handle >= 2^40 from `slack_posts`).
+
+## Where To Look When A Slack Post Is Missing
+
+1. `GET /whoami` with the machine's key: `transport: "slack"` or not. No field means the worker sees no valid secret for that machine and is posting to Telegram.
+2. `wrangler tail` for `[worker] slack ...` and the `[worker] request outcome` lines (status >= 400) on `/notifications/send` and `/messages/send`; read the response `errorClass`.
+3. D1: the chat id is `slack:<teamId>`. `SELECT * FROM topics WHERE chat_id LIKE 'slack:%' AND session_id = '<sid>'` gives the session's channel handle, and `slack_conversations` maps that handle to the Slack channel id (`slack_posts` maps post handles to channel + `ts`). Apply the schema (`slack_conversations`, `slack_posts`, `slack_seen_events`) before creating any secret; a missing table shows as a quiet `retention skipped: table missing` log line in the cron.
+4. No mention or push is expected by default: `SLACK_NOTIFY_OWNER` is deliberately unset (empty means no owner mention at all).
 
 ## Safe Rollback Guidance
 

@@ -96,7 +96,7 @@ copy `-wal`/`-shm` too, or read through SQLite.
 
 3. **Pigeon endpoint reconciler** (5s, `packages/daemon/src/routing/endpoint-reconciler.ts`).
    Makes `PIGEON_SERVE_ENDPOINTS` authoritative for `endpoint`, **that column only**.
-   Alerts via Telegram. It must never write `instance_uuid`.
+   Alerts via the chat (`#alerts` on Slack, General on Telegram). It must never write `instance_uuid`.
 
 Also: `markDead` is identity-fenced, so a departing rogue cannot drain a slot it no
 longer owns.
