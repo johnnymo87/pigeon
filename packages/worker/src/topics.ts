@@ -462,6 +462,23 @@ export async function listReapable(
 }
 
 /**
+ * Delete open numeric (non-`slack:`, Telegram-era) topic rows that match the orphan predicate of
+ * `listOrphaned`, in one statement and with no provider call. Returns how many rows went.
+ */
+export async function deleteNumericOrphans(db: D1Database, updatedBefore: number): Promise<number> {
+  const res = await db
+    .prepare(
+      `DELETE FROM topics
+       WHERE state = 'open' AND chat_id NOT LIKE 'slack:%'
+         AND (NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = topics.session_id)
+              OR EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = topics.session_id AND s.updated_at < ?))`,
+    )
+    .bind(updatedBefore)
+    .run();
+  return res.meta.changes ?? 0;
+}
+
+/**
  * List open topics whose session row is missing or last updated before updatedBefore.
  * Used by cron orphan-closer (T2.11).
  */

@@ -1,6 +1,7 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
+  deleteNumericOrphans,
   listOrphaned,
   listReapable,
   deleteTopicBySession,
@@ -152,6 +153,11 @@ export async function closeOrphanedTopics(
   const orphanTtlMs = opts.orphanTtlMs ?? ORPHAN_TTL_MS;
   const limit = opts.limit ?? DEFAULT_ORPHAN_CAP;
   const updatedBefore = now - orphanTtlMs;
+
+  // Numeric (Telegram-era) orphans have no provider call to make and are not counted as closed, so
+  // they are dropped first in one statement. Left in `listOrphaned`'s oldest-first window they would
+  // eat the cap ahead of the Slack orphans that actually need an archive.
+  await deleteNumericOrphans(db, updatedBefore);
 
   const rows = await listOrphaned(db, { updatedBefore, limit });
   if (rows.length === 0) {

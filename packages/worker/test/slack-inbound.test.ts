@@ -717,6 +717,19 @@ describe("slash commands", () => {
     expect(await commandsFor(box.machineId)).toEqual([]);
   });
 
+  it("/kill in a coordinator's bound named channel does not follow the binding: no kill is queued", async () => {
+    const box = await mkBox();
+    const coord = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:prog3");
+    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)")
+      .bind(box.chat, "stallwatch:prog3", coord, Date.now())
+      .run();
+    const body = await json(await sendCommand(box, "/kill", "", named.channelId));
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain("This channel has no session");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
   it("a command typed in a channel with no handle mints one, so the daemon's reply lands there", async () => {
     const box = await mkBox();
     const sessionId = await seedSession(box.machineId);

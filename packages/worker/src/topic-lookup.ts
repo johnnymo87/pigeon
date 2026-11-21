@@ -16,11 +16,12 @@ export interface TopicLookupEntry {
   messageThreadId: number | null;
   state: "open" | "closed";
   /**
-   * The conversation's link, on Slack rows ONLY (`null` when it cannot be built: the workspace's
-   * secret is gone, or the handle has no conversation). A numeric (Telegram-era) entry has no
-   * `url` field at all.
+   * The conversation's link. `null` when it cannot be built: the workspace's secret is gone, the
+   * handle has no conversation, or the row is a numeric (Telegram-era) one. Always present and
+   * never omitted: an old daemon builds a dead t.me link from a missing `url`, and treats an
+   * explicit null as "no button".
    */
-  url?: string | null;
+  url: string | null;
 }
 
 /**
@@ -84,9 +85,9 @@ export async function handleTopicLookup(
         chatId: row.chat_id,
         messageThreadId: row.message_thread_id,
         state: row.state,
-        ...(isSlackChatId(row.chat_id)
-          ? { url: await withD1("topics.lookupUrl", slackConversationUrl(db, env, row.chat_id, row.message_thread_id)) }
-          : {}),
+        url: isSlackChatId(row.chat_id)
+          ? await withD1("topics.lookupUrl", slackConversationUrl(db, env, row.chat_id, row.message_thread_id))
+          : null,
       };
     }
   } catch (err) {

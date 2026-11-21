@@ -370,6 +370,22 @@ describe("closeOrphanedTopics: numeric rows, reservations and a 429", () => {
     expect(before).toBe(2);
   });
 
+  it("numeric orphans do not consume the cap ahead of a Slack orphan", async () => {
+    const m = await mkMachine();
+    // Numeric rows are older (created_at ASC would put them first) and outnumber the cap.
+    const numeric: string[] = [];
+    for (let i = 0; i < 35; i++) numeric.push(await seedOrphan(m.machineId, { tg: TG_CHAT }));
+    await env.DB.prepare("UPDATE topics SET created_at = 1 WHERE chat_id = ?").bind(TG_CHAT).run();
+    const slackId = await seedOrphan(m.machineId, { ws: m.ws });
+    slack("conversations.archive", { ok: true });
+
+    const res = await closeOrphanedTopics(env.DB, { now: NOW, limit: 30, env: envFor([m]) });
+
+    expect(res).toEqual({ closedOrphans: 1, rateLimited: false });
+    expect(await states([slackId])).toEqual(["closed"]);
+    expect(await Promise.all(numeric.map((id) => getBySession(env.DB, id)))).toEqual(numeric.map(() => null));
+  });
+
   it("a closed numeric row is reaped by deleting it, with no provider call", async () => {
     const m = await mkMachine();
     const sessionId = await seedOrphan(m.machineId, { tg: TG_CHAT });
@@ -464,7 +480,7 @@ describe("Slack link URLs", () => {
       }),
     );
 
-  it("/topics/lookup adds url on Slack rows only; a numeric entry has no url field", async () => {
+  it("/topics/lookup answers url on Slack rows and an explicit url null on a numeric entry", async () => {
     const m = await mkMachine("beta");
     const slackSession = `ses_${stamp()}lk0000000`;
     const { channelId, handle } = await seedSlackTopic(slackSession, m.machineId, m.ws);
@@ -481,7 +497,9 @@ describe("Slack link URLs", () => {
           state: "open",
           url: slackArchiveUrl("beta", channelId),
         },
-        [tgSession]: { chatId: "-1001234567890", messageThreadId: 777, state: "open" },
+        // An explicit null (never an omitted url): an old daemon builds a dead t.me link from a
+        // missing one, and treats null as "no button".
+        [tgSession]: { chatId: "-1001234567890", messageThreadId: 777, state: "open", url: null },
         ses_missing: null,
       },
     });
