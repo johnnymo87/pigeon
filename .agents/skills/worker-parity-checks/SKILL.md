@@ -7,11 +7,11 @@ description: Use when validating deployed worker parity with authenticated check
 
 ## When To Use
 
-Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity.
+Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity. The example script below is the **Telegram** path (shared key, a numeric `chatId`, a simulated Telegram webhook). A machine on Slack has its own end-to-end check, in "Slack Machine" below.
 
 ## Prerequisites
 
-Daemon secrets (`CCR_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) are in sops at `/run/secrets/`.
+Daemon secrets (`CCR_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and on a Slack machine the per-machine `pigeon_worker_key`) are in sops at `/run/secrets/`.
 `TELEGRAM_WEBHOOK_SECRET` is a worker-only Cloudflare secret, not in sops. Set it manually before running webhook checks:
 ```bash
 export TELEGRAM_WEBHOOK_SECRET="<value>"
@@ -34,6 +34,7 @@ Verify unauthorized behavior:
 - `/notifications/send` with bad bearer -> `401`
 - `/notifications/send` missing required fields -> `400`
 - webhook with wrong Telegram secret -> `401`
+- Slack route `POST /slack/<machine>/events` with no/bad `X-Slack-Signature` -> `401` (machine has a `SLACK_WORKSPACE_<MACHINE>` secret) or `404` (it does not)
 
 ## Real Notification + Reply Routing
 
@@ -82,6 +83,15 @@ curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
 - Webhook reply returns `ok` (`200`)
 - Session is removable (`/sessions/unregister` returns `{ ok: true }`)
 
+## Slack Machine
+
+A Slack machine's end-to-end check is a **channel**, not a topic, and the shared key and the numeric `chatId` above do not apply: the worker resolves the destination itself (the machine's own `slack:<teamId>`, whatever `chatId` was sent), and the shared key never reaches Slack: for a stored `slack:<team>` address it is refused (`chat_not_allowed`), and a worker-resolved `/notifications/send` with the shared key goes down the Telegram path (an allowlisted numeric `chatId`, else `403`; `chat/address.ts` `resolveWorkerTarget`). So every Slack check here must use the MACHINE key (`/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac; `docs/runbooks/per-machine-credentials.md`), not `CCR_API_KEY`.
+
+1. `GET /whoami` with the machine key answers `{"credential":"machine","machine_id":"<m>","transport":"slack"}`. `"credential":"shared"` means you sent the wrong key (it says nothing about the machine's transport); a machine answer with no `transport` field means the worker sees no valid `SLACK_WORKSPACE_<MACHINE>` secret (rolled back to Telegram, or a broken secret).
+2. With the machine key, register a temporary session whose `machineId` is that machine (a machine key may only act as itself), then `POST /notifications/send` for it (`chatId` is still a required body field, but any value is ignored for a machine on Slack). The first notification creates a channel named `<title-slug>-<sid8>` in that machine's workspace; the response `messageId` is a handle >= 2^40 (`slack_posts`). Confirm in D1: `topics` has a row with `chat_id = 'slack:<teamId>'` for the session, and `slack_conversations` maps its handle to a channel id.
+3. Reply path: a message typed in that channel (or a thread reply under the post) becomes a `commands` row for the session. Slack requests are signed, so this is checked live in Slack rather than simulated with curl; slash commands are typed in the channel (not a thread), and `/kill`, `/interrupt`, `/compact`, `/mcp`, `/model` also work from `#alerts` as `/kill <session-id>`.
+4. Unregister the session. Its channel is archived by the nightly orphan-closer (04:00 UTC), not at unregister; remove the test channel by hand if it matters (bots cannot delete channels).
+
 ## Question Notification Token Parity
 
 When sending a notification with inline buttons (question notifications), verify the returned `token` matches the daemon's token embedded in the `callback_data`. The worker should extract the token from `cmd:TOKEN:action` in the first button's `callback_data` instead of generating its own.
@@ -113,7 +123,7 @@ Expected: upload returns `{ ok: true, key: "parity/..." }`, download returns the
 
 ### Notification with Media
 
-To verify end-to-end media in notifications, send a photo to the Telegram bot as a reply to an active session notification. The bot should:
+To verify end-to-end media in notifications, send a photo to the Telegram bot as a reply to an active session notification (on Slack: attach an image to a message in the session's channel). The bot should:
 
 1. Detect the photo, relay it to R2
 2. Deliver the command (with media) to the daemon via WebSocket

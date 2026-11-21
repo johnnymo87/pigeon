@@ -15,6 +15,7 @@ Use this skill for diagnosing regressions in auth, notifications, webhook proces
 2. Auth check (`CCR_API_KEY`)
 3. Webhook secret check
 4. Logs (`wrangler tail`)
+5. On a Slack machine (all three now): `GET /whoami` with the MACHINE key (`/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac; `docs/runbooks/per-machine-credentials.md`), then the Slack section below. Every Slack check here must use the machine key, not `CCR_API_KEY`: `/whoami` answering `"credential":"shared"` means you used the wrong key, not that the machine is on Telegram (the shared key has no machine, so it never shows `transport`)
 
 ## Health + Auth
 
@@ -42,6 +43,15 @@ Expected: HTTP `200`.
 - Notification send fails
   - Bot token issue or Telegram API error
   - Validate with a real `/notifications/send` call to allowed chat
+  - On Slack: read the response's top-level `errorClass` (`upstream` = bad token/scope or Slack trouble, `conversation_gone`, `rejected_format`, `rate_limited`), and `wrangler tail` for `[worker] slack ...`
+
+## Slack Failures
+
+- `404` on `POST /slack/<machine>/...`: the worker holds no valid `SLACK_WORKSPACE_<MACHINE>` secret for that machine (absent, unparseable or missing a field; the last is logged once as `slack workspace secret ignored`). `GET /whoami` then shows no `transport`.
+- `401` on a Slack route: the v0 signature failed against that machine's `signingSecret` (wrong secret in the config, or a clock skew over 5 minutes). `403`: `team_id` or `api_app_id` does not match the secret.
+- A message typed in a channel does nothing: only the owner (`ownerUserId`) is heard, bots and message subtypes other than `file_share`/`thread_broadcast` are ignored, and a channel pigeon never addressed has no handle and is ignored. A slash command echo (a message starting with one of the app's commands) is dropped on purpose; slash commands do not work in threads.
+- `403 chat_not_allowed` on `/messages/send` (a stored address): a `slack:<team>` chat id is refused for the shared key (use a machine key), and another machine's key needs a recent `commands` row for that channel. `POST /notifications/send` is different (worker-resolved): with the shared key it never goes to Slack, it takes the Telegram path (an allowlisted numeric `chatId`, else `403 Chat ID not allowed`; `resolveWorkerTarget` in `chat/address.ts`), so a send that "works" but posts nowhere in Slack is usually the wrong key.
+- Where the state is: D1 `topics`/`named_topics` rows with `chat_id = 'slack:<teamId>'`, `slack_conversations` (handle to channel id), `slack_posts` (handle to channel + ts, 30 days), `slack_seen_events` (event dedup, 48 h).
 
 ## Worker Logs
 
@@ -54,10 +64,11 @@ wrangler tail --format=pretty
 ## Command Routing Checks
 
 - Confirm session exists in `/sessions` (response uses `session_id`, `machine_id`)
-- Confirm webhook payload has:
+- Confirm webhook payload has (Telegram):
   - `message.reply_to_message.message_id`, or
   - `/cmd <token> <command>`, or
   - callback data `cmd:<token>:<action>`
+- On Slack the session comes from, in order: the thread parent's post (`slack_posts` then `messages`), the channel's `topics` row, a bound named channel. A `block_actions` button's `value` is the same `cmd:<token>:<action>` string
 - Confirm machine is polling recently (`machines` table `last_poll_at` within 30s)
 
 ## Question Button Callbacks
