@@ -50,7 +50,7 @@ export async function editTopicName(
  * strip it: the worker stores no per-session directory, only the name it rendered. A provisional
  * name IS the directory. A clamped name (ending in "…") may have lost its suffix, so it yields none.
  */
-function currentDirSuffix(topic: TopicRow): string {
+export function currentDirSuffix(topic: TopicRow): string {
   const name = topic.name ?? "";
   if (topic.name_provisional === 1) return name === "session" ? "" : name;
   if (name.endsWith("…")) return "";

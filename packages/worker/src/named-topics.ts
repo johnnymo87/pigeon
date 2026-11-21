@@ -20,7 +20,7 @@ import { authenticate } from "./credentials";
 import { resolveWorkerTarget } from "./chat/address";
 import { topicsEnabled } from "./topics";
 import { getTelegramErrorDetails } from "./telegram";
-import { transportForChat, type ChatTransport } from "./chat";
+import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
@@ -267,7 +267,8 @@ export async function maybeAnswerInNamedTopic(
   messageThreadId: number | undefined,
   now: number = Date.now(),
 ): Promise<boolean> {
-  if (!topicsEnabled(env) || messageThreadId === undefined) return false;
+  // TELEGRAM_TOPICS_ENABLED is Telegram's switch; a Slack channel is always a conversation.
+  if ((!isSlackChatId(chatId) && !topicsEnabled(env)) || messageThreadId === undefined) return false;
   const row = await getNamedTopicByThread(db, chatId, messageThreadId);
   if (!row) return false;
 

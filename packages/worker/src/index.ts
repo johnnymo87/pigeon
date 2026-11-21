@@ -3,6 +3,7 @@ import { handleSendMessage, handleUnpinTopic } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
 import { handleTelegramWebhook } from "./webhook";
+import { handleSlackRequest, sweepSlackSeenEvents, type SlackEndpoint } from "./slack-inbound";
 import { handleMediaUpload, handleMediaGet, cleanupExpiredMedia } from "./media";
 import { handlePollNext, handleAckCommand } from "./poll";
 import { cleanupCommands, cleanupSeenUpdates, checkSessionHighWaterAlert, sweepStaleSessions } from "./d1-ops";
@@ -18,7 +19,7 @@ import { hasSlackWorkspaceSecret } from "./chat/slack-config";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
@@ -143,6 +144,20 @@ export default {
           return handleTelegramWebhook(db, env, request);
         }
 
+        // Slack ingress (pigeon-4ogz.4). A machine with no SLACK_WORKSPACE_<MACHINE> secret gets
+        // this router's ordinary 404, so a Telegram-only worker answers exactly as before.
+        const slackMatch = path.match(/^\/slack\/([a-z0-9_-]{1,64})\/(events|commands|interactivity)$/);
+        if (slackMatch && method === "POST") {
+          return handleSlackRequest(
+            db,
+            env,
+            request,
+            slackMatch[1]!,
+            slackMatch[2] as SlackEndpoint,
+            ctx ? (work) => ctx.waitUntil(work) : undefined,
+          );
+        }
+
         return Response.json({ error: "Not found" }, { status: 404 });
       })();
 
@@ -231,6 +246,8 @@ export default {
         // logged inside), so it needs no wrapper to protect the jobs around it.
         const swept = await sweepSlackPosts(env.DB);
         if (swept > 0) console.log("[slack] slack_posts retention", { swept });
+        const seen = await sweepSlackSeenEvents(env.DB);
+        if (seen > 0) console.log("[slack] slack_seen_events retention", { swept: seen });
       } catch (err) {
         console.error("Slack post retention failed:", err);
       }
