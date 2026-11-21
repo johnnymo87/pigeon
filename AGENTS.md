@@ -152,13 +152,18 @@ daemon reads it once at startup and it is informational only (nothing branches o
 and move the machine's coordinator bindings with `packages/worker/scripts/slack-flip.mjs <machine> on`
 (see "Slack transport" below; there is no `off`); setup is `docs/runbooks/slack-workspace-setup.md`.
 In this file, where a mechanic says "topic", read "channel" (a Slack channel per session), and where
-it says "General", read `#alerts`; the Slack section lists the differences. Several names keep their
-Telegram-era spelling because they are wire or persisted values: the `telegram:{status,…}` object
-and `"Telegram API error"` in worker answers, `telegram_error` and friends, the Telegram-shaped
-request fields (`entities`, `replyMarkup.inline_keyboard`, `callback_data`, `messageThreadId`,
-`retryAfter`, `details.error_code`), the `telegram-reply` and `telegram-callback` opencode-direct execute-envelope sources (still sent; a plugin loaded after `pigeon-4ogz.14` also accepts `chat-reply`/`chat-callback`, so switching is safe only once every serve has restarted onto it) and
-`GooseTurnOrigin "telegram"`. Old daemons match some of them literally, so they stay until a
-follow-up renames them (the envelope sources: a follow-up of `pigeon-4ogz.14`).
+it says "General", read `#alerts`; the Slack section lists the differences. Worker answers that
+said Telegram are being renamed (`pigeon-4ogz.25`): `telegram:{status,…}` becomes `provider:{…}`,
+`"Telegram API error"` becomes `"provider_error"`, `telegram_error`/`telegram_unparseable`/`telegram_failed`
+become `provider_*`, and `telegram call …` becomes `provider call …`. Where a daemon matches one
+of these at all (`provider`, `provider_error`, `provider call`), it matches either spelling, so it
+understands a worker of either age. The Telegram-shaped fields (`entities` in UTF-16 units,
+`replyMarkup.inline_keyboard`, `callback_data`, `messageThreadId`, and in answers `retryAfter` in
+seconds and `details.error_code`) are the permanent wire shape, not a rename waiting to happen: they are neutral
+enough, persisted in outbox payloads, and renaming them would change nothing. The `telegram-reply`
+and `telegram-callback` opencode-direct execute-envelope sources are still sent (a plugin loaded
+after `pigeon-4ogz.14` also accepts `chat-reply`/`chat-callback`, so switching is safe only once
+every serve has restarted onto it; a follow-up of `pigeon-4ogz.14`).
 
 The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon short-polls for commands via HTTP. No long-lived connections. If the worker restarts, the next poll succeeds against the new instance. If the daemon restarts, pending commands wait in D1 until it comes back.
 

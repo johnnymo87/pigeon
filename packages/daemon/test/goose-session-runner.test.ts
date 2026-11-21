@@ -3231,7 +3231,7 @@ describe("GooseSessionRunner session title", () => {
 
       // chat-origin steer
       client.steerOutcome = { kind: "steered", messageId: "steer_msg_1" };
-      const outcome = await runner.deliver("tg_2", "steer prompt", { origin: "telegram" });
+      const outcome = await runner.deliver("tg_2", "steer prompt", { origin: "chat" });
       expect(outcome.ok).toBe(true);
       expect(outcome.meta?.mode).toBe("steered");
       expect(client.steers).toHaveLength(1);

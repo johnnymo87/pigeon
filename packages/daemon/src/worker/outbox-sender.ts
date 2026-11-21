@@ -294,10 +294,12 @@ export function commitDelivery(
 export const RICH_FAILURES_BEFORE_PLAIN = 2;
 
 /**
- * The worker's answer when the provider itself failed the send (`502 {error: "Telegram API
- * error"}`, the worker's wire text, kept), as opposed to a topic hold, a rate limit or the worker being unreachable, none
+ * The worker's answer when the provider itself failed the send (`502 {error: "provider_error"}`,
+ * or `"Telegram API error"` from a worker older than pigeon-4ogz.25), as opposed to a topic hold, a rate limit or the worker being unreachable, none
  * of which say anything about the rich message.
  */
+const PROVIDER_SEND_ERRORS: ReadonlySet<string> = new Set(["provider_error", "Telegram API error"]);
+
 function isChatSendFailure(result: unknown): boolean {
   const r = result as { kind?: unknown; status?: unknown; body?: unknown };
   return (
@@ -305,7 +307,7 @@ function isChatSendFailure(result: unknown): boolean {
     r.status === 502 &&
     !!r.body &&
     typeof r.body === "object" &&
-    (r.body as { error?: unknown }).error === "Telegram API error"
+    PROVIDER_SEND_ERRORS.has((r.body as { error?: unknown }).error as string)
   );
 }
 

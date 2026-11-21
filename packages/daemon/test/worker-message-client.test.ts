@@ -90,6 +90,26 @@ describe("WorkerMessageClient.sendMessage", () => {
     if (out.kind === "worker_failed") expect(out.reason).toContain("telegram call timed out after 4000ms");
   });
 
+  // pigeon-4ogz.25: the worker renames `telegram` -> `provider` and "telegram call" -> "provider
+  // call". A daemon reads both, so either age of worker is understood.
+  it("reads the provider's answer under the new `provider` key", async () => {
+    const f = vi.fn(async () => json({ ok: false, provider: { status: 429, retryAfter: 3, description: "Too Many Requests" } }));
+    const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
+    expect(out).toEqual({ kind: "chat_rejected", status: 429, retryAfter: 3, description: "Too Many Requests" });
+  });
+
+  it("502 relaying a chat 401 under `provider` names both", async () => {
+    const f = vi.fn(async () => json({ error: "provider_error", provider: { status: 401, description: "Unauthorized" } }, 502));
+    const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
+    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:chat401" });
+  });
+
+  it("a `provider call` abort is chat_unreachable", async () => {
+    const f = vi.fn(async () => json({ ok: false, error: "provider call failed: reset" }, 502));
+    const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
+    expect(out).toMatchObject({ kind: "worker_failed", status: 502, key: "http502:chat_unreachable", cause: "chat_unreachable" });
+  });
+
   it("a worker's own failures are cause worker", async () => {
     const f = vi.fn(async () => new Response("", { status: 500 }));
     const out = await client(f as unknown as typeof fetch).sendMessage({ chatId: "-100", text: "hi" }, { timeoutMs: 5_000 });
