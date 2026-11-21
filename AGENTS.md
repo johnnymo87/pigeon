@@ -511,7 +511,9 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 Photos, documents, audio, video, and voice messages sent to the Telegram bot are relayed to OpenCode sessions via R2:
 
 - **Inbound**: Telegram media → Worker (downloads from Telegram API, stores in R2) → Daemon (fetches from R2, converts to data URI) → Plugin (sends as file part to `prompt_async`)
-- **Outbound**: OpenCode file attachments → Plugin (captures FileParts and tool attachments) → Daemon (uploads to R2) → Worker (sends as `sendPhoto`/`sendDocument` reply in Telegram)
+- **Outbound**: OpenCode file attachments → Plugin (captures FileParts and tool attachments) → Daemon (uploads to R2) → Worker (sends as `sendPhoto`/`sendDocument` reply in Telegram, a file in the text post's thread in Slack)
+
+Outbound was silently dead from March to November 2026 (`pigeon-4ogz.23`): the upload left with the MachineAgent client in `d9d70fe`, and `/stop` ignored the plugin's `media`. Now `/stop` only validates the files (base64 data URIs only, at most 10, 20 MB each, 30 MB in all, filename reduced to a basename) and parks them in the outbox payload as `mediaPending`, because the plugin gives `/stop` 3s. The outbox sender uploads them before the entry's first send (30s budget per tick), persists the keys as `media`, and sends them with chunk 0. A 4xx refusal drops that file; a transient failure holds the entry, uncounted and with its session's later entries waiting behind it, for up to 3 ticks, after which the text goes without the file. The rate governor counts each file as a post. Note the plugin forwards every file of the current message, so every image or PDF the agent *reads*, not just screenshots it takes, is posted.
 
 Media is stored temporarily in the `pigeon-media` R2 bucket with a 24-hour TTL, cleaned hourly by cron.
 
