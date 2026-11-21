@@ -29,6 +29,9 @@ export function normalizeTitle(title: string | undefined): string | undefined {
   return clampPreservingSurrogates(trimmed, MAX_TITLE_LENGTH)
 }
 
+/** Deleted-session ids remembered so a late event cannot re-register one. */
+export const MAX_DELETED_TOMBSTONES = 1000
+
 const State = { Created: 0, Registering: 1, Registered: 2, Notified: 3 } as const
 type State = (typeof State)[keyof typeof State]
 
@@ -79,6 +82,13 @@ type SessionEntry = {
 export class SessionManager {
   private sessions = new Map<string, SessionEntry>()
   private mainSessionIds = new Set<string>()
+  /**
+   * Sessions opencode has deleted (pigeon-4ogz.21), oldest first, capped at
+   * {@link MAX_DELETED_TOMBSTONES}. A late event naming one must not re-register it: the
+   * daemon has just torn it down, and a re-registration would reopen its topic or channel.
+   * Separate from `onDeleted`, which also runs on a session.error teardown of a live session.
+   */
+  private deletedIds = new Set<string>()
   private discoveryPromises = new Map<string, Promise<void>>()
   private evictionTimer: ReturnType<typeof setInterval> | undefined
 
@@ -230,6 +240,20 @@ export class SessionManager {
     this.sessions.delete(sessionID)
 
     this.mainSessionIds.delete(sessionID)
+  }
+
+  markDeleted(sessionID: string): void {
+    this.onDeleted(sessionID)
+    this.deletedIds.delete(sessionID)
+    this.deletedIds.add(sessionID)
+    while (this.deletedIds.size > MAX_DELETED_TOMBSTONES) {
+      const oldest = this.deletedIds.values().next().value as string
+      this.deletedIds.delete(oldest)
+    }
+  }
+
+  isDeleted(sessionID: string): boolean {
+    return this.deletedIds.has(sessionID)
   }
 
   isMainSession(sessionID: string): boolean {

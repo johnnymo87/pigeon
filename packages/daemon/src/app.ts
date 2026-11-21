@@ -1,4 +1,5 @@
 import type { StorageDb } from "./storage/database";
+import type { BackendDeletedOutcome } from "./session-gone";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { registerGooseSession } from "./goose/register-session.js";
 import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
@@ -308,6 +309,12 @@ export interface AppOptions {
   notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
   onSessionDelete?: (sessionId: string) => Promise<void> | void;
+  /**
+   * `POST /session-deleted`: the opencode plugin reports a session deleted in its backend (the
+   * TUI, or a /kill's own delete). index.ts wires `SessionGone.backendDeleted`, which decides
+   * whether to tear the row down (pigeon-4ogz.21). Absent: the route answers `absent`.
+   */
+  onBackendSessionDeleted?: (sessionId: string) => Promise<BackendDeletedOutcome>;
   chatId?: string;
   machineId?: string;
   router?: IngressRouter;
@@ -1705,6 +1712,18 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         return Response.json({ ok: true, session_id: sessionId, machine_id });
+      }
+
+      if (request.method === "POST" && url.pathname === "/session-deleted") {
+        const body = await readJsonBody(request);
+        const sessionId = typeof body.session_id === "string" ? body.session_id : "";
+        if (!sessionId) {
+          return Response.json({ error: "session_id is required" }, { status: 400 });
+        }
+        const outcome: BackendDeletedOutcome = opts.onBackendSessionDeleted
+          ? await opts.onBackendSessionDeleted(sessionId)
+          : "absent";
+        return Response.json({ ok: true, outcome });
       }
 
       if (request.method === "POST" && url.pathname === "/session-unbind") {

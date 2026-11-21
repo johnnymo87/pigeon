@@ -447,7 +447,17 @@ export interface PollerDeps {
    * nobody would notice that Telegram commands had stopped arriving.
    */
   onPollAuthRejected?: (status: number, consecutive: number) => void;
+  /** Bound on `unregisterSession`'s worker call. Defaults to {@link UNREGISTER_TIMEOUT_MS}. */
+  unregisterTimeoutMs?: number;
 }
+
+/**
+ * How long `unregisterSession` waits for the worker (pigeon-4ogz.21). Every caller is
+ * best-effort, but `/kill` awaits it before its poller ack: an unbounded hang held the ack until
+ * the lease expired, and the redelivered kill then answered "already gone". Well inside the 60s
+ * lease, and long enough for the worker's immediate topic close (a Slack archive included).
+ */
+export const UNREGISTER_TIMEOUT_MS = 15_000;
 
 /** Consecutive refused polls before `onPollAuthRejected` fires: about one minute at 5s. */
 export const POLL_AUTH_ALERT_THRESHOLD = 12;
@@ -484,6 +494,7 @@ export class Poller {
   private polling = false;
   private readonly onPollAuthRejected: ((status: number, consecutive: number) => void) | undefined;
   private pollAuthRejections = 0;
+  private readonly unregisterTimeoutMs: number;
 
   constructor(
     private readonly config: PollerConfig,
@@ -494,6 +505,7 @@ export class Poller {
     this.healthMonitor = deps.healthMonitor;
     this.onPollAuthRejected = deps.onPollAuthRejected;
     this.pollIntervalMs = config.pollIntervalMs ?? 5000;
+    this.unregisterTimeoutMs = deps.unregisterTimeoutMs ?? UNREGISTER_TIMEOUT_MS;
   }
 
   /** Start polling — calls tick() immediately, then every pollIntervalMs. */
@@ -789,6 +801,7 @@ export class Poller {
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/sessions/unregister`, {
         method: "POST",
+        signal: AbortSignal.timeout(this.unregisterTimeoutMs),
         headers: {
           Authorization: `Bearer ${this.config.apiKey}`,
           "Content-Type": "application/json",

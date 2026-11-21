@@ -1,4 +1,5 @@
 import { describeWorkerIdentity, formatPollAuthAlert } from "./worker/worker-identity";
+import { SessionGone } from "./session-gone";
 import { createApp } from "./app";
 import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
@@ -393,7 +394,7 @@ async function handleGooseControl(
  * Pigeon's teardown for a session that was explicitly deleted, after its sessions row is gone:
  * DELETE /sessions/:id and an opencode /kill (pigeon-4ogz.20).
  */
-async function onSessionDeleted(sessionId: string): Promise<void> {
+async function onSessionDeleted(sessionId: string, opts: { immediate?: boolean } = {}): Promise<void> {
   // Drop the routing assignment so a deleted session can't yield a prospective
   // /route 200 (workstation-boi9).
   storage.assignments.delete(sessionId);
@@ -406,9 +407,22 @@ async function onSessionDeleted(sessionId: string): Promise<void> {
     // teardown), where a human is watching, so the forum topic closes now rather than waiting
     // for the daily close window. Every janitorial unregister deliberately omits the flag —
     // see poller.unregisterSession and worker sessions.ts (pigeon-xehy).
-    await poller.unregisterSession(sessionId, { immediate: true });
+    await poller.unregisterSession(sessionId, { immediate: opts.immediate ?? true });
   }
 }
+
+/**
+ * A session deleted in its backend (the opencode TUI) gets the same teardown as an explicit
+ * delete, unless a /kill for it is in flight, which owns the teardown (pigeon-4ogz.21).
+ */
+const sessionGone = new SessionGone({
+  getSession: (sessionId) => storage.sessions.get(sessionId),
+  hasAutomationOrigin: (sessionId) => storage.sessionOrigins.get(sessionId) !== null,
+  teardown: async (sessionId, { immediate }) => {
+    storage.sessions.delete(sessionId);
+    await onSessionDeleted(sessionId, { immediate });
+  },
+});
 
 /**
  * The worker's session-free send route (chat-transport phase 1, pigeon-lenr). Used for
@@ -823,7 +837,9 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             console.warn(`[index] onKill: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
             return;
           }
-          await ingestKillCommand({
+          // Holding the kill guard makes the plugin's session.deleted report (fired by this kill's
+          // own delete) wait, so the reply lands before the channel is archived (pigeon-4ogz.21).
+          await sessionGone.runKill(msg.sessionId, () => ingestKillCommand({
             commandId: msg.commandId,
             sessionId: msg.sessionId,
             chatId: msg.chatId,
@@ -837,7 +853,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
               storage.sessions.delete(sessionId);
               await onSessionDeleted(sessionId);
             },
-          });
+          }));
         },
         onInterrupt: async (msg) => {
           if (await handleGooseControl("interrupt", msg)) return;
@@ -1440,6 +1456,7 @@ const app = createApp(storage, {
     }
   },
   onSessionDelete: onSessionDeleted,
+  onBackendSessionDeleted: (sessionId) => sessionGone.backendDeleted(sessionId),
 });
 appHandler = app;
 resolveAppReady?.(app);
