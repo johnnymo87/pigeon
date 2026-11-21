@@ -1200,7 +1200,7 @@ describe("POST /notifications/send", () => {
     const res = await sendN({ sessionId: SESSION_ID, text: "hello" });
     expect(res.status).toBe(502);
     const body = (await res.json()) as { error: string; details: unknown; errorClass?: string };
-    expect(body.error).toBe("Telegram API error");
+    expect(body.error).toBe("provider_error");
     expect(body.errorClass).toBe("upstream");
   });
 
@@ -2314,7 +2314,7 @@ describe("POST /notifications/edit", () => {
 
     expect(editRes.status).toBe(502);
     const editBody = (await editRes.json()) as { error: string };
-    expect(editBody.error).toBe("Telegram API error");
+    expect(editBody.error).toBe("provider_error");
   });
 });
 

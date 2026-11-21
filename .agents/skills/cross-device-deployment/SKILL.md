@@ -109,9 +109,11 @@ The script runs these; they are listed for the manual path.
 > daemon that mints its own, and it revokes the flag. No pool restart is required after a
 > rollback, but a restart is still the fastest way to a known state.
 
-> **Version floor (pigeon-4ogz.13):** never roll a daemon back below `7f4554f` (PR #246) once
-> its host no longer exports `TELEGRAM_CHAT_ID` (workstation #891). Older daemons build no outbox
-> and no alert notifier without it, so every notification is queued and silently never sent.
+> **Version floor (pigeon-4ogz.25):** never roll a daemon back below `5016db9` (PR #250). The
+> worker answers with `provider`-named values since pigeon-4ogz.25; an older daemon misreads
+> them (alert rejections become worker failures, and a rich stop that keeps failing upstream is
+> never sent plain, so it is lost at TTL). Below `7f4554f` (PR #246) it is worse: without
+> `TELEGRAM_CHAT_ID` (gone since workstation #891) it builds no outbox and no alert notifier.
 
 ### Restart opencode-serve (only when you actually need it — see below)
 

@@ -1,5 +1,5 @@
 import { handleNamedTopicRehome } from "./named-topic-rehome";
-import { handleSendMessage, handleUnpinTopic } from "./messages";
+import { handleSendMessage } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
 import { handleSlackRequest, sweepSlackSeenEvents, type SlackEndpoint } from "./slack-inbound";
@@ -133,9 +133,6 @@ export default {
         // Session-free sends (chat-transport, pigeon-lenr.1)
         if (path === "/messages/send" && method === "POST") {
           return handleSendMessage(env, request);
-        }
-        if (path === "/topics/unpin" && method === "POST") {
-          return handleUnpinTopic(env, request);
         }
 
         // Slack ingress (pigeon-4ogz.4). A machine with no SLACK_WORKSPACE_<MACHINE> secret gets

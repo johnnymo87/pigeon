@@ -6,21 +6,19 @@
  *
  * - WORKER-RESOLVED sends (`/notifications/send`, `/topics/named`, `/topics/named/bind`): the
  *   daemon asks the worker to put something in a conversation the worker owns. A machine that is
- *   on Slack therefore always gets its own `slack:<team>`, whatever `chatId` the daemon sent (a
- *   daemon that has not yet learned that Telegram is gone sends a stale numeric one). Every other
- *   principal (the shared key, a machine with no workspace) has no target.
+ *   on Slack therefore always gets its own `slack:<team>`, whatever `chatId` the daemon sent (one
+ *   is ignored). Every other principal (the shared key, a machine with no workspace) has no target.
  *
  * - STORED addresses (`/messages/send`): the caller names a conversation that already exists (a
  *   command reply into the thread it was typed in), so it goes where it lives. A Slack
  *   conversation of another machine's team is reachable only by a machine that holds a command
  *   typed there; the shared key never reaches Slack.
  *
- * Slack is the only transport: a numeric chat id is accepted from a machine on Slack for backward
- * compatibility and mapped onto that machine's workspace; nothing else resolves.
+ * Slack is the only transport: a stored address is a `slack:<team>` or absent. A numeric chat id
+ * was mapped onto the machine's workspace until pigeon-4ogz.25; it is now refused like any other.
  */
 import type { D1Database } from "@cloudflare/workers-types";
 import type { Principal } from "../credentials";
-import { isSlackChatId } from "./index";
 import { SLACK_HANDLE_MIN, slackChatId, slackWorkspaceForMachine, slackWorkspaceForTeam, teamIdOfChat } from "./slack-config";
 import type { SlackWorkspace } from "./slack-config";
 
@@ -89,11 +87,8 @@ async function holdsCommandIn(
  *   typed in that very conversation.
  * - a missing `chatId` (the caller is a machine on Slack that dropped it): that machine's
  *   workspace, in the handle it names, or its `#alerts`.
- * - numeric, from a machine on Slack: with no thread it means that machine's `#alerts` (the
- *   daemon's old numeric `chatId` is not a chat any more); with a Slack handle (>= 2^40) it is
- *   that conversation in its own workspace. A smaller thread id was a Telegram thread and has
- *   nowhere to go: refused.
- * - everything else (the shared key, a machine with no workspace): refused.
+ * - everything else (a numeric or malformed address, the shared key with no address, a machine
+ *   with no workspace): refused.
  */
 export async function authorizeStoredAddress(
   env: Env,
@@ -117,11 +112,5 @@ export async function authorizeStoredAddress(
     if (!(await holdsCommandIn(db, principal.machineId, chatId, threadId))) return refuse();
     return { ok: true, chatId, threadId, slack: true };
   }
-  if (isSlackChatId(chatId)) return refuse(); // `slack:` with no team id
-
-  const own = machineSlackWorkspace(env, principal);
-  if (own && (threadId === undefined || threadId >= SLACK_HANDLE_MIN)) {
-    return { ok: true, chatId: slackChatId(own), threadId, slack: true };
-  }
-  return refuse();
+  return refuse(); // `slack:` with no team id, or a numeric (Telegram-era) address
 }

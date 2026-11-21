@@ -1,25 +1,25 @@
 /**
- * Session-free sends: `POST /messages/send` and `POST /topics/unpin` (chat-transport phase 1,
+ * Session-free sends: `POST /messages/send` (chat-transport phase 1,
  * bead pigeon-lenr.1; design docs/plans/2026-11-20-telegram-single-egress-design.md).
  *
  * These exist so the daemon never has to call the chat provider itself for command replies and
  * operational alerts: the worker's `ChatTransport` is the only caller of the provider.
  *
  * THE RESULT CONTRACT is what the daemon's alert fallback hinges on, so it is narrower than
- * `/notifications/send`'s on purpose (the `telegram` key and `telegram_*` error values are the
- * wire format of the daemon's contract, kept as they were for deployed daemons):
+ * `/notifications/send`'s on purpose. The `provider` key, the `provider_*` error values and the
+ * `provider call ` text were spelled `telegram` until pigeon-4ogz.25; every daemon reads both.
  *
  *   200 {ok:true, chatId, messageId}                     posted
- *   200 {ok:false, telegram:{status:400, description}}   the provider refused the payload; nothing
+ *   200 {ok:false, provider:{status:400, description}}   the provider refused the payload; nothing
  *                                                        was posted. "thread not found" lands
  *                                                        here, description intact, so the
  *                                                        daemon's /alert ladder still sees it.
- *   200 {ok:false, telegram:{status:429, retryAfter}}    rate limited
+ *   200 {ok:false, provider:{status:429, retryAfter}}    rate limited
  *   403 {error:"chat_not_allowed"}                       the address is not one the caller may
  *                                                        post to (no workspace, another team's
- *                                                        conversation, a numeric address with a
- *                                                        Telegram-era thread id)
- *   502 {ok:false, error, telegram?}                     the worker could not deliver: any other
+ *                                                        conversation, a numeric or unknown
+ *                                                        address)
+ *   502 {ok:false, error, provider?}                     the worker could not deliver: any other
  *                                                        status, an unparseable body, a timeout, a
  *                                                        transport error.
  *
@@ -30,8 +30,8 @@
  * reply-routable, as they were not when the daemon sent them itself.
  *
  * `chatId` is optional: a machine with a workspace that omits it posts to its own `#alerts` (or
- * to the handle in `messageThreadId`). A numeric `chatId` from such a machine is mapped as it
- * always was (no thread: `#alerts`; a Slack handle: that conversation).
+ * to the handle in `messageThreadId`). A numeric `chatId` is refused: no daemon >= 7f4554f sends
+ * one (pigeon-4ogz.25 removed the mapping).
  */
 
 import { authenticate } from "./credentials";
@@ -116,7 +116,7 @@ function toResponse<T>(
 ): Response {
   if (res.ok) return Response.json({ ok: true, ...okBody(res.result), chatId });
 
-  // `no_transport` never becomes a Telegram-shaped body (a synthetic 400 would read to a deployed
+  // `no_transport` never becomes a provider-shaped body (a synthetic 400 would read to a deployed
   // daemon as "the provider refused the payload"). Addresses are authorized before they get here,
   // so this is unreachable; it answers the existing refusal.
   if (res.kind === "no_transport") return Response.json({ error: "chat_not_allowed" }, { status: 403 });
@@ -128,7 +128,7 @@ function toResponse<T>(
   if (res.kind === "rate_limited") {
     return Response.json({
       ok: false,
-      telegram: { status: 429, retryAfter: res.retryAfter, ...withDescription },
+      provider: { status: 429, retryAfter: res.retryAfter, ...withDescription },
       ...errorClass,
     });
   }
@@ -140,14 +140,14 @@ function toResponse<T>(
     res.kind === "topic_not_modified" ||
     (res.kind === "error" && res.errorCode === 400 && res.response !== undefined)
   ) {
-    return Response.json({ ok: false, telegram: { status: 400, ...withDescription }, ...errorClass });
+    return Response.json({ ok: false, provider: { status: 400, ...withDescription }, ...errorClass });
   }
   const status = res.kind === "error" ? res.errorCode : undefined;
   return Response.json(
     {
       ok: false,
-      error: status === undefined ? "telegram_unparseable" : "telegram_error",
-      ...(status !== undefined ? { telegram: { status, ...withDescription } } : {}),
+      error: status === undefined ? "provider_unparseable" : "provider_error",
+      ...(status !== undefined ? { provider: { status, ...withDescription } } : {}),
       ...errorClass,
     },
     { status: 502 },
@@ -180,8 +180,8 @@ async function bounded(
     return await Promise.race([inFlight, deadline]);
   } catch (err) {
     const error = controller.signal.aborted
-      ? `telegram call timed out after ${timeoutMs}ms`
-      : `telegram call failed: ${err instanceof Error ? err.message : String(err)}`;
+      ? `provider call timed out after ${timeoutMs}ms`
+      : `provider call failed: ${err instanceof Error ? err.message : String(err)}`;
     console.warn("[worker] session-free chat call failed", { error });
     return Response.json({ ok: false, error }, { status: 502 });
   } finally {
@@ -247,16 +247,4 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
       addr.chatId,
     ),
   );
-}
-
-/**
- * `POST /topics/unpin`: a constant `200 {ok:true}`. Telegram auto-pinned the first message of a new
- * topic and the daemon asked the worker to clear it; Slack pins nothing, so there is nothing to do
- * and no provider call to make. Deployed daemons still call it after creating a topic, so the route
- * stays until they are gone (removed with the numeric-`chatId` mapping).
- */
-export async function handleUnpinTopic(env: Env, request: Request): Promise<Response> {
-  const principal = await authenticate(request, env);
-  if (!principal) return unauthorized();
-  return Response.json({ ok: true });
 }

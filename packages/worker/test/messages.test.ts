@@ -3,7 +3,7 @@
  * docs/plans/2026-11-20-telegram-single-egress-design.md, "Worker PR").
  *
  * The result contract is what the daemon's fallback hinges on: a provider 400 or 429 rides in a
- * 200 body (`telegram: {status}`, the wire name deployed daemons read -- do not fall back),
+ * 200 body (`provider: {status}`; a daemon reads it as "do not fall back"),
  * everything else that is not a clean post is a 502 or a 403 ("worker cannot deliver" -- fall back
  * direct). Through the real router.
  */
@@ -147,7 +147,7 @@ describe("POST /messages/send (Slack)", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       ok: false,
-      telegram: { status: 400, description: "thread not found: channel_not_found" },
+      provider: { status: 400, description: "thread not found: channel_not_found" },
       errorClass: "conversation_gone",
     });
   });
@@ -158,7 +158,7 @@ describe("POST /messages/send (Slack)", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       ok: false,
-      telegram: { status: 429, retryAfter: 7, description: "slack rate limited: ratelimited" },
+      provider: { status: 429, retryAfter: 7, description: "slack rate limited: ratelimited" },
       errorClass: "rate_limited",
     });
   });
@@ -169,7 +169,9 @@ describe("POST /messages/send (Slack)", () => {
     expect(res.status).toBe(502);
     const body = (await res.json()) as any;
     expect(body.ok).toBe(false);
-    expect(body.telegram).toMatchObject({ status: 502 });
+    expect(body.provider).toMatchObject({ status: 502 });
+    expect(body.error).toBe("provider_error");
+    expect(body).not.toHaveProperty("telegram");
     expect(body.errorClass).toBe("upstream");
   });
 
@@ -185,7 +187,7 @@ describe("POST /messages/send (Slack)", () => {
     const started = Date.now();
     const res = await send({ chatId: CH, text: "x", timeoutMs: 100 });
     expect(res.status).toBe(502);
-    expect(((await res.json()) as any).error).toMatch(/timed out|abort/i);
+    expect(((await res.json()) as any).error).toMatch(/^provider call (timed out|failed)/);
     expect(Date.now() - started).toBeLessThan(1_500);
   });
 
@@ -239,21 +241,11 @@ describe("POST /messages/send (Slack)", () => {
 });
 
 describe("POST /topics/unpin", () => {
-  test("a constant {ok:true} with no provider call, for any authenticated caller and body", async () => {
+  // pigeon-4ogz.25: removed; no daemon >= 7f4554f calls it.
+  test("is gone: the router answers 404, with no provider call", async () => {
     const m = await mkSlackMachine();
-    const e = envWith([m]);
-    const CH = slackChatId(m.ws);
-    expect((await callWith(e, "/topics/unpin", { chatId: CH, messageThreadId: 3 }, null)).status).toBe(401);
-    for (const [body, key] of [
-      [{ chatId: CH, messageThreadId: 31 }, m.key],
-      [{ chatId: CH, messageThreadId: 3 }, "test-api-key"],
-      [{ chatId: "8248645256", messageThreadId: 12 }, m.key],
-      [{ chatId: CH }, m.key],
-    ] as Array<[unknown, string]>) {
-      const res = await callWith(e, "/topics/unpin", body, key);
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true });
-    }
+    const res = await callWith(envWith([m]), "/topics/unpin", { chatId: slackChatId(m.ws), messageThreadId: 31 }, m.key);
+    expect(res.status).toBe(404);
     expect(slackCalls).toHaveLength(0);
   });
 });
