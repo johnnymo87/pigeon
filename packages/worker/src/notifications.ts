@@ -302,6 +302,9 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
  * Media send outcome. The failure arm carries the Telegram error: collapsing it to a bare
  * `{ ok: false }` is what made a dropped attachment unexplainable (pigeon-bit4).
  */
+/** Bound on posting one outbound file (pigeon-4ogz.23). */
+const MEDIA_SEND_TIMEOUT_MS = 20_000;
+
 type MediaSendResult =
   | { ok: true; result: { message_id: number } }
   | { ok: false; details: unknown };
@@ -313,6 +316,7 @@ async function sendTelegramPhoto(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
+  signal?: AbortSignal,
 ): Promise<MediaSendResult> {
   const res = await tg.sendPhoto({
     chatId,
@@ -320,6 +324,7 @@ async function sendTelegramPhoto(
     filename,
     replyToMessageId,
     messageThreadId,
+    ...(signal ? { signal } : {}),
   });
   if (res.ok) {
     return { ok: true, result: res.result };
@@ -334,6 +339,7 @@ async function sendTelegramDocument(
   filename: string,
   replyToMessageId?: number,
   messageThreadId?: number,
+  signal?: AbortSignal,
 ): Promise<MediaSendResult> {
   const res = await tg.sendDocument({
     chatId,
@@ -341,6 +347,7 @@ async function sendTelegramDocument(
     filename,
     replyToMessageId,
     messageThreadId,
+    ...(signal ? { signal } : {}),
   });
   if (res.ok) {
     return { ok: true, result: res.result };
@@ -869,9 +876,13 @@ export async function handleSendNotification(
           const blob = new Blob([await object.arrayBuffer()], { type: item.mime });
           const isImage = item.mime.startsWith("image/");
 
+          // Bounded (pigeon-4ogz.23): this loop runs before the response, and the daemon's outbox
+          // is serial, so one hung upload would hold every session's notifications behind it.
+          // The Telegram client ignores the signal; the Slack upload honours it.
+          const signal = AbortSignal.timeout(MEDIA_SEND_TIMEOUT_MS);
           const mediaResult = isImage
-            ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId)
-            : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId);
+            ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
+            : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
 
           if (mediaResult.ok && mediaResult.result) {
             await db

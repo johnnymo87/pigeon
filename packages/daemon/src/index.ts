@@ -1014,6 +1014,8 @@ const outboxSender = poller && config.telegramChatId
       sendNotification: (input) => poller.sendNotification(input),
       registerSession: (sessionId, label) => poller.registerSession(sessionId, label),
       unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
+      // pigeon-4ogz.23: a stop's files go to R2 before its first send.
+      uploadMedia: (key, data, mime, filename, signal) => poller.uploadMedia(key, data, mime, filename, signal),
       chatId: config.telegramChatId,
       // pigeon-qioa: never post a swarm notice for a session this machine does not have.
       gateSwarmOnLocalSession: true,
