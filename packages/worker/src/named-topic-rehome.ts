@@ -18,11 +18,15 @@
  *
  * Three things are deliberate:
  *
- * - **It only ever converges.** The target is the machine's transport as this isolate sees it
- *   (its `SLACK_WORKSPACE_<MACHINE>` secret), and `expect` must agree or the answer is 409. So any
- *   machine key may call it for any machine (the flip runs on devbox for all three), and the worst
- *   a caller can do is what that machine's next re-bind would do anyway. A 409 right after a secret
- *   put or delete is propagation, and the script retries it.
+ * - **It only ever converges, and never takes another machine's binding.** The target is the
+ *   machine's transport as this isolate sees it (its `SLACK_WORKSPACE_<MACHINE>` secret), and
+ *   `expect` must agree or the answer is 409; a 409 right after a secret put or delete is
+ *   propagation, and the script retries it. On Slack the target chat is the machine's own
+ *   workspace. On Telegram the worker cannot tell whose chat a numeric id is, so a key already
+ *   bound there to ANOTHER machine's session is reported `failed` and left alone (a bind would
+ *   otherwise hand that machine's topic to this coordinator), and `_`-prefixed keys are never
+ *   moved onto Slack (they are the worker's own, like `_alerts`). With those two rules any machine
+ *   key may call it for any machine, which the flip needs (it runs on devbox for all three).
  * - **Paged and resumable.** At most `limit` bindings per call, in session-id order after the
  *   `after` cursor; `next` is the cursor to pass back, or null when the page reached the end. A
  *   Slack 429 stops the page with `retryAfter` and a cursor BEFORE the limited binding, so it is
@@ -115,6 +119,21 @@ async function existingTelegramChat(db: D1Database, key: string, env: Env): Prom
   return allowed.length === 1 ? allowed[0]!.chat_id : null;
 }
 
+/**
+ * The machine whose session holds `(chatId, key)`, when that is not `machine`, else null. A binding
+ * whose session has no worker row is inert and may be replaced (as /topics/named/bind would).
+ */
+async function otherMachineHolding(db: D1Database, chatId: string, key: string, machine: string): Promise<string | null> {
+  const row = await db
+    .prepare(
+      `SELECT s.machine_id FROM named_topic_bindings b JOIN sessions s ON s.session_id = b.session_id
+        WHERE b.chat_id = ? AND b.topic_key = ?`,
+    )
+    .bind(chatId, key)
+    .first<{ machine_id: string }>();
+  return row && row.machine_id !== machine ? row.machine_id : null;
+}
+
 export async function handleNamedTopicRehome(db: D1Database, env: Env, request: Request): Promise<Response> {
   const principal = await requireMachinePrincipal(request, env);
   if (principal instanceof Response) return principal;
@@ -196,6 +215,22 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
         key: row.topic_key,
         outcome: "unplaced",
         reason: "no single Telegram topic for this key; pass telegramChatId",
+      });
+      cursor = row.session_id;
+      continue;
+    }
+    if (transport === "slack" && row.topic_key.startsWith("_")) {
+      results.push({ sessionId: row.session_id, key: row.topic_key, outcome: "failed", reason: "reserved key" });
+      cursor = row.session_id;
+      continue;
+    }
+    const holder = await otherMachineHolding(db, chatId, row.topic_key, machine);
+    if (holder !== null) {
+      results.push({
+        sessionId: row.session_id,
+        key: row.topic_key,
+        outcome: "failed",
+        reason: `key is bound in ${chatId} to a session of ${holder}`,
       });
       cursor = row.session_id;
       continue;

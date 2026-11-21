@@ -41,6 +41,12 @@ export const AGE_KEY_FILE = "/persist/sops-age-key.txt";
 /** How long to wait for a secret change to reach the worker before giving up. */
 export const PROPAGATION_TIMEOUT_MS = 120_000;
 export const PROPAGATION_POLL_MS = 5_000;
+/**
+ * After the first pass, wait this long and sweep again. Isolates can disagree about a secret for
+ * minutes, and a daemon re-bind that lands on one still seeing the old transport moves a binding
+ * back. The second sweep catches it (and a later re-bind on an up-to-date isolate would too).
+ */
+export const SETTLE_MS = 120_000;
 /** Pause between pages, on top of any Slack backoff the worker reports. */
 export const PAGE_PAUSE_MS = 1_000;
 /** Pages after which the loop gives up (a cursor that never advances would otherwise spin). */
@@ -170,13 +176,26 @@ function putSecret(machine, cfg, deps) {
   if (r.status !== 0) throw new Error(`wrangler secret put ${secretName(machine)} failed: ${lastLine(r.stderr)}`);
 }
 
+/** Whether the worker has `name`, from `wrangler secret list` (names only; values are never listed). */
+export function hasSecret(name, deps) {
+  const r = deps.run("npx", ["wrangler", "secret", "list", "--format", "json"], { cwd: WORKER_DIR });
+  if (r.status !== 0) throw new Error(`wrangler secret list failed: ${lastLine(r.stderr)}`);
+  let list;
+  try {
+    list = JSON.parse(r.stdout);
+  } catch {
+    throw new Error("could not read wrangler secret list --format json output");
+  }
+  if (!Array.isArray(list)) throw new Error("wrangler secret list did not answer a list");
+  return list.some((x) => x && x.name === name);
+}
+
+/** Deletes the secret if it exists, so a re-run of `off` gets past this step to the bindings. */
 function deleteSecret(machine, deps) {
+  if (!hasSecret(secretName(machine), deps)) return false;
   // Non-interactive (stdin is not a TTY), so wrangler takes its "yes" fallback for the prompt.
   const r = deps.run("npx", ["wrangler", "secret", "delete", secretName(machine)], { cwd: WORKER_DIR });
-  if (r.status !== 0) {
-    if (/not found|10056/i.test(r.stderr + r.stdout)) return false;
-    throw new Error(`wrangler secret delete ${secretName(machine)} failed: ${lastLine(r.stderr)}`);
-  }
+  if (r.status !== 0) throw new Error(`wrangler secret delete ${secretName(machine)} failed: ${lastLine(r.stderr)}`);
   return true;
 }
 
@@ -201,14 +220,15 @@ async function callRehome(opts, deps, body) {
  * 409 transport_mismatch = the secret change has not reached the worker yet: wait and retry.
  */
 export async function rehomeAll(opts, deps, expect) {
-  const started = deps.now();
+  let waitingSince = null; // start of the current run of 409s, so Slack backoffs do not count
   const results = [];
   let after = null;
   for (let page = 0; page < MAX_PAGES; page++) {
     const body = { expect, ...(after ? { after } : {}), ...(opts.telegramChat ? { telegramChatId: opts.telegramChat } : {}) };
     const r = await callRehome(opts, deps, body);
     if (r.status === 409 && r.body?.error === "transport_mismatch") {
-      if (deps.now() - started > PROPAGATION_TIMEOUT_MS) {
+      waitingSince ??= deps.now();
+      if (deps.now() - waitingSince > PROPAGATION_TIMEOUT_MS) {
         throw new Error(
           `the worker still sees ${opts.machine} on ${r.body.transport} after ${PROPAGATION_TIMEOUT_MS / 1000}s; ` +
             "check the secret (npx wrangler secret list) and re-run",
@@ -219,6 +239,7 @@ export async function rehomeAll(opts, deps, expect) {
       page--; // not a page
       continue;
     }
+    waitingSince = null;
     if (r.status !== 200 || !r.body || !Array.isArray(r.body.results)) {
       throw new Error(`POST /topics/named/rehome answered ${r.status}: ${JSON.stringify(r.body?.error ?? r.body)}`);
     }
@@ -273,6 +294,18 @@ export async function flip(opts, deps = realDeps) {
 
   deps.log(`moving ${machine}'s named-topic bindings to ${expect}:`);
   const results = await rehomeAll(opts, deps, expect);
+  deps.log(`waiting ${SETTLE_MS / 1000}s for every worker isolate to see the change, then checking again`);
+  await deps.sleep(SETTLE_MS);
+  if ((await preview(opts, deps, expect)).pending > 0) {
+    deps.log("some bindings moved back or were left; sweeping again:");
+    const again = await rehomeAll(opts, deps, expect);
+    // The second sweep's outcome supersedes the first's for the same binding.
+    for (const x of again) {
+      const i = results.findIndex((y) => y.sessionId === x.sessionId);
+      if (i >= 0) results[i] = x;
+      else results.push(x);
+    }
+  }
   const left = (await preview(opts, deps, expect)).pending;
   const bad = results.filter((x) => x.outcome !== "moved");
   deps.log(

@@ -187,7 +187,9 @@ secret, and both directions are tested. The batch is the worker route `POST /top
 which moves a machine's bindings only toward the transport the worker sees it on (so `on` puts the
 secret first and `off` deletes it first, and the script waits out propagation), pages with a cursor
 so a `conversations.create` 429 is retried rather than skipped, and accepts any machine key, since
-it can only converge. Unflip returns a binding to the one Telegram chat already holding a topic for
+it can only converge: it never takes a key another machine's session holds in the target chat, and
+never moves a `_`-prefixed key onto Slack. The script sweeps once more two minutes later, because a
+daemon re-bind landing on an isolate that still sees the old transport moves a binding back. Unflip returns a binding to the one Telegram chat already holding a topic for
 its key, or to `--telegram-chat`.
 
 **`#alerts`**: a `named_topics` row with reserved key `_alerts`, found by name (the runbook creates

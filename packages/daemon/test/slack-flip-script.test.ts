@@ -33,6 +33,7 @@ function fakeDeps(opts: {
   tables?: string[];
   config?: string;
   secretDeleteFails?: string;
+  secrets?: string[];
 }) {
   const calls: Call[] = [];
   const posts: Array<Record<string, unknown>> = [];
@@ -47,6 +48,10 @@ function fakeDeps(opts: {
       if (args[1] === "d1") {
         const names = opts.tables ?? ["slack_conversations", "slack_posts", "named_topic_bindings"];
         return { status: 0, stdout: JSON.stringify([{ results: names.map((name) => ({ name })) }]), stderr: "" };
+      }
+      if (args[1] === "secret" && args[2] === "list") {
+        const names = opts.secrets ?? ["SLACK_WORKSPACE_DEVBOX", "CCR_API_KEY"];
+        return { status: 0, stdout: JSON.stringify(names.map((name) => ({ name, type: "secret_text" }))), stderr: "" };
       }
       if (args[1] === "secret" && args[2] === "delete" && opts.secretDeleteFails) {
         return { status: 1, stdout: "", stderr: opts.secretDeleteFails };
@@ -199,21 +204,57 @@ describe("slack-flip.mjs", () => {
             },
     });
     expect(await script.flip(base(["devbox", "off", "--telegram-chat", "-100123"]), f.deps)).toBe(0);
-    expect(f.calls.map((c) => c.args.slice(0, 3).join(" "))).toEqual(["wrangler secret delete"]);
+    expect(f.calls.map((c) => c.args.slice(0, 4).join(" "))).toEqual([
+      "wrangler secret list --format",
+      "wrangler secret delete SLACK_WORKSPACE_DEVBOX",
+    ]);
     expect(f.calls.some((c) => c.cmd === "sudo" || c.cmd === "nix")).toBe(false);
     expect(f.posts[0]).toMatchObject({ expect: "telegram", telegramChatId: "-100123" });
   });
 
-  it("off: an already-deleted secret is fine (re-running off is idempotent); other delete failures are not", async () => {
-    const ok = fakeDeps({
-      secretDeleteFails: "✘ [ERROR] A request to the Cloudflare API failed. secret not found [code: 10056]",
-      rehome: () => ({ status: 200, body: { transport: "telegram", pending: 0, results: [], next: null } }),
-    });
+  it("off: an absent secret is skipped (re-running off reaches the bindings); a failed delete stops", async () => {
+    const ok = fakeDeps({ secrets: ["CCR_API_KEY"], rehome: () => ({ status: 200, body: { transport: "telegram", pending: 0, results: [], next: null } }) });
     expect(await script.flip(base(["devbox", "off"]), ok.deps)).toBe(0);
+    expect(ok.calls.some((c) => c.args[2] === "delete")).toBe(false);
     expect(ok.log.join("\n")).toMatch(/already absent/);
 
     const bad = fakeDeps({ secretDeleteFails: "Authentication error [code: 10000]", rehome: () => ({ status: 200, body: null }) });
     await expect(script.flip(base(["devbox", "off"]), bad.deps)).rejects.toThrow(/Authentication error/);
     expect(bad.posts).toHaveLength(0);
+  });
+
+  it("sweeps again after the settle wait when a binding moved back", async () => {
+    let previews = 0;
+    let sweeps = 0;
+    const f = fakeDeps({
+      rehome: (b) => {
+        if (b.dryRun) {
+          previews++;
+          // After the settle wait a stale-isolate re-bind has moved one back; the re-sweep fixes it.
+          return { status: 200, body: { transport: "slack", pending: previews === 1 ? 1 : 0, results: [], next: null } };
+        }
+        sweeps++;
+        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
+      },
+    });
+    expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(0);
+    expect(f.sleeps).toContain(script.SETTLE_MS);
+    expect(sweeps).toBe(2);
+    expect(f.log.at(-1)).toMatch(/1 binding\(s\) moved, 0 not, 0 still pending/);
+  });
+
+  it("the propagation timeout counts only consecutive 409s, not time spent in Slack backoffs", async () => {
+    let n = 0;
+    const f = fakeDeps({
+      rehome: (b) => {
+        if (b.dryRun) return { status: 200, body: { transport: "slack", pending: 0, results: [], next: null } };
+        n++;
+        // Five long Slack backoffs, then one stale-isolate 409, then done.
+        if (n <= 5) return { status: 200, body: { transport: "slack", pending: 1, results: [], next: null, retryAfter: 60 } };
+        if (n === 6) return { status: 409, body: { error: "transport_mismatch", transport: "telegram" } };
+        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
+      },
+    });
+    expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(0);
   });
 });
