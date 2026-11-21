@@ -347,7 +347,7 @@ describe("events", () => {
     // message, which arrives as a message event. The command itself already ran.
     const box = await mkBox();
     const ch = await seedSessionChannel(box);
-    for (const text of ["/retitle Live check retitled", "/kill", "/launch devbox pigeon hi", "/tag  x"]) {
+    for (const text of ["/retitle Live check retitled", "/kill", "/launch devbox pigeon hi", "/tag  x", "/Retitle Mixed"]) {
       expect((await sendEvent(box, { channel: ch.channelId, text })).status).toBe(200);
     }
     expect(await commandsFor(box.machineId)).toEqual([]);

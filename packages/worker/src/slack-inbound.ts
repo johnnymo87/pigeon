@@ -73,7 +73,9 @@ export const SLACK_APP_COMMANDS = ["/launch", "/kill", "/interrupt", "/compact",
 
 function isSlashCommandEcho(event: SlackMessageEvent): boolean {
   if (event.subtype !== undefined || (Array.isArray(event.files) && event.files.length > 0)) return false;
-  const text = typeof event.text === "string" ? event.text : "";
+  if (event.thread_ts && event.thread_ts !== event.ts) return false; // commands cannot run in threads
+  // Lower-cased: Slack matches command names case-insensitively, so `/Retitle x` echoes as typed.
+  const text = typeof event.text === "string" ? event.text.toLowerCase() : "";
   return SLACK_APP_COMMANDS.some((c) => text === c || text.startsWith(c + " ") || text.startsWith(c + "\n"));
 }
 
