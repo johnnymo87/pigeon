@@ -337,6 +337,18 @@ function parsePayloadObject(payload: string): Record<string, unknown> | null {
   }
 }
 
+function mediaCountOf(payload: string): number {
+  if (!payload.includes('"media')) return 0;
+  const parsed = parsePayloadObject(payload);
+  if (!parsed) return 0;
+  return readPendingMedia(parsed.mediaPending).length + readUploadedMedia(parsed.media).length;
+}
+
+function isDeduplicated(result: unknown): boolean {
+  const body = (result as { body?: unknown }).body;
+  return !!body && typeof body === "object" && (body as { deduplicated?: unknown }).deduplicated === true;
+}
+
 function hasPendingMedia(payload: string): boolean {
   return payload.includes('"mediaPending"') && parsePayloadObject(payload)?.mediaPending !== undefined;
 }
@@ -352,6 +364,12 @@ export class OutboxSender {
   private readonly richFailures = new Map<string, number>();
   /** Ticks with a transient media upload failure, by notificationId (pigeon-4ogz.23). */
   private readonly mediaFailures = new Map<string, number>();
+  /**
+   * Sessions whose entry is held for a media upload retry, to the held notificationId. A later
+   * entry of that session waits behind it rather than overtaking it on a later tick (pigeon-81p
+   * ordering). Bounded by MEDIA_UPLOAD_TRIES; lost on restart, which only releases the wait.
+   */
+  private readonly mediaHolds = new Map<string, string>();
   private readonly uploadMedia: UploadMediaFn | undefined;
   private readonly registerSession: RegisterSessionFn | undefined;
   private readonly unregisterSession: UnregisterSessionFn | undefined;
@@ -455,6 +473,11 @@ export class OutboxSender {
    * failure should hold the text for another tick. Files already uploaded are kept across ticks,
    * so a retry never uploads one twice.
    */
+  private clearMediaState(entry: { notificationId: string; sessionId: string }): void {
+    this.mediaFailures.delete(entry.notificationId);
+    if (this.mediaHolds.get(entry.sessionId) === entry.notificationId) this.mediaHolds.delete(entry.sessionId);
+  }
+
   private async prepareMedia(entry: OutboxRecord, now: number): Promise<UploadedMedia[] | "retry"> {
     const parsed = parsePayloadObject(entry.payload);
     if (!parsed) return [];
@@ -522,13 +545,13 @@ export class OutboxSender {
 
     if (remaining.length === 0) {
       persist([]);
-      this.mediaFailures.delete(entry.notificationId);
+      this.clearMediaState(entry);
       return uploaded;
     }
 
     const failures = (this.mediaFailures.get(entry.notificationId) ?? 0) + 1;
     if (failures >= MEDIA_UPLOAD_TRIES) {
-      this.mediaFailures.delete(entry.notificationId);
+      this.clearMediaState(entry);
       this.log("outbox media dropped: upload kept failing, sending the text without it", {
         notificationId: entry.notificationId,
         files: remaining.map((m) => m.filename),
@@ -539,10 +562,12 @@ export class OutboxSender {
       return uploaded;
     }
     this.mediaFailures.set(entry.notificationId, failures);
+    this.mediaHolds.set(entry.sessionId, entry.notificationId);
     persist(remaining);
     const backoff = getBackoff(entry.retryCount);
-    // Uncounted: the text has not been tried, and MEDIA_UPLOAD_TRIES bounds this loop.
-    this.storage.outbox.markRetry(entry.notificationId, now, backoff, `media upload: ${lastError ?? "failed"}`, false);
+    // Uncounted: the text has not been tried, and MEDIA_UPLOAD_TRIES bounds this loop. Measured
+    // from after the uploads, which may have taken most of the budget.
+    this.storage.outbox.markRetry(entry.notificationId, this.nowFn(), backoff, `media upload: ${lastError ?? "failed"}`, false);
     this.log("outbox media upload failed, holding the entry for a retry", {
       notificationId: entry.notificationId,
       sessionId: entry.sessionId,
@@ -552,6 +577,22 @@ export class OutboxSender {
       error: lastError,
     });
     return "retry";
+  }
+
+  /** A failed row is kept for a while; it must not keep megabytes of files nobody will send. */
+  private dropPendingMedia(entry: OutboxRecord, now: number): void {
+    if (!entry.payload.includes('"mediaPending"')) return;
+    const parsed = parsePayloadObject(entry.payload);
+    if (!parsed || parsed.mediaPending === undefined) return;
+    delete parsed.mediaPending;
+    try {
+      this.storage.outbox.updatePayload(entry.notificationId, JSON.stringify(parsed), now);
+    } catch (err) {
+      this.log("outbox media drop on terminal failed", {
+        notificationId: entry.notificationId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Mark an outbox entry failed terminally, clean up, and log uniform outbox terminal drop. */
@@ -585,7 +626,8 @@ export class OutboxSender {
     this.reregisteredEntries.delete(entry.notificationId);
     this.entriesSentUnderGeneral.delete(entry.notificationId);
     this.richFailures.delete(entry.notificationId);
-    this.mediaFailures.delete(entry.notificationId);
+    this.clearMediaState(entry);
+    this.dropPendingMedia(entry, now);
     const hold = this.getTopicHold(entry.sessionId, now);
     if (hold && hold.holderId === entry.notificationId) {
       this.topicHolds.delete(entry.sessionId);
@@ -720,6 +762,17 @@ export class OutboxSender {
           continue;
         }
 
+        // Same ordering rule behind an entry held for a media upload retry (pigeon-4ogz.23).
+        const mediaHolder = this.mediaHolds.get(entry.sessionId);
+        if (mediaHolder !== undefined && mediaHolder !== entry.notificationId) {
+          const holder = this.storage.outbox.getByNotificationId(mediaHolder);
+          if (holder && holder.state === "queued") {
+            this.storage.outbox.reschedule(entry.notificationId, now, 5_000);
+            continue;
+          }
+          this.mediaHolds.delete(entry.sessionId);
+        }
+
         // Defence in depth: an outbox entry whose session is a goose-acp row with
         // notify: false is dropped terminally (notify_false_goose) before any send
         // or re-register, so no future producer can create a topic for a --no-telegram session.
@@ -797,6 +850,9 @@ export class OutboxSender {
           continue;
         }
 
+        // Every file is a chat post of its own (pigeon-4ogz.23), so the governor counts them.
+        const mediaCount = mediaCountOf(entry.payload);
+
         // The pre-entry governor check counts ENTRIES; a multi-chunk entry can therefore
         // overshoot the window (11 used + an 11-chunk stop = 22 sends against Telegram's
         // ~20/min group cap), and a resulting 429 pauses the WHOLE outbox for minutes.
@@ -807,7 +863,7 @@ export class OutboxSender {
         // empty window, or it is starved forever.
         if (
           this.sendTimestamps.length > 0 &&
-          this.sendTimestamps.length + messages.length > OUTBOX_RATE_LIMIT
+          this.sendTimestamps.length + messages.length + mediaCount > OUTBOX_RATE_LIMIT
         ) {
           deferredSessions.add(entry.sessionId);
           if (!loggedGovernorChunkDeferral) {
@@ -1184,6 +1240,10 @@ export class OutboxSender {
             }
 
             sentChunks++;
+            if (i === 0 && media.length > 0 && !isDeduplicated(result)) {
+              // The worker posted the files after this chunk; charge them to the window.
+              for (let f = 0; f < media.length; f++) this.sendTimestamps.push(this.nowFn());
+            }
             if (i === 0 && rich) {
               const richOutcome = richOutcomeOf(result);
               if (richOutcome === "sent") break;
@@ -1204,7 +1264,7 @@ export class OutboxSender {
             this.reregisteredEntries.delete(entry.notificationId);
             this.entriesSentUnderGeneral.delete(entry.notificationId);
             this.richFailures.delete(entry.notificationId);
-            this.mediaFailures.delete(entry.notificationId);
+            this.clearMediaState(entry);
             if (!sentUnderGeneral) {
               this.topicHolds.delete(entry.sessionId);
             }

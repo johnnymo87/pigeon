@@ -165,6 +165,92 @@ describe("OutboxSender outbound media", () => {
     expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
   });
 
+  it("keeps a later entry of the session behind one held for a media retry", async () => {
+    seed();
+    storage.outbox.upsert({
+      notificationId: "stop-2",
+      sessionId: "sess-1",
+      requestId: "req-2",
+      kind: "stop",
+      payload: JSON.stringify({ messages: [{ text: "later" }], replyMarkup: { inline_keyboard: [] }, notificationId: "stop-2" }),
+      token: "tok",
+    }, 2_000);
+    const sendFn = vi.fn().mockResolvedValue(success);
+    const upload = vi
+      .fn()
+      .mockImplementationOnce(async () => ({ ok: false, key: "", permanent: false, error: "HTTP 503" }))
+      .mockImplementation(async (key: string) => ({ ok: true, key }));
+    const s = sender(sendFn as unknown as SendNotificationFn, upload as unknown as UploadMediaFn);
+    await s.processOnce();
+    expect(sendFn).not.toHaveBeenCalled();
+    // The held entry's backoff (5s) has not passed yet, but stop-2's would have: it must still wait.
+    now += 3_000;
+    await s.processOnce();
+    expect(sendFn).not.toHaveBeenCalled();
+    now += 10 * 60_000;
+    await s.processOnce();
+    await s.processOnce();
+    expect(sendFn.mock.calls.map((c) => (c[0] as SendNotificationInput).text)).toEqual(["hello", "later"]);
+  });
+
+  it("does not bring the files back when entities are stripped after the upload", async () => {
+    seed();
+    const sendFn = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        kind: "http_error",
+        status: 502,
+        body: { error: "Telegram API error", details: { error_code: 400, description: "Bad Request: can't parse entities" } },
+      })
+      .mockResolvedValue(success);
+    const upload = vi.fn(async (key: string) => ({ ok: true as const, key }));
+    storage.outbox.updatePayload(
+      "stop-1",
+      JSON.stringify({ ...stored(), messages: [{ text: "hello", entities: [{ offset: 0, length: 5, type: "bold" }] }] }),
+      1_000,
+    );
+    const s = sender(sendFn as unknown as SendNotificationFn, upload);
+    await s.processOnce();
+    expect(stored()).not.toHaveProperty("mediaPending");
+    expect(stored().media).toHaveLength(2);
+    now += 10 * 60_000;
+    await s.processOnce();
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect((sendFn.mock.calls[1]![0] as SendNotificationInput).media).toHaveLength(2);
+  });
+
+  it("sends the text when the uploader throws", async () => {
+    seed({ mediaPending: [{ mime: "image/png", filename: "shot.png", data: PNG }] });
+    const sendFn = vi.fn().mockResolvedValue(success);
+    const upload = vi.fn(async () => {
+      throw new Error("boom");
+    });
+    const s = sender(sendFn as unknown as SendNotificationFn, upload as unknown as UploadMediaFn);
+    for (let i = 0; i < MEDIA_UPLOAD_TRIES; i++) {
+      await s.processOnce();
+      now += 10 * 60_000;
+    }
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("sent");
+  });
+
+  it("drops parked files from a row that fails terminally", async () => {
+    seed();
+    now = 1_000 + 48 * 60 * 60_000;
+    await sender(vi.fn() as unknown as SendNotificationFn, async (key) => ({ ok: true, key })).processOnce();
+    expect(storage.outbox.getByNotificationId("stop-1")!.state).toBe("failed");
+    expect(stored()).not.toHaveProperty("mediaPending");
+  });
+
+  it("charges each file to the rate window", async () => {
+    seed();
+    const sendFn = vi.fn().mockResolvedValue(success);
+    const s = sender(sendFn as unknown as SendNotificationFn, async (key) => ({ ok: true, key }));
+    await s.processOnce();
+    expect((s as unknown as { sendTimestamps: number[] }).sendTimestamps).toHaveLength(3);
+  });
+
   it("rides with a rich chunk 0 that ends the entry", async () => {
     seed({ messages: [{ text: "a" }, { text: "b" }], rich: { markdown: "| a |\n|---|\n| 1 |" } });
     const sendFn = vi.fn().mockResolvedValue({ ...success, body: { ok: true, messageId: 1, rich: "sent" } });
