@@ -94,5 +94,4 @@ The Pigeon plugin uses the file-based approach. Other Nix-managed plugins (e.g.,
 - Plugin source: `packages/opencode-plugin/src/`
 - Direct channel contracts: `packages/daemon/src/opencode-direct/contracts.ts`
 - Adapter (daemon side): `packages/daemon/src/opencode-direct/adapter.ts`
-- Parity harness (direct mode): `packages/daemon/scripts/parity-harness.ts` with `PARITY_MODE=direct`
 - Nix derivation tracking: beads `ccr-f2i`
