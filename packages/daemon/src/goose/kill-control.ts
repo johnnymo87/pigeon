@@ -17,7 +17,7 @@ export interface GooseKillDeps {
   };
   gooseRunners?: GooseRunnerRegistry;
   poller?: {
-    unregisterSession(id: string): Promise<unknown>;
+    unregisterSession(id: string, opts?: { immediate?: boolean }): Promise<unknown>;
   };
   reply: (text: string) => Promise<unknown>;
 }
@@ -114,17 +114,23 @@ export async function executeGooseKill(sessionId: string, deps: GooseKillDeps): 
   dropGooseRunnerWithSwarmNotify(deps.storage, deps.gooseRunners, sessionId);
   deps.storage.sessions.delete(sessionId);
   deps.storage.assignments.delete(sessionId);
-  if (deps.poller) {
-    try {
-      await deps.poller.unregisterSession(sessionId);
-    } catch (err) {
-      console.warn(`[index] onKill: goose session unregister failed for ${sessionId}:`, err);
-    }
-  }
 
   let replyText = pickKillReply(outcome, isHonk, isHonkKnown);
   if (droppedQueued > 0) {
     replyText += ` ${droppedQueued} queued message(s) were discarded.`;
   }
-  await deps.reply(replyText);
+  try {
+    await deps.reply(replyText);
+  } finally {
+    // After the reply (pigeon-4ogz.20): `immediate` closes the topic now, and closing a Slack
+    // session channel archives it, so a reply sent after this would fail. `immediate` because a
+    // /kill is an interactive close; without it the topic waited for the daily close window.
+    if (deps.poller) {
+      try {
+        await deps.poller.unregisterSession(sessionId, { immediate: true });
+      } catch (err) {
+        console.warn(`[index] onKill: goose session unregister failed for ${sessionId}:`, err);
+      }
+    }
+  }
 }

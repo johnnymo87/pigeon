@@ -9,15 +9,34 @@ export interface KillCommandInput {
   machineId?: string;
   opencodeClient: OpencodeClient;
   sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  /**
+   * Tears down pigeon's side of a session opencode has just deleted: the daemon's sessions row,
+   * its routing, and the worker registration with an immediate topic close (pigeon-4ogz.20).
+   * Before this a /kill left the row behind, so the topic (or Slack channel) stayed open until the
+   * orphan closer collected it past the 7-day idle TTL.
+   *
+   * Called AFTER the reply, because closing a Slack session channel archives it and a reply into
+   * an archived channel fails. Called only when the delete succeeded: after a failed delete the
+   * session may still be alive, and dropping its row would orphan it from Telegram.
+   */
+  onTerminated?: (sessionId: string) => Promise<void>;
 }
 
 export async function ingestKillCommand(input: KillCommandInput): Promise<void> {
-  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply } = input;
+  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply, onTerminated } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   try {
     await opencodeClient.deleteSession(sessionId);
-    console.log(`[kill-ingest] session terminated sessionId=${sessionId}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[kill-ingest] failed to terminate session sessionId=${sessionId}: ${message}`);
+    await sendTelegramReply(chatId, `Failed to kill session${machineLabel}: ${message}`);
+    return;
+  }
+
+  console.log(`[kill-ingest] session terminated sessionId=${sessionId}`);
+  try {
     const msg = new TgMessageBuilder()
       .append(`Session terminated${machineLabel}.\n🆔 `)
       .appendCode(sessionId)
@@ -25,7 +44,16 @@ export async function ingestKillCommand(input: KillCommandInput): Promise<void> 
     await sendTelegramReply(chatId, msg.text, msg.entities);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[kill-ingest] failed to terminate session sessionId=${sessionId}: ${message}`);
-    await sendTelegramReply(chatId, `Failed to kill session${machineLabel}: ${message}`);
+    console.warn(`[kill-ingest] terminated reply failed sessionId=${sessionId}: ${message}`);
+  }
+
+  if (!onTerminated) return;
+  // Never throws: a throw would skip the poller ack, and the kill would be redelivered every lease
+  // expiry, each time answering "Failed to kill" for a session that is already gone.
+  try {
+    await onTerminated(sessionId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[kill-ingest] teardown failed sessionId=${sessionId}: ${message}`);
   }
 }

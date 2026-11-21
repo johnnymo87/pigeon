@@ -390,6 +390,27 @@ async function handleGooseControl(
 }
 
 /**
+ * Pigeon's teardown for a session that was explicitly deleted, after its sessions row is gone:
+ * DELETE /sessions/:id and an opencode /kill (pigeon-4ogz.20).
+ */
+async function onSessionDeleted(sessionId: string): Promise<void> {
+  // Drop the routing assignment so a deleted session can't yield a prospective
+  // /route 200 (workstation-boi9).
+  storage.assignments.delete(sessionId);
+  // A goose session's runner holds a websocket; dropping the row without
+  // dropping the runner would leak the socket and leave a turn reporting into
+  // a session that no longer exists.
+  dropGooseRunnerWithSwarmNotify(storage, gooseRunners, sessionId);
+  if (poller) {
+    // Interactive close: this fires on an explicit session delete (`/kill`, plugin session
+    // teardown), where a human is watching, so the forum topic closes now rather than waiting
+    // for the daily close window. Every janitorial unregister deliberately omits the flag —
+    // see poller.unregisterSession and worker sessions.ts (pigeon-xehy).
+    await poller.unregisterSession(sessionId, { immediate: true });
+  }
+}
+
+/**
  * The worker's session-free send route (chat-transport phase 1, pigeon-lenr). Used for
  * slash-command replies (no fallback) and as the first leg of operational alerts.
  */
@@ -809,6 +830,13 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             machineId: config.machineId,
             opencodeClient: client,
             sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            // pigeon-4ogz.20: the same teardown as DELETE /sessions/:id. Nothing else removes the
+            // row after a /kill (the plugin's session.deleted handler only clears its own state),
+            // so without this the topic stayed open until the orphan closer's 7-day TTL.
+            onTerminated: async (sessionId) => {
+              storage.sessions.delete(sessionId);
+              await onSessionDeleted(sessionId);
+            },
           });
         },
         onInterrupt: async (msg) => {
@@ -1411,22 +1439,7 @@ const app = createApp(storage, {
       return await poller.registerSession(sessionId, label ?? undefined);
     }
   },
-  onSessionDelete: async (sessionId) => {
-    // Drop the routing assignment so a deleted session can't yield a prospective
-    // /route 200 (workstation-boi9).
-    storage.assignments.delete(sessionId);
-    // A goose session's runner holds a websocket; dropping the row without
-    // dropping the runner would leak the socket and leave a turn reporting into
-    // a session that no longer exists.
-    dropGooseRunnerWithSwarmNotify(storage, gooseRunners, sessionId);
-    if (poller) {
-      // Interactive close: this fires on an explicit session delete (`/kill`, plugin session
-      // teardown), where a human is watching, so the forum topic closes now rather than waiting
-      // for the daily close window. Every janitorial unregister deliberately omits the flag —
-      // see poller.unregisterSession and worker sessions.ts (pigeon-xehy).
-      await poller.unregisterSession(sessionId, { immediate: true });
-    }
-  },
+  onSessionDelete: onSessionDeleted,
 });
 appHandler = app;
 resolveAppReady?.(app);
