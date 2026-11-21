@@ -31,11 +31,23 @@ export interface WorkerMessageBody {
   urlButtons?: Array<Array<{ text: string; url: string }>>;
   /** The worker's own abort on its Telegram call. Absent: the worker's default (~4s). */
   timeoutMs?: number;
+  /**
+   * Ask for the owner mention (Slack only, still gated by the worker's `SLACK_NOTIFY_OWNER`;
+   * pigeon-4ogz.5). Sent only when true.
+   */
+  notifyOwner?: boolean;
 }
 
 export type WorkerSendOutcome =
   | { kind: "sent"; messageId?: number }
-  | { kind: "telegram_rejected"; status: 400 | 429; description?: string; retryAfter?: number }
+  | {
+      kind: "telegram_rejected";
+      status: 400 | 429;
+      description?: string;
+      retryAfter?: number;
+      /** The worker's top-level `errorClass`, present on Slack responses only (pigeon-4ogz.5). */
+      errorClass?: string;
+    }
   | {
       kind: "worker_failed";
       /** Human-readable, for logs and the alert's `sent direct; worker: <reason>` suffix. */
@@ -123,6 +135,7 @@ export class WorkerMessageClient {
     if (body.messageThreadId !== undefined) wire.messageThreadId = body.messageThreadId;
     if (body.urlButtons && body.urlButtons.length > 0) wire.urlButtons = body.urlButtons;
     if (body.timeoutMs !== undefined) wire.timeoutMs = body.timeoutMs;
+    if (body.notifyOwner === true) wire.notifyOwner = true;
 
     let res: Awaited<ReturnType<WorkerMessageClient["post"]>>;
     try {
@@ -136,6 +149,9 @@ export class WorkerMessageClient {
     const tg = obj && isObject(obj.telegram) ? obj.telegram : undefined;
     const tgStatus = tg && typeof tg.status === "number" ? tg.status : undefined;
     const tgDesc = tg && typeof tg.description === "string" ? tg.description : undefined;
+    const errorClass = obj && typeof obj.errorClass === "string" && /^[a-z_]{1,40}$/.test(obj.errorClass)
+      ? obj.errorClass
+      : undefined;
 
     if (res.status === 200) {
       if (!obj || typeof obj.ok !== "boolean") {
@@ -154,6 +170,7 @@ export class WorkerMessageClient {
         const out: WorkerSendOutcome = { kind: "telegram_rejected", status: tgStatus };
         if (tgDesc !== undefined) out.description = tgDesc;
         if (tg && typeof tg.retryAfter === "number") out.retryAfter = tg.retryAfter;
+        if (errorClass !== undefined) out.errorClass = errorClass;
         return out;
       }
       // ok:false that is not a documented rejection: not a verdict we can trust.
@@ -170,7 +187,11 @@ export class WorkerMessageClient {
     let reason = `HTTP ${res.status}`;
     let key = `http${res.status}`;
     let cause: "worker" | "telegram_unreachable" = "worker";
-    if (tgStatus !== undefined) {
+    if (errorClass !== undefined) {
+      // A Slack answer: its class is the low-cardinality part, the description the detail.
+      reason += ` (Slack ${errorClass}${tgDesc ? `: ${sanitise(tgDesc, 80)}` : ""})`;
+      key += `:${errorClass}`;
+    } else if (tgStatus !== undefined) {
       reason += ` (Telegram ${tgStatus}${tgDesc ? `: ${tgDesc}` : ""})`;
       key += `:tg${tgStatus}`;
     } else if (error && /^[a-z_]{1,40}$/.test(error)) {

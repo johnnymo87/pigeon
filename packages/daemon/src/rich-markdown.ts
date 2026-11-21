@@ -260,14 +260,18 @@ function findBacktickRun(line: string, from: number, len: number): number {
  *   `> said\nreply` into the quote (lazy continuation), where plain text showed the `>`
  *   (pigeon-6mkr).
  */
-export function sanitizeBodyMarkdown(text: string): string {
+export function sanitizeBodyMarkdown(text: string, dialect?: RichDialect): string {
+  const slack = dialect === "slack";
   const classified = classify(text);
-  const lines = withSpacers(flattenSublists(classified.lines));
+  // Slack's markdown block is plain GFM: none of Telegram's extensions to defang, and none of
+  // the Telegram app's rendering quirks (spacer paragraphs, nested-list bullets, `#5620` read as
+  // a heading) to work around. Only the generic layout fixes below apply (pigeon-4ogz.5).
+  const lines = slack ? classified.lines : withSpacers(flattenSublists(classified.lines));
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     out +=
-      line.fenced || line.spacer
+      line.fenced || line.spacer || slack
         ? line.text
         : escapeInline(line.table ? line.text : line.text.replace(LOOSE_HASH, "$1\\#"), line.table);
     const next = lines[i + 1];
@@ -454,32 +458,46 @@ function codeBlock(content: string): string {
  * segments are escaped; entities become their markdown form. Returns null on overlapping
  * entities, which pigeon never builds, so the caller falls back to plain.
  */
-export function tgMessageToMarkdown(msg: TgMessage): string | null {
+export function tgMessageToMarkdown(msg: TgMessage, dialect?: RichDialect): string | null {
+  const slack = dialect === "slack";
+  const esc = slack ? escapePlainSlack : escapePlain;
   const entities = [...msg.entities].sort((a, b) => a.offset - b.offset);
   let out = "";
   let pos = 0;
   for (const e of entities) {
     if (e.offset < pos) return null;
-    out += escapePlain(msg.text.slice(pos, e.offset));
+    out += esc(msg.text.slice(pos, e.offset));
     const content = msg.text.slice(e.offset, e.offset + e.length);
     switch (e.type) {
       case "code":
-        out += copyButton(content) ?? codeSpan(content);
+        // Slack has no copy button; a code span is what its client lets you copy.
+        out += (slack ? null : copyButton(content)) ?? codeSpan(content);
         break;
       case "pre":
         out += codeBlock(content);
         break;
       case "bold":
-        out += `**${escapePlain(content)}**`;
+        out += `**${esc(content)}**`;
         break;
       case "italic":
-        out += `_${escapePlain(content)}_`;
+        out += `_${esc(content)}_`;
         break;
     }
     pos = e.offset + e.length;
   }
-  out += escapePlain(msg.text.slice(pos));
+  out += esc(msg.text.slice(pos));
   return out;
+}
+
+/**
+ * Characters escaped in pigeon's own text for Slack: CommonMark's backslash escapes for the
+ * emphasis, code, link, strikethrough and table characters. No entities and no Telegram
+ * escapes (`\$`, `\=`, `&lt;`), which Slack would show literally.
+ */
+const MD_SPECIAL_SLACK = /[\\`*_[\]~|]/g;
+
+function escapePlainSlack(s: string): string {
+  return s.replace(MD_SPECIAL_SLACK, (c) => "\\" + c).replace(/\n/g, "  \n");
 }
 
 /**
@@ -496,12 +514,23 @@ function estimateBlocks(markdown: string): number {
   return blocks;
 }
 
+/** Which markdown dialect to write. Absent: Telegram's (the default since pigeon-p909). */
+export type RichDialect = "slack";
+
+/** Slack's limit for a markdown block, in characters (the worker's `SLACK_MARKDOWN_MAX`). */
+export const SLACK_RICH_MAX_CHARS = 12_000;
+
 export interface BuildRichOptions {
   /**
    * Only offer rich when the body has a pipe table (the default, pigeon-p909). False for
    * goose turns, whose markdown is rendered whatever it contains (pigeon-6mkr).
    */
   requireTable?: boolean;
+  /**
+   * `"slack"`: standard GFM for a Slack markdown block (pigeon-4ogz.5), with Slack's limit and no
+   * Telegram block estimate.
+   */
+  dialect?: RichDialect;
 }
 
 /**
@@ -519,11 +548,17 @@ export function buildRichMarkdown(
   if ((options.requireTable ?? true) && !hasPipeTable(body.text)) return null;
   if (maxTableColumns(body.text) > RICH_MAX_COLUMNS) return null;
 
-  const head = tgMessageToMarkdown(header);
-  const foot = tgMessageToMarkdown(footer);
+  const dialect = options.dialect;
+  const head = tgMessageToMarkdown(header, dialect);
+  const foot = tgMessageToMarkdown(footer, dialect);
   if (head === null || foot === null) return null;
 
-  const parts = [head, sanitizeBodyMarkdown(body.text), foot].filter((p) => p.length > 0);
+  const parts = [head, sanitizeBodyMarkdown(body.text, dialect), foot].filter((p) => p.length > 0);
+  if (dialect === "slack") {
+    // Slack draws the gap between paragraphs itself.
+    const markdown = parts.join("\n\n");
+    return [...markdown].length > SLACK_RICH_MAX_CHARS ? null : markdown;
+  }
   const markdown = parts.join(`\n\n${SPACER}\n\n`);
 
   if ([...markdown].length > RICH_MAX_CHARS) return null;

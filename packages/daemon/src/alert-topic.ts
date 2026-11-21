@@ -24,6 +24,11 @@ export interface AlertTopic {
 export interface ResolvedTopic {
   messageThreadId: number;
   created: boolean;
+  /**
+   * The chat the topic lives in, as the worker returned it (pigeon-4ogz.5): `slack:<team>` for
+   * a Slack channel. The send that follows must use it. Absent from an older worker.
+   */
+  chatId?: string;
 }
 
 export type NamedTopicResolver = (
@@ -78,7 +83,11 @@ export async function resolveAlertTopic(
       }
       return undefined;
     }
-    return { messageThreadId: res.messageThreadId, created: res.created === true };
+    return {
+      messageThreadId: res.messageThreadId,
+      created: res.created === true,
+      ...(typeof res.chatId === "string" && res.chatId.length > 0 ? { chatId: res.chatId } : {}),
+    };
   } catch (err) {
     console.warn(
       `[alert] topic resolve failed; posting to General: ${err instanceof Error ? err.message : String(err)}`,

@@ -599,7 +599,8 @@ export class OutboxSender {
         let title: string | undefined;
         let dir: string | undefined;
         let threaded: boolean | undefined;
-        let rich: { markdown: string } | undefined;
+        let rich: { markdown: string; dialect?: "slack" } | undefined;
+        let notifyOwner: true | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
             messages?: Array<{ text: string; entities?: unknown[] }>;
@@ -609,7 +610,8 @@ export class OutboxSender {
             title?: string;
             dir?: string;
             threaded?: boolean;
-            rich?: { markdown?: unknown };
+            rich?: { markdown?: unknown; dialect?: unknown };
+            notifyOwner?: unknown;
           };
           messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
@@ -619,8 +621,12 @@ export class OutboxSender {
           threaded = parsed.threaded;
           rich =
             typeof parsed.rich?.markdown === "string" && parsed.rich.markdown.length > 0
-              ? { markdown: parsed.rich.markdown }
+              ? parsed.rich.dialect === "slack"
+                ? { markdown: parsed.rich.markdown, dialect: "slack" }
+                : { markdown: parsed.rich.markdown }
               : undefined;
+          // Set at enqueue on a Slack machine (pigeon-4ogz.5); the worker decides.
+          notifyOwner = parsed.notifyOwner === true ? true : undefined;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           this.markTerminal(entry, now, "payload_parse_failed", errMsg);
@@ -728,6 +734,7 @@ export class OutboxSender {
               // message is the whole notification; otherwise chunk 0 went out plain and the
               // loop carries on exactly as it always has.
               ...(i === 0 && rich ? { rich } : {}),
+              ...(notifyOwner ? { notifyOwner } : {}),
             });
 
             if (onTopicUnavailable === "general") {

@@ -121,6 +121,12 @@ export interface PlainAlertOptions {
    * alert without a topic still lands in General exactly as before.
    */
   messageThreadId?: number;
+  /**
+   * The chat `messageThreadId` belongs to, when the worker named it (`/topics/named` returns
+   * `chatId`, pigeon-4ogz.5): a `slack:<team>` address for a Slack channel. Absent means the
+   * notifier's configured chat, as before.
+   */
+  chatId?: string;
 }
 
 /**
@@ -134,6 +140,11 @@ export class TelegramSendError extends Error {
     message: string,
     /** Telegram's `description`, when the error body carried one. */
     public readonly description?: string,
+    /**
+     * The worker's `errorClass` for a Slack rejection (`conversation_gone`, `rejected_format`,
+     * ...; pigeon-4ogz.5). Absent for Telegram.
+     */
+    public readonly errorClass?: string,
   ) {
     super(description ? `${message}: ${description}` : message);
     this.name = "TelegramSendError";

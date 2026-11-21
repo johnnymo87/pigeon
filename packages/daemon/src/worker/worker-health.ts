@@ -47,7 +47,7 @@
  */
 
 import type { WorkerResult } from "./poller";
-import { getTelegramErrorCode } from "./delivery-policy";
+import { getErrorClass, getTelegramErrorCode } from "./delivery-policy";
 
 export type WorkerEndpoint = "register" | "send";
 
@@ -262,7 +262,13 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     return "transport";
   }
   if (result.kind === "http_error" && result.status >= 500) {
-    if (getTelegramErrorCode(result.body) === 400) {
+    // A Slack verdict on one message or one conversation (pigeon-4ogz.5) is the twin of the
+    // Telegram 400 below. `upstream` (a dead token, Slack down) and `rate_limited` still count.
+    const errorClass = getErrorClass(result.body);
+    if (errorClass === "rejected_format" || errorClass === "conversation_gone") {
+      return "neutral";
+    }
+    if (errorClass === undefined && getTelegramErrorCode(result.body) === 400) {
       return "neutral";
     }
     // A 502 with error "topic_unavailable" (pigeon-iqpd) is the worker holding a transient

@@ -32,6 +32,10 @@ import { WorkerMessageClient } from "./worker/worker-message-client";
 import { createCommandReplySender, type CommandReplySender } from "./worker/command-reply";
 import { createAlertNotifier, describeAlertDelivery } from "./alert-notifier";
 import { DirectTelegramAlarm } from "./direct-telegram-alarm";
+import { DirectSlackAlarm } from "./direct-slack-alarm";
+import { createDirectAlarm } from "./direct-alarm";
+import { ChatTransportState } from "./chat-transport-state";
+import { launchCapability } from "./launch-capability";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
 import { AlertDrainer, DEFAULT_DRAIN_INTERVAL_MS, type AlertDrainerNotifier } from "./swarm/alert-drainer";
@@ -96,6 +100,12 @@ const ALERT_ABANDONED_CREATED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
+
+// The transport the worker last said this machine is on (pigeon-4ogz.5). Read from SQLite at
+// startup, so a restart during a worker outage still picks the right alarm path; re-asked every
+// 60s once the poller exists.
+const chatTransport = new ChatTransportState({ db: storage.db });
+console.log(`[chat-transport] persisted transport=${chatTransport.get() ?? "(none yet)"}`);
 
 const ingressRouter = config.serveEndpoints.length > 0
   ? new IngressRouter(storage, {
@@ -490,32 +500,38 @@ const remoteLaunchClient = config.workerUrl && config.workerApiKey
   ? new RemoteLaunchClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
   : undefined;
 
-// Still requires TELEGRAM_BOT_TOKEN even though launch notices now go worker-first
-// (chat-transport phase 1): a worker-only host is deliberately not treated as launch-capable
-// until that is decided on its own.
-const launchCapable = Boolean(
-  config.remoteLaunchFrom.length > 0 &&
-  opencodeClient &&
-  config.telegramBotToken &&
-  config.telegramChatId &&
-  remoteLaunchClient,
-);
+// Launch capability needs an alarm path for the CURRENT transport (pigeon-4ogz.5, see
+// launch-capability.ts): computed per call from the persisted whoami.transport, so a flip needs
+// no restart. A change is logged once.
+const launchCapabilityInputs = {
+  remoteLaunchFrom: config.remoteLaunchFrom,
+  opencodeClient: Boolean(opencodeClient),
+  remoteLaunchClient: Boolean(remoteLaunchClient),
+  telegramBotToken: Boolean(config.telegramBotToken),
+  telegramChatId: Boolean(config.telegramChatId),
+  slackAlarmWebhook: Boolean(config.slackAlarmWebhookUrl),
+};
+let lastLaunchCapableLog: string | undefined;
+function launchCapableNow(): boolean {
+  const { capable, missing } = launchCapability(launchCapabilityInputs, chatTransport.get());
+  if (config.remoteLaunchFrom.length > 0) {
+    const line = capable
+      ? `[remote-launch] receiving is capable (transport=${chatTransport.get() ?? "unknown"})`
+      : `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: ${missing.join(", ")} (transport=${chatTransport.get() ?? "unknown"})`;
+    if (line !== lastLaunchCapableLog) {
+      lastLaunchCapableLog = line;
+      (capable ? console.log : console.warn)(line);
+    }
+  }
+  return capable;
+}
 
 if (config.remoteLaunchFrom.length > 0 || config.remoteLaunchSend) {
   console.log(
     `[remote-launch] launch_from=${config.remoteLaunchFrom.join(",") || "(none)"} launch_send=${config.remoteLaunchSend ? "on" : "off"}`,
   );
 }
-if (config.remoteLaunchFrom.length > 0 && !launchCapable) {
-  const missing: string[] = [];
-  if (!opencodeClient) missing.push("opencodeClient");
-  if (!config.telegramBotToken) missing.push("telegramBotToken");
-  if (!config.telegramChatId) missing.push("telegramChatId");
-  if (!remoteLaunchClient) missing.push("remoteLaunchClient");
-  console.warn(
-    `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: ${missing.join(", ")}`,
-  );
-}
+launchCapableNow();
 if (config.remoteLaunchSend && !remoteLaunchClient) {
   console.warn(
     "[remote-launch] remoteLaunchSend is enabled but worker credentials are missing; remote launch will not be available",
@@ -554,7 +570,10 @@ const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
   ? {
       storage,
       selfMachineId: config.machineId ?? "",
-      launchFrom: launchCapable ? config.remoteLaunchFrom : [],
+      // A getter: read on every launch item, so it follows the current transport.
+      get launchFrom() {
+        return launchCapableNow() ? config.remoteLaunchFrom : [];
+      },
       relaySendEnabled: config.swarmRelaySend,
       ...(opencodeClient ? { opencodeClient } : {}),
       resolveOwnerClient: clientForSession,
@@ -589,11 +608,12 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           opencode: Boolean(opencodeClient),
           goose: canLaunchGoose,
         }),
-        relayHeader: relayPollHeader(
-          config.swarmRelayAcceptFrom,
-          true,
-          launchCapable ? config.remoteLaunchFrom : [],
-        ),
+        relayHeaderFn: () =>
+          relayPollHeader(
+            config.swarmRelayAcceptFrom,
+            true,
+            launchCapableNow() ? config.remoteLaunchFrom : [],
+          ),
       },
       {
         // Relay items: inserted and acked before this poll's command is dispatched.
@@ -935,7 +955,10 @@ if (poller) {
   void poller.whoami(AbortSignal.timeout(5_000)).then((identity) => {
     const { level, text } = describeWorkerIdentity(identity, config.machineId!);
     console[level](text);
+    chatTransport.observe(identity);
   });
+  // Re-read every 60s: a flip puts or deletes the worker's secret, and nothing else tells us.
+  chatTransport.start(() => poller!.whoami(AbortSignal.timeout(5_000)));
 }
 
 const outboxSender = poller && config.telegramChatId
@@ -962,9 +985,20 @@ if (outboxSender) {
 // one direct Bot API path as a visible fallback, so an alarm about a broken worker can still
 // get out (see alert-notifier.ts). Either leg alone also works; with neither there is no
 // notifier and alerts are only recorded.
-const alertDirect = config.telegramBotToken && config.telegramChatId
-  ? new DirectTelegramAlarm(config.telegramBotToken, config.telegramChatId)
-  : undefined;
+// Telegram's Bot API or Slack's #alerts webhook, picked per alert from the persisted transport
+// (direct-alarm.ts, pigeon-4ogz.5).
+const alertDirect = createDirectAlarm({
+  telegram: config.telegramBotToken && config.telegramChatId
+    ? new DirectTelegramAlarm(config.telegramBotToken, config.telegramChatId)
+    : undefined,
+  slack: config.slackAlarmWebhookUrl
+    ? new DirectSlackAlarm(config.slackAlarmWebhookUrl, {
+        ownerUserId: config.slackOwnerUserId,
+        notifyOwner: config.slackNotifyOwner === true,
+      })
+    : undefined,
+  transport: () => chatTransport.get(),
+});
 const alertDelivery = describeAlertDelivery({
   worker: Boolean(workerMessageClient && config.telegramChatId),
   direct: Boolean(alertDirect),
@@ -974,12 +1008,21 @@ const notifier: StopNotifier | undefined = config.telegramChatId
       chatId: config.telegramChatId,
       worker: workerMessageClient,
       direct: alertDirect,
+      transport: () => chatTransport.get(),
       alerts: storage.alerts,
       machineId: config.machineId,
       log: (msg, fields) => console.warn(`[alert] ${msg}`, fields ? JSON.stringify(fields) : ""),
     })
   : undefined;
 console.log(`[pigeon-daemon] alert delivery: ${alertDelivery}`);
+// Never the URL itself: it is a credential. INVALID means the env var is set but is not a Slack
+// incoming-webhook URL, so it is ignored (an empty one counts as unset).
+{
+  const raw = process.env.PIGEON_SLACK_ALARM_WEBHOOK_URL?.trim();
+  const slack = config.slackAlarmWebhookUrl ? "set" : raw ? "INVALID (ignored)" : "unset";
+  const line = `[alert] direct paths: telegram=${config.telegramBotToken && config.telegramChatId ? "yes" : "no"} slack=${slack}`;
+  (slack.startsWith("INVALID") ? console.warn : console.log)(line);
+}
 
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.
@@ -1322,6 +1365,7 @@ if (deliveryWatchdog) {
 
 const app = createApp(storage, {
   notifier,
+  chatTransport: () => chatTransport.get(),
   tagLookup: tagResolver,
   chatId: config.telegramChatId,
   machineId: config.machineId,
