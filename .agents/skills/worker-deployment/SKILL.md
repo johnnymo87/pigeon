@@ -25,22 +25,21 @@ export CLOUDFLARE_API_TOKEN="$(cat /run/secrets/cloudflare_api_token)"
 
 > **⚠️ WARNING: The `[vars]` Deploy-Revert Trap**
 >
-> `ALLOWED_CHAT_IDS` and `TELEGRAM_TOPICS_ENABLED` live in `[vars]` in `packages/worker/wrangler.toml`.
+> `SHARED_KEY_REFUSED_MACHINES` lives in `[vars]` in `packages/worker/wrangler.toml`.
 > **Running `wrangler deploy` re-asserts `[vars]` from `wrangler.toml`**, silently overwriting any variables modified directly in the Cloudflare Dashboard UI.
 >
 > To update worker environment variables, edit `wrangler.toml` directly, preview with `npm run --workspace @pigeon/worker deploy -- --dry-run`, and then deploy.
 >
-> Slack config is **not** in `[vars]`: each machine's workspace is a worker *secret* `SLACK_WORKSPACE_<MACHINE>` (JSON `{teamId, appId, domain, botToken, userToken, signingSecret, ownerUserId}`), put only by `packages/worker/scripts/slack-flip.mjs <machine> on` (never by hand, never at deploy: putting it is what flips the machine to Slack). `SLACK_NOTIFY_OWNER` (owner @-mention categories, unset = no pushes) and `SLACK_MARKDOWN_BLOCKS` (`off` = no Slack markdown blocks) are optional and deliberately not in `wrangler.toml`; `keep_vars = true` keeps what is deployed. **Apply `d1-schema.sql` (the `slack_conversations`, `slack_posts`, `slack_seen_events` tables) before any such secret exists.**
+> Slack config is **not** in `[vars]`: each machine's workspace is a worker *secret* `SLACK_WORKSPACE_<MACHINE>` (JSON `{teamId, appId, domain, botToken, userToken, signingSecret, ownerUserId}`), put only by `packages/worker/scripts/slack-flip.mjs <machine> on` (never by hand, never at deploy: putting it is what gives the machine its workspace). `SLACK_NOTIFY_OWNER` (owner @-mention categories, unset = no pushes) and `SLACK_MARKDOWN_BLOCKS` (`off` = no Slack markdown blocks) are optional and deliberately not in `wrangler.toml`; `keep_vars = true` keeps what is deployed. **Apply `d1-schema.sql` (the `slack_conversations`, `slack_posts`, `slack_seen_events` tables) before any such secret exists.**
 
 ```bash
 cd ~/projects/pigeon
 npm run --workspace @pigeon/worker deploy
 ```
 
-## Chat Transport Runbooks
+## Chat Transport Runbook
 
-- Telegram Forum Topics (historical: no machine uses Telegram since 2026-11-21; the rollback path until `pigeon-4ogz.13`): `docs/runbooks/telegram-forum-migration.md`
-- Slack workspace and app setup for a machine, and the flip (`slack-flip.mjs`): `docs/runbooks/slack-workspace-setup.md`
+- Slack workspace and app setup for a machine, and putting it on Slack (`slack-flip.mjs`): `docs/runbooks/slack-workspace-setup.md`
 
 ## R2 Bucket
 
@@ -91,27 +90,9 @@ curl -s -H "Authorization: Bearer $(cat /run/secrets/ccr_api_key)" \
   "https://ccr-router.jonathan-mohrbacher.workers.dev/sessions"
 ```
 
-## Webhook Checks
-
-### Slack
+## Ingress Checks
 
 Slack routes take no bearer, only Slack's signature, so the deploy check without the signing secret is the negative one: `POST /slack/<machine>/events` with no `X-Slack-Signature` returns `401` for a machine that has a `SLACK_WORKSPACE_<MACHINE>` secret and the router's `404` for one that does not (`GET /whoami` with that machine's key shows which: `transport: "slack"`). A positive check is the Slack app's *Event Subscriptions* page showing the request URL *Verified* (see the runbook's "At the flip").
-
-### Telegram
-
-> **Note:** `TELEGRAM_WEBHOOK_SECRET` is a worker-only Cloudflare secret, not in sops.
-> Set it manually: `export TELEGRAM_WEBHOOK_SECRET="<value>"` before running.
-
-```bash
-curl -s -o /tmp/webhook-auth-check.txt -w "%{http_code}" \
-  -X POST \
-  -H "Content-Type: application/json" \
-  -H "X-Telegram-Bot-Api-Secret-Token: $TELEGRAM_WEBHOOK_SECRET" \
-  "https://ccr-router.jonathan-mohrbacher.workers.dev/webhook/telegram/parity" \
-  --data '{"update_id":999999001}'
-```
-
-Expected: HTTP `200`.
 
 ## Verify
 

@@ -54,7 +54,7 @@ including the unattended nightly one on devbox/cloudbox, runs it. The script say
 fetches its binary for whichever `node` is first on PATH (its install scripts call `node`, so
 naming the `npm` binary alone is not enough). If that is a different Node major than the one the
 service runs, the daemon dies at the next restart with a `NODE_MODULE_VERSION` mismatch and takes
-the host's chat notifications (Slack or Telegram) and swarm relay with it. Every host's service runs a pinned nix node:
+the host's chat notifications and swarm relay with it. Every host's service runs a pinned nix node:
 
 | Machine | Daemon's node comes from |
 |---------|--------------------------|
@@ -108,6 +108,10 @@ The script runs these; they are listed for the manual path.
 > response carrying a `notificationId` that is not the one we sent is positive evidence of a
 > daemon that mints its own, and it revokes the flag. No pool restart is required after a
 > rollback, but a restart is still the fastest way to a known state.
+
+> **Version floor (pigeon-4ogz.13):** never roll a daemon back below `7f4554f` (PR #246) once
+> its host no longer exports `TELEGRAM_CHAT_ID` (workstation #891). Older daemons build no outbox
+> and no alert notifier without it, so every notification is queued and silently never sent.
 
 ### Restart opencode-serve (only when you actually need it — see below)
 

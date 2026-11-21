@@ -155,7 +155,7 @@ When `to` is a registered pull session (`backend_kind === "goose-pull"`) whose `
 - The background `SwarmArbiter` is bypassed entirely — no `prompt_async` attempts, no delivery race.
 - Response: HTTP 202 `{ "accepted": true, "msg_id": "msg_...", "banked": true }`. (Non-banked sends omit `banked`).
 - Payload limit: payloads exceeding 4000 Unicode code points (`[...payload].length > 4000`) are refused with HTTP 413 `{ "error": "payload exceeds maximum length of 4000 characters (...)" }` at send time. Pull clients cannot take larger prompts; refusing at send time alerts the sender immediately.
-- Non-opted-in pull sessions: sends to pull sessions that have not opted into `"swarm"` still enter `swarm_messages`, fail arbiter delivery (~10 attempts with `TargetUnavailableError`), and result in a loud `delivery.failed` message back to the sender. This keeps behavior intact for pull clients that only accept `telegram-reply` rows (the source name for replies from either chat).
+- Non-opted-in pull sessions: sends to pull sessions that have not opted into `"swarm"` still enter `swarm_messages`, fail arbiter delivery (~10 attempts with `TargetUnavailableError`), and result in a loud `delivery.failed` message back to the sender. This keeps behavior intact for pull clients that only accept `telegram-reply` rows (the historical name of the human-reply source; Slack replies use it).
 - Banking failed delivery notices: when delivery to any target fails and the original sender was itself an opted-in pull session, its `delivery.failed` notice is also banked in `pull_inbox`.
 
 ### `POST /swarm/schedule`
@@ -315,7 +315,7 @@ Per message item, first refusal wins and is acked `refused` with the code. The w
 5. A pull or goose target lacking either `"swarm"` or `"swarm-remote"` in `pull_sources` → `remote_not_accepted`. Exception (`pigeon-a0o8`): a stall-watch coordinator (goose-acp, bound to `stallwatch:<tag>` with a valid tag, locally reachable) is accepted without `swarm-remote` (`swarm/coordinators.ts`).
 6. Insert through `bankOrInsertSwarmMessage` with the original fields, plus the `swarm_relay_inbound` record, in one transaction. A `refused` result (`scheduled`, `payload_too_large`, `no_mailbox`, `no_session`) is acked with that code. A relayed message banked in a pull inbox gets a 5-day TTL (`RELAYED_PULL_TTL_MS`), not 7, so its expiry is still reportable while the worker remembers the row.
 
-An item whose processing throws is left unacked, so the worker offers it again (up to its 5 leases); a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its Telegram notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
+An item whose processing throws is left unacked, so the worker offers it again (up to its 5 leases); a transient fault must not become permanent. A relayed row bypasses `Poller.dispatch`, so it never calls `markAllRead`. Its chat notice names the sender `<from_label> (<from_machine>)` and lands in the **receiver's** chat.
 
 **Late failures go back through the worker.** `notifySenderOfFailure` is the one funnel for arbiter expiry, the attempt budget, permanent errors, watchdog terminals and pull-inbox expiry. For a `msg_id` with an inbound record, it does not insert a local `from='pigeon'` row, which would address a remote session. It stamps `fail_reason` on the record instead, once only. `RelayFailSender` then POSTs `/swarm/relay/fail` with backoff. Codes:
 
@@ -366,7 +366,7 @@ Anything else is acked `refused` (`no_matching_relay`), and the worker drops it.
 
 ## Remote Launch (pigeon-k0qn.17)
 
-Remote launch allows an agent session on machine A (opencode, or goose via honk's swarm MCP) to start a fresh headless opencode session on machine B with an initial prompt via the `swarm_launch` tool (`{machine, directory, prompt, tag?}`). It copies the cross-machine relay's trust and wire model (per-machine keys, D1 queue, poll hand-out, receipts) instead of using the Telegram `commands` queue.
+Remote launch allows an agent session on machine A (opencode, or goose via honk's swarm MCP) to start a fresh headless opencode session on machine B with an initial prompt via the `swarm_launch` tool (`{machine, directory, prompt, tag?}`). It copies the cross-machine relay's trust and wire model (per-machine keys, D1 queue, poll hand-out, receipts) instead of using the chat `commands` queue.
 
 ### Storage Schema
 
@@ -401,7 +401,7 @@ The daemon includes launch acceptance in `X-Pigeon-Swarm-Relay`:
 X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
 ```
 
-- Advertised only if B is **launch-capable** (`config.remoteLaunchFrom.length > 0`, `opencodeClient` available, bot token and chat ID present, and worker credentials configured).
+- Advertised only if B is **launch-capable** (`config.remoteLaunchFrom.length > 0`, `opencodeClient` and a remote-launch client available, and `PIGEON_SLACK_ALARM_WEBHOOK_URL` set; no chat id is needed).
 - If `remoteLaunchFrom` is set but B lacks any capability, the daemon logs a warning naming what is missing and leaves the `launch=` token out of its poll header, so it is handed no launches (results for its own requests still arrive on `failures=1`).
 - Hand-out: worker checks target's live poll header and hands out at most 1 launch item per poll in `body.launches`. Result items (`item: "launch_result"`) are handed out to the requester under `failures=1` (up to 20 per poll).
 
@@ -423,7 +423,7 @@ X-Pigeon-Swarm-Relay: accept=<relay_csv>; launch=<launch_csv>; failures=1
    - `startSession` executes with step budgets: health 5s, create 15s, prompt 20s. Hooks `onCreated` -> updates inbound row state to `created(sessionId)`.
    - Settle inbound row state to `settled` with outcome (`launched`, `refused`, or `unconfirmed`).
    - Acks outcome to worker `POST /launch/relay/ack` (sent one item per HTTP call; launched session id must be `ses_`).
-   - Side effects (run detached in background): `autoAttach`, chat info alert to General / `#alerts` (`🚀 Remote launch from ...`), and `applyTag` if tag present.
+   - Side effects (run detached in background): `autoAttach`, chat info alert to `#alerts` (`🚀 Remote launch from ...`), and `applyTag` if tag present.
 6. **Result Row Minting on Worker:** On B's ack, worker marks launch row settled and inserts a result row `r:<launch_id>` with status `queued`, addressed to `from_machine`. If an `unconfirmed` launch is later acked as `launched`, a corrective result row `r:<launch_id>:launched` is minted.
 7. **Result Delivery to Requester A:** Worker hands out `launch_result` on A's poll (under `failures=1`).
    - Requester checks `from_machine === self`, matches against `remote_launch_outbound`, and records `result_id` in `remote_launch_results_seen`.
@@ -512,7 +512,7 @@ killing the turn already handling it. Priority cannot buy information the
 daemon does not have. Waiting costs latency; aborting destroys a peer's tool
 calls, reasoning and partial answer irreversibly.
 
-**The authorized override already exists**: the chat `/interrupt` command (Telegram, or Slack in the session's channel or as `/interrupt <session-id>`)
+**The authorized override already exists**: the chat `/interrupt` command (typed in the session's Slack channel or as `/interrupt <session-id>`)
 (`worker/interrupt-ingest.ts` → `OpencodeClient.abortSession`). A human with
 context decides, targets one session, and owns the consequence.
 
@@ -592,12 +592,12 @@ The arbiter therefore stats the directory before sending (`swarm/directory-check
 
 **The rule that governs both, and the one to carry forward:** a filesystem check may **refuse a future send**; it may never **re-interpret a turn already dispatched**. The same `stat` is sanctioned in the arbiter preflight and forbidden in the watchdog's silent-in-flight branch for exactly that reason.
 
-## Chat Mirroring (Telegram topic / Slack channel)
+## Chat Mirroring (Slack channel)
 
 Every swarm IPC message is mirrored to the **receiver's** chat conversation (its Slack session channel; the daemon just enqueues the outbox row and the worker resolves the conversation) so operators can see why a session started working. The helper is `enqueueSwarmChatNotice` in `swarm/chat-notice.ts` (renamed from the Telegram-era name, `pigeon-4ogz.13`).
 
 ### Hook Sites & Guarantees
-- **Hooked at insert, not delivery**: Swarm rows route through `bankOrInsertSwarmMessage()` and enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). For banked pull messages, Telegram notices are still enqueued on fresh inserts, but arbiter delivery is skipped. Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
+- **Hooked at insert, not delivery**: Swarm rows route through `bankOrInsertSwarmMessage()` and enqueue an outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). For banked pull messages, notices are still enqueued on fresh inserts, but arbiter delivery is skipped. Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
 - **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a chat post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
 - **Fault isolation**: The `enqueueSwarmChatNotice` helper (`packages/daemon/src/swarm/chat-notice.ts`) is wrapped in an internal `try/catch`. A chat/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
 - **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).

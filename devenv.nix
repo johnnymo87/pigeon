@@ -8,7 +8,7 @@
   dotenv.enable = true;
 
   scripts.dev-daemon.exec = ''
-    for f in ccr_worker_url ccr_api_key telegram_bot_token telegram_chat_id; do
+    for f in ccr_worker_url ccr_api_key; do
       upper=$(echo "$f" | tr '[:lower:]' '[:upper:]')
       export "$upper"="$(cat /run/secrets/$f)"
     done

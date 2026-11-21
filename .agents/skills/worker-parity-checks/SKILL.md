@@ -7,15 +7,11 @@ description: Use when validating deployed worker parity with authenticated check
 
 ## When To Use
 
-Use this skill after deploys or refactors to confirm endpoint auth, webhook behavior, and reply routing parity. The example script below is the **Telegram** path (shared key, a numeric `chatId`, a simulated Telegram webhook). A machine on Slack has its own end-to-end check, in "Slack Machine" below.
+Use this skill after deploys or refactors to confirm endpoint auth, ingress behavior, and reply routing parity. The end-to-end check is in "Slack Machine" below.
 
 ## Prerequisites
 
-Daemon secrets (`CCR_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and on a Slack machine the per-machine `pigeon_worker_key`) are in sops at `/run/secrets/`.
-`TELEGRAM_WEBHOOK_SECRET` is a worker-only Cloudflare secret, not in sops. Set it manually before running webhook checks:
-```bash
-export TELEGRAM_WEBHOOK_SECRET="<value>"
-```
+The per-machine worker key `pigeon_worker_key` and the daemon's `CCR_API_KEY` are in sops at `/run/secrets/`. Slack's signing secrets are worker-side only (inside each `SLACK_WORKSPACE_<MACHINE>` secret).
 
 ## Baseline
 
@@ -33,62 +29,14 @@ Verify unauthorized behavior:
 - `/sessions` with bad bearer -> `401`
 - `/notifications/send` with bad bearer -> `401`
 - `/notifications/send` missing required fields -> `400`
-- webhook with wrong Telegram secret -> `401`
 - Slack route `POST /slack/<machine>/events` with no/bad `X-Slack-Signature` -> `401` (machine has a `SLACK_WORKSPACE_<MACHINE>` secret) or `404` (it does not)
-
-## Real Notification + Reply Routing
-
-1. Register a temporary session
-2. Send notification to allowed chat ID
-3. Capture returned `messageId`
-4. Post simulated webhook reply with `reply_to_message.message_id = messageId`
-5. Unregister the session
-
-## Example Script
-
-```bash
-set -euo pipefail
-BASE="https://ccr-router.jonathan-mohrbacher.workers.dev"
-AUTH="Authorization: Bearer $(cat /run/secrets/ccr_api_key)"
-CHAT_ID="8248645256"
-SID="parity-$(date +%s)"
-
-curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-  "$BASE/sessions/register" \
-  --data "{\"sessionId\":\"$SID\",\"machineId\":\"devbox-parity\",\"label\":\"Parity\"}"
-
-curl -s -o /tmp/parity_notify.json -X POST -H "$AUTH" -H "Content-Type: application/json" \
-  "$BASE/notifications/send" \
-  --data "{\"sessionId\":\"$SID\",\"chatId\":\"$CHAT_ID\",\"text\":\"Parity check\"}"
-
-MSGID=$(python - <<"PY"
-import json
-print(json.load(open('/tmp/parity_notify.json'))['messageId'])
-PY
-)
-
-curl -s -X POST -H "Content-Type: application/json" \
-  -H "X-Telegram-Bot-Api-Secret-Token: $TELEGRAM_WEBHOOK_SECRET" \
-  "$BASE/webhook/telegram/parity" \
-  --data "{\"update_id\":9101234,\"message\":{\"message_id\":777,\"chat\":{\"id\":$CHAT_ID},\"text\":\"echo parity\",\"reply_to_message\":{\"message_id\":$MSGID}}}"
-
-curl -s -X POST -H "$AUTH" -H "Content-Type: application/json" \
-  "$BASE/sessions/unregister" \
-  --data "{\"sessionId\":\"$SID\"}"
-```
-
-## Pass Criteria
-
-- Notification send returns `{ ok: true, messageId, token }`
-- Webhook reply returns `ok` (`200`)
-- Session is removable (`/sessions/unregister` returns `{ ok: true }`)
 
 ## Slack Machine
 
-A Slack machine's end-to-end check is a **channel**, not a topic, and the shared key and the numeric `chatId` above do not apply: the worker resolves the destination itself (the machine's own `slack:<teamId>`, whatever `chatId` was sent), and the shared key never reaches Slack: for a stored `slack:<team>` address it is refused (`chat_not_allowed`), and a worker-resolved `/notifications/send` with the shared key goes down the Telegram path (an allowlisted numeric `chatId`, else `403`; `chat/address.ts` `resolveWorkerTarget`). So every Slack check here must use the MACHINE key (`/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac; `docs/runbooks/per-machine-credentials.md`), not `CCR_API_KEY`.
+The end-to-end check is a **channel**. The worker resolves the destination itself (the machine's own `slack:<teamId>`, whatever `chatId` was sent, and `chatId` may be omitted), and the shared key can post nowhere: a stored `slack:<team>` address is refused (`chat_not_allowed`), and a worker-resolved `/notifications/send` with the shared key is `403` (`chat/address.ts` `resolveWorkerTarget`). So every check here must use the MACHINE key (`/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac; `docs/runbooks/per-machine-credentials.md`), not `CCR_API_KEY`.
 
-1. `GET /whoami` with the machine key answers `{"credential":"machine","machine_id":"<m>","transport":"slack"}`. `"credential":"shared"` means you sent the wrong key (it says nothing about the machine's transport); a machine answer with no `transport` field means the worker sees no valid `SLACK_WORKSPACE_<MACHINE>` secret (rolled back to Telegram, or a broken secret).
-2. With the machine key, register a temporary session whose `machineId` is that machine (a machine key may only act as itself), then `POST /notifications/send` for it (`chatId` is still a required body field, but any value is ignored for a machine on Slack). The first notification creates a channel named `<title-slug>-<sid8>` in that machine's workspace; the response `messageId` is a handle >= 2^40 (`slack_posts`). Confirm in D1: `topics` has a row with `chat_id = 'slack:<teamId>'` for the session, and `slack_conversations` maps its handle to a channel id.
+1. `GET /whoami` with the machine key answers `{"credential":"machine","machine_id":"<m>","transport":"slack"}`. `"credential":"shared"` means you sent the wrong key (it says nothing about the machine's transport); a machine answer with no `transport` field means the worker sees no valid `SLACK_WORKSPACE_<MACHINE>` secret (missing or broken): `/notifications/send` will answer `503 no_transport`.
+2. With the machine key, register a temporary session whose `machineId` is that machine (a machine key may only act as itself), then `POST /notifications/send` for it (a machine needs no `chatId`; any value is ignored). The first notification creates a channel named `<title-slug>-<sid8>` in that machine's workspace; the response `messageId` is a handle >= 2^40 (`slack_posts`). Confirm in D1: `topics` has a row with `chat_id = 'slack:<teamId>'` for the session, and `slack_conversations` maps its handle to a channel id.
 3. Reply path: a message typed in that channel (or a thread reply under the post) becomes a `commands` row for the session. Slack requests are signed, so this is checked live in Slack rather than simulated with curl; slash commands are typed in the channel (not a thread), and `/kill`, `/interrupt`, `/compact`, `/mcp`, `/model` also work from `#alerts` as `/kill <session-id>`.
 4. Unregister the session. Its channel is archived by the nightly orphan-closer (04:00 UTC), not at unregister; remove the test channel by hand if it matters (bots cannot delete channels).
 
@@ -123,28 +71,13 @@ Expected: upload returns `{ ok: true, key: "parity/..." }`, download returns the
 
 ### Notification with Media
 
-To verify end-to-end media in notifications, send a photo to the Telegram bot as a reply to an active session notification (on Slack: attach an image to a message in the session's channel). The bot should:
+To verify end-to-end media in notifications, attach an image to a message in a session's channel. The worker should:
 
-1. Detect the photo, relay it to R2
-2. Deliver the command (with media) to the daemon via WebSocket
+1. Detect the file, relay it to R2
+2. Queue the command (with media) in D1 for the daemon's poll
 3. Daemon fetches from R2, converts to data URI, delivers to the plugin
 
-## Plugin-Direct Variant
-
-For OpenCode sessions using the direct command channel (`backend_kind: "opencode-plugin-direct"`),
-use the daemon parity harness with `PARITY_MODE=direct`:
-
-```bash
-cd ~/projects/pigeon/packages/daemon
-PARITY_MODE=direct npm run parity:harness
-```
-
-This variant:
-- Spins up a `startDirectChannelServer`
-- Registers the session with `backend_kind`, `backend_protocol_version`, `backend_endpoint`, `backend_auth_token`
-- Verifies that webhook reply commands are delivered directly to the plugin server's `onExecute` callback
-
-### Manual Plugin-Direct Registration
+## Manual Plugin-Direct Registration
 
 To register a plugin-direct session manually via curl:
 
@@ -164,5 +97,4 @@ curl -s -X POST -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_
 
 ## Verify
 
-Run the Example Script and confirm all three pass criteria.
-For plugin-direct, also run `PARITY_MODE=direct npm run parity:harness` and confirm it passes.
+Run the Slack Machine steps and confirm each.

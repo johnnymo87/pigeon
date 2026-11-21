@@ -19,7 +19,8 @@ from (pigeon-k0qn.8). Cross-machine swarm delivery (Phase 2) depends on this. De
 - `GET /whoami` says which principal a key resolves to. The daemon logs that once at startup
   as `[worker-identity] ...`.
 - If the worker refuses 12 polls in a row (about a minute) with 401 or 403, the daemon sends
-  a Telegram alert straight to Telegram, bypassing the worker.
+  an alert to `#alerts`: the worker first, and when it refuses that too, straight to Slack's `#alerts`
+  incoming webhook (`PIGEON_SLACK_ALARM_WEBHOOK_URL`), bypassing the worker.
 
 Revocation takes up to 60s (the worker caches each resolved key per isolate). Registration
 takes effect at once.
@@ -98,7 +99,7 @@ changed for the daemon yet.
   The key only appears in that command's argv, briefly. Do not run it with `set -x`.
 
 Then change **only the daemon start script** to prefer the machine key, keeping an instant
-rollback switch that needs no rebuild. On the Linux hosts:
+rollback switch that needs no rebuild (dead now: see "Rollback" below). On the Linux hosts:
 
 ```sh
 if [ -s /run/secrets/pigeon_worker_key ] && [ ! -e "$HOME/.config/pigeon/use-shared-worker-key" ]; then
@@ -135,10 +136,15 @@ delete `~/pigeon-worker-key.<m>`.
   The success line goes to `out.log` and warnings to `err.log`, so read both.
 
 Expect `[worker-identity] credential=machine machine=<m>` and no `Poll failed: 401/403`.
-Then send a Telegram message to a session on that machine and confirm it arrives. Only then
+Then send a Slack message to a session on that machine and confirm it arrives. Only then
 move on to the next machine.
 
-## Rollback (one machine)
+## Rollback (one machine): DEAD since Telegram's deletion
+
+**Do not use this.** Every machine is in `SHARED_KEY_REFUSED_MACHINES`, and since pigeon-4ogz.13
+the shared key cannot post anywhere either (`/notifications/send` answers 403, which the outbox
+retries silently). A refused or broken machine key is recovered by minting and registering a new
+one (above). The steps are kept only as a record of what the marker file does:
 
 1. `mkdir -p ~/.config/pigeon && touch ~/.config/pigeon/use-shared-worker-key`
 2. Restart the daemon (as above) and check for `[worker-identity] credential=shared`.
@@ -151,8 +157,8 @@ stays retired. Confirm the deployed value (Cloudflare dashboard, or `npx wrangle
 on the new version) before restarting the daemon on the shared key.
 
 **Worker rollback.** Rolling the worker back to a version before per-machine keys makes every
-machine key fail with 401 everywhere. Before such a rollback, put every machine-keyed daemon
-on the shared key with the marker file above.
+machine key fail with 401 everywhere, and the shared key no longer posts anywhere: do not roll
+the worker back past per-machine keys.
 
 ## Revoking or rotating a machine key
 
@@ -198,4 +204,4 @@ retired.
 | `owned_by_other_machine` (409) on register | another machine holds that session and has been active within 7 days; it must unregister it first. Fixed ids registered from more than one machine (pull lanes, `ses_stallwatch_*`) hit this once both machines use their own keys |
 | no `[worker-identity]` line at all | `CCR_API_KEY` is empty, so no poller started: the start script's secret read failed |
 | `[worker-identity] credential=shared` after switching | the start script did not pick up the machine key: the secret is missing or the rollback marker exists |
-| Telegram alert "the worker has refused its last 12 polls" | any of the above, the machine was retired from the shared key while still using it, or the worker was rolled back |
+| `#alerts` alert "the worker has refused its last 12 polls" | any of the above, the machine was retired from the shared key while still using it, or the worker was rolled back |

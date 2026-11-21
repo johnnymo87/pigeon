@@ -123,4 +123,8 @@ at 13:36Z (after every flip): find out what they are before deleting the webhook
 - PR A #245 merged 4c3e876, worker deployed b0303bac (2026-11-21 ~15:30Z). Webhook deleted, D1
   purged (topics 2307, named_topics 41, messages 25674), `seen_updates` dropped, worker Telegram
   secrets deleted. Deployed plain vars left inert.
-- PR B (daemon + plugin) opened.
+- PR B #246 merged 7f4554f; daemons deployed on devbox, cloudbox, macbook (all log `[chat] Slack
+  only`). Workstation #891 (env/sops/Keychain reads, allowlists) set to auto-merge after that.
+- PR C folded into nothing: `/topics/unpin` stays a constant ok until old daemons are certainly
+  gone (cheap; removing it is part of pigeon-4ogz.25).
+- PR D (docs deletions) opened.

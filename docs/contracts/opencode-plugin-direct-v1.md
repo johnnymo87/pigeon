@@ -13,7 +13,7 @@ This contract defines daemon <-> OpenCode plugin command transport for OpenCode 
 - `backend_endpoint`: plugin-local command endpoint (`http://127.0.0.1:<port>/...` or unix socket proxy URL)
 - `backend_auth_token`: bearer-like token for daemon -> plugin calls
 
-For OpenCode sessions, daemon routes inbound Telegram commands to this backend.
+For OpenCode sessions, daemon routes inbound chat commands to this backend.
 
 ## Execute Message (daemon -> plugin)
 
@@ -29,7 +29,7 @@ For OpenCode sessions, daemon routes inbound Telegram commands to this backend.
   "issuedAt": 1739383871000,
   "deadlineMs": 30000,
   "metadata": {
-    "chatId": "8248645256",
+    "chatId": "slack:T0123ABCD",
     "replyToMessageId": "2912",
     "replyToken": "token"
   }
