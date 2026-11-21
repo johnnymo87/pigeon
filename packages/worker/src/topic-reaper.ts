@@ -164,7 +164,7 @@ export async function closeOrphanedTopics(
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
+  const chatFor = (chatId: string) => transportForChat(chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
   let closedOrphans = 0;
   // A 429 stops the remaining provider calls of this run (rows with no call to make still go).
   let limited = false;
@@ -183,7 +183,7 @@ export async function closeOrphanedTopics(
 
     if (limited) continue;
 
-    const res = await tgFor(row.chat_id).archiveConversation({
+    const res = await chatFor(row.chat_id).archiveConversation({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });

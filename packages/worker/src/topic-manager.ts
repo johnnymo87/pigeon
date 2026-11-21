@@ -211,7 +211,8 @@ export async function resolveTopic(
         } else {
           // Genuine reopen failure (e.g. a provider 5xx, a transient network error, the user token losing its rights).
           // Do not call markOpen so the D1 row remains 'closed' and the reopen is retried on subsequent notifications.
-          // Delivery is unaffected because a post into an archived channel unarchives it in the transport.
+          // A post into an archived channel retries the unarchive itself; if that also fails, the post falls
+          // back like any other topic failure (held when transient, #alerts when permanent).
           //
           // Note on reaper/state:
           // The reaper is double-gated (listReapable requires state='closed' AND closed_at < closedBefore AND the session
