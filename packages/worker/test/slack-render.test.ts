@@ -166,12 +166,12 @@ describe("keyboardToBlocks", () => {
 
   it("keeps the row index in the action id when an earlier row is skipped", () => {
     const blocks = keyboardToBlocks({ inline_keyboard: [[], [{ text: "A", callback_data: "a" }]] });
-    expect((blocks[0] as { elements: Array<{ action_id: string }> }).elements[0]!.action_id).toBe("b1_0");
+    expect((blocks[0] as unknown as { elements: Array<{ action_id: string }> }).elements[0]!.action_id).toBe("b1_0");
   });
 
   it("splits a row longer than 25 elements, keeping column ids unique", () => {
     const row = Array.from({ length: 30 }, (_, i) => ({ text: `B${i}`, callback_data: `c${i}` }));
-    const blocks = keyboardToBlocks({ inline_keyboard: [row] }) as Array<{ elements: Array<{ action_id: string }> }>;
+    const blocks = keyboardToBlocks({ inline_keyboard: [row] }) as unknown as Array<{ elements: Array<{ action_id: string }> }>;
     expect(blocks.map((b) => b.elements.length)).toEqual([25, 5]);
     const ids = blocks.flatMap((b) => b.elements.map((e) => e.action_id));
     expect(new Set(ids).size).toBe(30);
@@ -180,21 +180,21 @@ describe("keyboardToBlocks", () => {
 
   it("truncates a label to 75 code points with an ellipsis", () => {
     const long = "😀".repeat(80);
-    const [block] = keyboardToBlocks({ inline_keyboard: [[{ text: long, callback_data: "x" }]] }) as Array<{
+    const [block] = keyboardToBlocks({ inline_keyboard: [[{ text: long, callback_data: "x" }]] }) as unknown as Array<{
       elements: Array<{ text: { text: string } }>;
     }>;
     const label = block!.elements[0]!.text.text;
     expect([...label].length).toBe(75);
     expect(label.endsWith("…")).toBe(true);
     const exact = "a".repeat(75);
-    const [b2] = keyboardToBlocks({ inline_keyboard: [[{ text: exact, callback_data: "x" }]] }) as Array<{
+    const [b2] = keyboardToBlocks({ inline_keyboard: [[{ text: exact, callback_data: "x" }]] }) as unknown as Array<{
       elements: Array<{ text: { text: string } }>;
     }>;
     expect(b2!.elements[0]!.text.text).toBe(exact);
   });
 
   it("never emits an empty button label", () => {
-    const [block] = keyboardToBlocks({ inline_keyboard: [[{ text: "", callback_data: "x" }]] }) as Array<{
+    const [block] = keyboardToBlocks({ inline_keyboard: [[{ text: "", callback_data: "x" }]] }) as unknown as Array<{
       elements: Array<{ text: { text: string } }>;
     }>;
     expect(block!.elements[0]!.text.text.length).toBeGreaterThan(0);
@@ -262,7 +262,7 @@ describe("buildSlackMessage", () => {
       ownerUserId: OWNER,
       notifyOwner: true,
     });
-    expect((pre.blocks[0] as { elements: unknown[] }).elements).toEqual([
+    expect((pre.blocks[0] as unknown as { elements: unknown[] }).elements).toEqual([
       { type: "rich_text_section", elements: [{ type: "user", user_id: OWNER }] },
       { type: "rich_text_preformatted", elements: [t("code")] },
     ]);

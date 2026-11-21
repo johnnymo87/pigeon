@@ -4,7 +4,7 @@
  * Test harness modeled on test/relay.test.ts. Machine ids are rl-a, rl-b, rl-c,
  * session ids ses_rl... so cleanup cannot touch relay tests.
  */
-import { env, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
 import worker from "../src/index";
@@ -512,7 +512,7 @@ describe("hand-out on GET /machines/:id/next", () => {
       prompt: "say hello",
       tag: null,
     });
-    expect(typeof body1.launches[0].expires_at).toBe("number");
+    expect(typeof body1.launches[0]!.expires_at).toBe("number");
 
     // Second poll within lease gets nothing (204)
     const res2 = await poll(KEY_B, B, `launch=${A}; failures=1`);
@@ -560,7 +560,7 @@ describe("hand-out on GET /machines/:id/next", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { launches: Array<{ launch_id: string }> };
     expect(body.launches).toHaveLength(1);
-    expect(body.launches[0].launch_id).toBe("launch_1");
+    expect(body.launches[0]!.launch_id).toBe("launch_1");
   });
 
   it("a launch with < 60 s of life left is not handed out", async () => {
@@ -650,7 +650,7 @@ describe("hand-out on GET /machines/:id/next", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { launches: Array<{ result_id: string }> };
     expect(body.launches).toHaveLength(1);
-    expect(body.launches[0].result_id).toBe("r:valid_02");
+    expect(body.launches[0]!.result_id).toBe("r:valid_02");
 
     const corruptRow = await env.DB.prepare("SELECT * FROM remote_launch WHERE launch_id = 'r:corrupt_01'").first<Record<string, unknown>>();
     expect(corruptRow!.status).toBe("leased");
@@ -1080,9 +1080,9 @@ describe("POST /launch/relay/ack", () => {
       .bind(A)
       .all<Record<string, unknown>>();
     expect(resultRows.results).toHaveLength(1);
-    expect(resultRows.results[0].launch_id).toBe("r:launch_rl_0001");
+    expect(resultRows.results[0]!.launch_id).toBe("r:launch_rl_0001");
 
-    const bodyJson = JSON.parse(String(resultRows.results[0].body_json));
+    const bodyJson = JSON.parse(String(resultRows.results[0]!.body_json));
     expect(bodyJson).toMatchObject({
       launch_id: "launch_rl_0001",
       outcome: "launched",
@@ -1107,8 +1107,8 @@ describe("POST /launch/relay/ack", () => {
     const pollA1 = await poll(KEY_A, A, "failures=1");
     expect(pollA1.status).toBe(200);
     const body1 = (await pollA1.json()) as { launches: Array<{ result_id: string; outcome: string }> };
-    expect(body1.launches[0].result_id).toBe("r:launch_rl_0001");
-    expect(body1.launches[0].outcome).toBe("unconfirmed");
+    expect(body1.launches[0]!.result_id).toBe("r:launch_rl_0001");
+    expect(body1.launches[0]!.outcome).toBe("unconfirmed");
 
     // B acks launched -> correction after r:<id> collected
     const ackCorrect = await ack(KEY_B, [
@@ -1130,8 +1130,8 @@ describe("POST /launch/relay/ack", () => {
     expect(pollA2.status).toBe(200);
     const body2 = (await pollA2.json()) as { launches: Array<{ result_id: string; outcome: string }> };
     expect(body2.launches).toHaveLength(1);
-    expect(body2.launches[0].result_id).toBe("r:launch_rl_0001:launched");
-    expect(body2.launches[0].outcome).toBe("launched");
+    expect(body2.launches[0]!.result_id).toBe("r:launch_rl_0001:launched");
+    expect(body2.launches[0]!.outcome).toBe("launched");
   });
 
   it("correction for row expired with never_collected: B acks unconfirmed with session_id -> row becomes expired/unconfirmed with that session_id and result carrying id is minted", async () => {
@@ -1807,13 +1807,10 @@ describe("runLaunchExpiry", () => {
       .bind(now - 1000, A, "launch_cron_01")
       .run();
 
-    const ctx = createExecutionContext();
     await worker.scheduled(
       { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
       env,
-      ctx,
     );
-    await waitOnExecutionContext(ctx);
 
     const lRow = await row(A, "launch_cron_01");
     expect(lRow!.status).toBe("expired");

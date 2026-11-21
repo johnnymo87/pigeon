@@ -2,7 +2,7 @@
  * All worker tests in a single file.
  * The worker uses D1 + HTTP polling (no Durable Objects).
  */
-import { env, SELF, fetchMock, createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env, SELF, fetchMock } from "cloudflare:test";
 import worker from "../src/index";
 import { describe, it, test, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { SESSION_TTL_MS as DAEMON_SESSION_TTL_MS } from "../../daemon/src/storage/schema";
@@ -909,13 +909,10 @@ describe("stale-session TTL sweep (pigeon-bea)", () => {
       "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
     ).bind(sessionId, "devbox", "cron", staleTime, staleTime).run();
 
-    const ctx = createExecutionContext();
     await worker.scheduled(
       { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
       env,
-      ctx,
     );
-    await waitOnExecutionContext(ctx);
 
     const check = await env.DB.prepare(
       "SELECT * FROM sessions WHERE session_id = ?"
@@ -2175,8 +2172,8 @@ describe("d1-ops", () => {
       .all<{ session_id: string }>();
 
     expect(rows.results.length).toBe(2);
-    expect(rows.results[0].session_id).toBe("ses-1");
-    expect(rows.results[1].session_id).toBe("ses-2");
+    expect(rows.results[0]!.session_id).toBe("ses-1");
+    expect(rows.results[1]!.session_id).toBe("ses-2");
   });
 
   it("verifies idx_topics_thread is defined as a partial unique index", async () => {
@@ -4857,7 +4854,9 @@ describe("topics module and topicName", () => {
   });
 
   describe("Task T2.11: Topic reaper cron jobs", () => {
-    // Rows live in a Slack workspace; the provider is a scripted fake transport.
+    // Rows live in a Slack workspace; the orphan-closer's provider is a scripted fake transport.
+    // reapTopics takes neither a transport nor an env, so "no provider call" on a reap is a
+    // property of its signature rather than something a fake can observe.
     const topicChatId = "slack:TREAPER";
 
     beforeEach(async () => {
@@ -4875,11 +4874,9 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
       await markClosed(env.DB, { sessionId, now: closedAt });
 
-      const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS });
 
       expect(result.reaped).toBe(1);
-      expect(calls.deleteConversation).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
@@ -4895,11 +4892,9 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
       await markClosed(env.DB, { sessionId, now: closedAt });
 
-      const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS });
 
       expect(result.reaped).toBe(0);
-      expect(Object.values(calls).flat()).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).not.toBeNull();
@@ -4918,8 +4913,7 @@ describe("topics module and topicName", () => {
         await markClosed(env.DB, { sessionId, now: closedAt });
       }
 
-      const { client } = fakeTransport();
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, limit: 5, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, limit: 5 });
 
       expect(result.reaped).toBe(5);
       const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM topics WHERE session_id LIKE 'ses_t211_reap_cap_%'").first<{ n: number }>();
@@ -4934,11 +4928,9 @@ describe("topics module and topicName", () => {
       await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread reap", now: closedAt - 1000 });
       await markClosed(env.DB, { sessionId, now: closedAt });
 
-      const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS });
 
       expect(result.reaped).toBe(1);
-      expect(Object.values(calls).flat()).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
@@ -5170,7 +5162,7 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", now - 1000, now - 1000).run();
 
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
 
       expect(result.reaped).toBe(0);
       const row = await getBySession(env.DB, sessionId);
@@ -5190,7 +5182,7 @@ describe("topics module and topicName", () => {
 
       // No sessions row created
 
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
 
       expect(result.reaped).toBe(1);
       const row = await getBySession(env.DB, sessionId);
@@ -5212,7 +5204,7 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", staleSessionTime, staleSessionTime).run();
 
-      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
 
       expect(result.reaped).toBe(1);
       const row = await getBySession(env.DB, sessionId);
@@ -5259,7 +5251,7 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
 
       expect(reapRes.reaped).toBe(0);
 
@@ -5306,7 +5298,7 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
 
       expect(reapRes.reaped).toBe(0);
 
@@ -5491,13 +5483,10 @@ describe("topics module and topicName", () => {
       const srv = fakeSlack();
 
       const cronEnv = wEnv;
-      const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
         cronEnv,
-        ctx,
       );
-      await waitOnExecutionContext(ctx);
 
       expect(srv.of("conversations.archive")).toHaveLength(0);
       expect((await getBySession(env.DB, sessionId))?.state).toBe("open");
@@ -5510,13 +5499,10 @@ describe("topics module and topicName", () => {
       const srv = fakeSlack();
 
       const cronEnv = wEnv;
-      const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
         cronEnv,
-        ctx,
       );
-      await waitOnExecutionContext(ctx);
 
       expect(srv.of("conversations.archive").map((c) => c.params.get("channel"))).toContain(channelId);
       expect((await getBySession(env.DB, sessionId))?.state).toBe("closed");
@@ -6288,9 +6274,11 @@ describe("named topics", () => {
     ).bind(CHAT, nextKey(), thread, now - 60 * 86400 * 1000, now - 60 * 86400 * 1000).run();
     const { client, calls } = fakeTransport();
     await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
-    await reapTopics(env.DB, { now, transport: client });
+    await reapTopics(env.DB, { now });
     expect(calls.archiveConversation.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
-    expect(calls.deleteConversation.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
+    // The reaper makes no provider call at all, so what it must leave alone is the D1 row.
+    const left = await env.DB.prepare("SELECT 1 FROM named_topics WHERE message_thread_id = ?").bind(thread).first();
+    expect(left).not.toBeNull();
   });
 
   test("a message typed in a named topic gets one rate-limited hint", async () => {

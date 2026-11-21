@@ -167,7 +167,6 @@ describe("topic CAS scoped to chat_id", () => {
       chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
-      botToken: "unused",
       transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);
@@ -193,7 +192,6 @@ describe("topic CAS scoped to chat_id", () => {
       chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
-      botToken: "unused",
       transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);

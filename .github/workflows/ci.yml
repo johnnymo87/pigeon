@@ -60,9 +60,10 @@ jobs:
       # There is no build script in any workspace, so typecheck is the compile
       # gate. It runs in all three packages via the root script -- but note it
       # covers each package's tsconfig `include`, which today means SRC only
-      # for opencode-plugin and worker. Their test code is typechecked by
-      # nothing (pigeon-09vu). Do not read a green tick here as "the test code
-      # compiles".
+      # for opencode-plugin: its test code is typechecked by nothing
+      # (pigeon-09vu), so do not read a green tick here as "the plugin's test
+      # code compiles". The worker's test/ is checked by its own
+      # test/tsconfig.json (pigeon-4ogz.34); the daemon's tsconfig includes test/.
       - name: Typecheck
         run: npm run typecheck
 

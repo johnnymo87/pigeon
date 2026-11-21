@@ -142,7 +142,12 @@ export async function seedSlackTopic(sessionId: string, machineId: string, ws: S
 
 // ─── Fake transport ────────────────────────────────────────────────────────
 
-type Handler = (o: any) => any; // eslint-disable-line @typescript-eslint/no-explicit-any
+type Method = keyof ChatTransport;
+type Options<M extends Method> = Parameters<ChatTransport[M]>[0];
+type Result<M extends Method> = Awaited<ReturnType<ChatTransport[M]>>;
+/** Typed against ChatTransport, so a renamed method, option or result field fails `typecheck`. */
+type Handler<M extends Method> = (o: Options<M>) => Result<M> | Promise<Result<M>>;
+type Handlers = { [M in Method]: Handler<M> };
 
 const METHODS = [
   "sendMessage",
@@ -155,18 +160,21 @@ const METHODS = [
   "archiveConversation",
   "unarchiveConversation",
   "deleteConversation",
-] as const;
+] as const satisfies readonly Method[];
+// Every ChatTransport method must be faked: a method added to the interface fails here.
+const _allMethodsFaked: Exclude<Method, (typeof METHODS)[number]> extends never ? true : never = true;
+void _allMethodsFaked;
 
 /**
  * A scripted ChatTransport. A method with no handler succeeds (a create answers thread 1; a send
  * answers an incrementing message id); a handler returns the ChatResult (or a promise of one),
  * and may throw. `calls` records each method's options in order.
  */
-export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number], Handler>> = {}) {
-  const calls: Record<string, any[]> = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
+export function fakeTransport(handlers: Partial<Handlers> = {}) {
+  const calls = {} as { [M in Method]: Options<M>[] };
   for (const m of METHODS) calls[m] = [];
   let nextMessageId = 1;
-  const defaults: Record<(typeof METHODS)[number], Handler> = {
+  const defaults: Handlers = {
     sendMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     sendRichMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     editMessage: () => ({ ok: true, result: true }),
@@ -178,11 +186,15 @@ export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number],
     unarchiveConversation: () => ({ ok: true, result: true }),
     deleteConversation: () => ({ ok: true, result: true }),
   };
-  const client = {} as Record<string, Handler>;
+  // The per-method types are enforced at the boundary (handlers, defaults, calls); inside the loop
+  // the method is a union, which TypeScript cannot correlate, so it is erased here.
+  const client = {} as Record<Method, (o: unknown) => Promise<unknown>>;
   for (const m of METHODS) {
+    const handler = (handlers[m] ?? defaults[m]) as (o: unknown) => unknown;
+    const recorded = calls[m] as unknown[];
     client[m] = async (o: unknown) => {
-      calls[m]!.push(o);
-      return (handlers[m] ?? defaults[m])(o);
+      recorded.push(o);
+      return handler(o);
     };
   }
   return { client: client as unknown as ChatTransport, calls };
