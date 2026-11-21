@@ -676,6 +676,34 @@ describe("Poller.uploadMedia()", () => {
     expect(init.body).toBeInstanceOf(FormData);
   });
 
+  it("marks a 4xx refusal permanent and a 5xx transient (pigeon-4ogz.23)", async () => {
+    const respond = (status: number) =>
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "nope" }), { status, headers: { "Content-Type": "application/json" } }),
+      ) as unknown as typeof fetch;
+
+    const refused = await new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: respond(413) })
+      .uploadMedia("k", new ArrayBuffer(4), "image/png", "a.png");
+    expect(refused).toMatchObject({ ok: false, permanent: true });
+
+    const down = await new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: respond(503) })
+      .uploadMedia("k", new ArrayBuffer(4), "image/png", "a.png");
+    expect(down).toMatchObject({ ok: false, permanent: false });
+
+    const limited = await new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn: respond(429) })
+      .uploadMedia("k", new ArrayBuffer(4), "image/png", "a.png");
+    expect(limited).toMatchObject({ ok: false, permanent: false });
+  });
+
+  it("bounds the upload with a timeout signal", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, key: "k" }), { status: 200 }),
+    ) as unknown as typeof fetch;
+    await new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn }).uploadMedia("k", new ArrayBuffer(4), "image/png", "a.png");
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
   it("returns { ok: false, key: '' } on fetch error", async () => {
     const fetchFn = vi.fn().mockRejectedValue(new Error("Network error")) as unknown as typeof fetch;
     const poller = new Poller(BASE_CONFIG, makeCallbacks(), { fetchFn });

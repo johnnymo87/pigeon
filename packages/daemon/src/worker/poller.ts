@@ -64,6 +64,14 @@ export type WorkerResultTransportError = {
   retryAfter?: undefined;
 };
 
+/** Outcome of `Poller.uploadMedia`. */
+export type UploadMediaResult =
+  | { ok: true; key: string }
+  | { ok: false; key: ""; permanent: boolean; error: string };
+
+/** Default bound on one outbound file upload, when the caller passes no signal of its own. */
+export const UPLOAD_MEDIA_TIMEOUT_MS = 30_000;
+
 export type WorkerResult<T = unknown> =
   | WorkerResultSuccess<T>
   | WorkerResultAppRejection<T>
@@ -1104,12 +1112,18 @@ export class Poller {
     }
   }
 
+  /**
+   * Stores one outbound file in R2 through the worker (pigeon-4ogz.23). `permanent` is true only
+   * for a 4xx other than 408/429: the worker understood the upload and refused it (too large,
+   * malformed), so repeating it cannot help. Everything else is worth another try.
+   */
   async uploadMedia(
     key: string,
     data: Uint8Array | ArrayBuffer,
     mime: string,
     filename: string,
-  ): Promise<{ ok: boolean; key: string }> {
+    signal?: AbortSignal,
+  ): Promise<UploadMediaResult> {
     try {
       const form = new FormData();
       form.append("key", key);
@@ -1122,11 +1136,21 @@ export class Poller {
         method: "POST",
         headers: { Authorization: `Bearer ${this.config.apiKey}` },
         body: form,
+        signal: signal ?? AbortSignal.timeout(UPLOAD_MEDIA_TIMEOUT_MS),
       });
-      return await response.json() as { ok: boolean; key: string };
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        const status = response.status;
+        const permanent = status >= 400 && status < 500 && status !== 408 && status !== 429;
+        return { ok: false, key: "", permanent, error: `HTTP ${status}${text ? `: ${text.slice(0, 200)}` : ""}` };
+      }
+      const body = await response.json() as { ok?: boolean; key?: string };
+      if (body.ok === true && typeof body.key === "string") return { ok: true, key: body.key };
+      return { ok: false, key: "", permanent: false, error: "upload answered without ok" };
     } catch (err) {
-      console.warn(`[poller] uploadMedia failed key=${key}:`, err instanceof Error ? err.message : String(err));
-      return { ok: false, key: "" };
+      const error = err instanceof Error ? err.message : String(err);
+      console.warn(`[poller] uploadMedia failed key=${key}:`, error);
+      return { ok: false, key: "", permanent: false, error };
     }
   }
 

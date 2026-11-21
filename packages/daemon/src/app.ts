@@ -27,6 +27,7 @@ import { clampPreservingSurrogates, excerptOf, parseTitle, MAX_TITLE_LENGTH } fr
 export { parseTitle };
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
+import { parseStopMedia } from "./outbound-media";
 import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
 import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
 import { shouldAllowRemoteGooseTarget } from "./swarm/remote-goose-target";
@@ -760,6 +761,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       requireTable: session.backendKind !== GOOSE_BACKEND_KIND,
       ...(slackDialect ? { dialect: "slack" as const } : {}),
     });
+    // Files the turn produced (pigeon-4ogz.23). Parked, not uploaded: the outbox sender uploads
+    // them to R2 before the first send, because the plugin gives this route 3s.
+    const parsedMedia = parseStopMedia(body.media);
+    if (parsedMedia.skipped.length > 0) {
+      console.warn(
+        `[stop] media skipped sessionId=${sessionId} notificationId=${notificationId} ` +
+        parsedMedia.skipped.map((s) => `${s.filename ?? "?"}:${s.reason}`).join(","),
+      );
+    }
     const notificationPayload = {
       messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
       replyMarkup: notification.replyMarkup,
@@ -770,6 +780,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       ...(richMarkdown !== null
         ? { rich: slackDialect ? { markdown: richMarkdown, dialect: "slack" } : { markdown: richMarkdown } }
         : {}),
+      ...(parsedMedia.media.length > 0 ? { mediaPending: parsedMedia.media } : {}),
     };
 
     // The goose runner's answer to a swarm message (s:<sid>:swarm-<msgId>) waits behind that
