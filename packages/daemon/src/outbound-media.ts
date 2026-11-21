@@ -52,6 +52,27 @@ export function sanitizeMediaFilename(raw: string): string {
   return [...clean].slice(0, MAX_FILENAME).join("");
 }
 
+const EXTENSIONS: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/svg+xml": "svg",
+  "application/pdf": "pdf",
+  "text/plain": "txt",
+  "application/json": "json",
+};
+
+/**
+ * A read-tool attachment has no filename, so the plugin sends "file", and the chat would show a
+ * file named `file`. Give a name without an extension one from its mime type.
+ */
+export function withMediaExtension(filename: string, mime: string): string {
+  if (/\.[A-Za-z0-9]{1,8}$/.test(filename)) return filename;
+  const ext = EXTENSIONS[mime.toLowerCase()];
+  return ext ? `${filename}.${ext}` : filename;
+}
+
 export type MediaSkip = { index: number; reason: string; filename?: string };
 
 /**
@@ -81,7 +102,7 @@ export function parseStopMedia(raw: unknown): { media: PendingMedia[]; skipped: 
     if (bytes > MAX_OUTBOUND_MEDIA_BYTES) return skip("too_large");
     if (total + bytes > MAX_OUTBOUND_MEDIA_TOTAL_BYTES) return skip("total_too_large");
     total += bytes;
-    media.push({ mime: rec.mime, filename, data });
+    media.push({ mime: rec.mime, filename: withMediaExtension(filename, rec.mime), data });
   });
   return { media, skipped };
 }
