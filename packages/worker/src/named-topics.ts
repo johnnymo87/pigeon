@@ -1,5 +1,5 @@
 /**
- * Named forum topics: caller-keyed topics that belong to no session.
+ * Named conversations: caller-keyed topics that belong to no session.
  *
  * A `POST /alert` caller (a digest, a watcher) can ask for its alerts to land in a topic of its
  * own, identified by a stable key it chooses, instead of in General. The worker owns the
@@ -24,7 +24,7 @@ import { transportForChat, type ChatTransport } from "./chat";
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
 
-/** Telegram's limit on a forum topic name, kept as the bound on a conversation's name. */
+/** Telegram-era limit on a topic name (128), kept as the bound on a conversation's name. */
 export const MAX_TOPIC_NAME_CHARS = 128;
 
 /** How often an existing named topic is re-opened, at most. A closed topic still accepts posts. */
@@ -110,7 +110,7 @@ export async function resolveNamedTopic(
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = transportForChat(opts.chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
+  const chat = transportForChat(opts.chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 
@@ -124,7 +124,7 @@ export async function resolveNamedTopic(
 
   if (row) {
     if (row.reopen_checked_at === null || now - row.reopen_checked_at >= REOPEN_CHECK_INTERVAL_MS) {
-      const res = await tg.reopenForumTopic({ chatId: opts.chatId, messageThreadId: row.message_thread_id });
+      const res = await chat.unarchiveConversation({ chatId: opts.chatId, messageThreadId: row.message_thread_id });
       if (!res.ok && res.kind === "thread_not_found") {
         await db
           .prepare("DELETE FROM named_topics WHERE chat_id = ? AND topic_key = ? AND message_thread_id = ?")
@@ -148,7 +148,7 @@ export async function resolveNamedTopic(
 
   const name = truncateName(opts.name.trim() || opts.key);
   // `channelKey` and `topic`: the key becomes the channel's name and the human name its topic line.
-  const created = await tg.createForumTopic({ chatId: opts.chatId, name, channelKey: opts.key, topic: name });
+  const created = await chat.createConversation({ chatId: opts.chatId, name, channelKey: opts.key, topic: name });
   if (!created.ok) {
     if (created.kind === "rate_limited") {
       return { ok: false, kind: "rate_limited", retryAfter: created.retryAfter };
@@ -160,7 +160,7 @@ export async function resolveNamedTopic(
     return { ok: false, kind: "create_failed", details: failureDetails(created) };
   }
 
-  const threadId = created.result.message_thread_id;
+  const threadId = created.result.messageThreadId;
   await db
     .prepare(
       `INSERT OR IGNORE INTO named_topics
@@ -174,7 +174,7 @@ export async function resolveNamedTopic(
   if (winner && winner.message_thread_id !== threadId) {
     // Lost a concurrent create. Remove our duplicate; best-effort.
     try {
-      await tg.deleteForumTopic({ chatId: opts.chatId, messageThreadId: threadId });
+      await chat.deleteConversation({ chatId: opts.chatId, messageThreadId: threadId });
     } catch {
       // ignore
     }
@@ -271,8 +271,8 @@ export async function maybeAnswerInNamedTopic(
     .bind(now, chatId, row.topic_key, now - NAMED_TOPIC_HINT_INTERVAL_MS)
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
-    const tg = transportForChat(chatId, { env, db });
-    const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
+    const chat = transportForChat(chatId, { env, db });
+    const res = await chat.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
       console.warn("[worker] named topic hint failed", { key: row.topic_key, details: failureDetails(res) });
     }

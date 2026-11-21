@@ -29,7 +29,7 @@ export interface TopicLookupEntry {
  *   -> 200 {topics: {[sessionId]: TopicLookupEntry | null}}
  *
  * A read-only view of the `topics` table, so a machine can render a link to a session's
- * forum topic without the worker having to know what the link is for. `null` means the
+ * channel without the worker having to know what the link is for. `null` means the
  * session has no topic row at all — topics are created lazily on a session's first threaded
  * notification, so a quiet or never-notified session legitimately has none.
  *

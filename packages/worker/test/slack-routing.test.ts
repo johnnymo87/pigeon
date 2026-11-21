@@ -357,9 +357,9 @@ describe("a session's topic row in a numeric chat is treated as absent", () => {
       transport: client,
     });
     expect(res).toEqual({ ok: true, messageThreadId: 1 });
-    expect(calls.createForumTopic).toHaveLength(1);
-    expect(calls.closeForumTopic).toHaveLength(0);
-    expect(calls.deleteForumTopic).toHaveLength(0);
+    expect(calls.createConversation).toHaveLength(1);
+    expect(calls.archiveConversation).toHaveLength(0);
+    expect(calls.deleteConversation).toHaveLength(0);
     expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("slack:TNUMRES");
   });
 
@@ -395,15 +395,15 @@ describe("a session's topic row in a numeric chat is treated as absent", () => {
   it("loser path: the reserve is lost to a numeric row, which is purged and reserved again", async () => {
     const sessionId = await seedSession("devbox");
     const { client, calls } = fakeTransport({
-      createForumTopic: (o) => ({ ok: true, result: { message_thread_id: 4242, name: o.name, icon_color: 0 } }),
+      createConversation: (o) => ({ ok: true, result: { messageThreadId: 4242, name: o.name } }),
     });
     const res = await resolveTopic(
       racingDb(() => seedNumericTopic(sessionId, "devbox", ALLOWED, 5)),
       { sessionId, machineId: "devbox", chatId: "slack:TNUMLOSE", dir: "~/p", title: "T", transport: client },
     );
     expect(res).toEqual({ ok: true, messageThreadId: 4242 });
-    expect(calls.createForumTopic).toHaveLength(1);
-    expect(calls.closeForumTopic).toHaveLength(0);
+    expect(calls.createConversation).toHaveLength(1);
+    expect(calls.archiveConversation).toHaveLength(0);
     const row = await getBySession(env.DB, sessionId);
     expect(row?.chat_id).toBe("slack:TNUMLOSE");
     expect(row?.message_thread_id).toBe(4242);
@@ -415,7 +415,7 @@ describe("a session's topic row in a numeric chat is treated as absent", () => {
     await reserve(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TNUMPOLL", name: "rival" });
     let polls = 0;
     const { client, calls } = fakeTransport({
-      createForumTopic: (o) => ({ ok: true, result: { message_thread_id: 4243, name: o.name, icon_color: 0 } }),
+      createConversation: (o) => ({ ok: true, result: { messageThreadId: 4243, name: o.name } }),
     });
     const res = await resolveTopic(env.DB, {
       sessionId,
@@ -432,7 +432,7 @@ describe("a session's topic row in a numeric chat is treated as absent", () => {
       },
     });
     expect(res).toEqual({ ok: true, messageThreadId: 4243 });
-    expect(calls.createForumTopic).toHaveLength(1);
+    expect(calls.createConversation).toHaveLength(1);
     expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("slack:TNUMPOLL");
   });
 
@@ -484,13 +484,13 @@ describe("another workspace's row is never touched", () => {
     const sessionId = await seedSession("devbox");
     const deleted: number[] = [];
     const { client } = fakeTransport({
-      createForumTopic: async (o) => {
+      createConversation: async (o) => {
         // While the create is in flight, the row moves to another workspace.
         await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
         await reserve(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TLATEB", name: "other row" });
-        return { ok: true, result: { message_thread_id: 9100, name: o.name, icon_color: 0 } };
+        return { ok: true, result: { messageThreadId: 9100, name: o.name } };
       },
-      deleteForumTopic: (o) => {
+      deleteConversation: (o) => {
         deleted.push(o.messageThreadId);
         return { ok: true, result: true };
       },

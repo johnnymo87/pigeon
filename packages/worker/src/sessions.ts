@@ -293,7 +293,7 @@ async function unregisterSession(
       if (topic.message_thread_id !== null && isSlackChatId(topic.chat_id)) {
         try {
           const client = transportForChat(topic.chat_id, { env, db });
-          await client.closeForumTopic({
+          await client.archiveConversation({
             chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,
           });

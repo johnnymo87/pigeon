@@ -3194,13 +3194,13 @@ describe("topics module and topicName", () => {
     // Provider results are scripted through an injected transport (Slack-shaped addresses).
     const topicChatId = "slack:TTOPICMGR";
 
-    it("two concurrent resolveTopic calls -> exactly one createForumTopic, both get same thread id", async () => {
+    it("two concurrent resolveTopic calls -> exactly one createConversation, both get same thread id", async () => {
       const sessionId = "ses_topic_concurrent";
 
       const { client, calls } = fakeTransport({
-        createForumTopic: () => ({
+        createConversation: () => ({
           ok: true,
-          result: { message_thread_id: 101, name: "pigeon · test", icon_color: 7322096 },
+          result: { messageThreadId: 101, name: "pigeon · test" },
         }),
       });
 
@@ -3227,7 +3227,7 @@ describe("topics module and topicName", () => {
         }),
       ]);
 
-      expect(calls.createForumTopic).toHaveLength(1);
+      expect(calls.createConversation).toHaveLength(1);
       expect(res1).toMatchObject({ ok: true, messageThreadId: 101 });
       expect(res2).toMatchObject({ ok: true, messageThreadId: 101 });
 
@@ -3308,13 +3308,13 @@ describe("topics module and topicName", () => {
       const sessionId = "ses_bit4_warn_no_winner";
 
       const { client, calls } = fakeTransport({
-        createForumTopic: async () => {
+        createConversation: async () => {
           // A rival deletes the reservation instead of finalizing it, so the CAS below
           // matches zero rows AND the re-read finds nothing.
           await deleteBySession(env.DB, sessionId);
           return {
             ok: true as const,
-            result: { message_thread_id: 606, name: "pigeon · no winner", icon_color: 7322096 },
+            result: { messageThreadId: 606, name: "pigeon · no winner" },
           };
         },
       });
@@ -3331,7 +3331,7 @@ describe("topics module and topicName", () => {
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: null, reason: "finalize_lost_no_winner", transient: true });
-        expect(calls.deleteForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 606 }]);
+        expect(calls.deleteConversation).toEqual([{ chatId: topicChatId, messageThreadId: 606 }]);
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -3383,10 +3383,10 @@ describe("topics module and topicName", () => {
 
       let call = 0;
       const { client } = fakeTransport({
-        createForumTopic: () =>
+        createConversation: () =>
           ++call === 1
             ? results.error(400, "Bad Request: chat not found")
-            : { ok: true, result: { message_thread_id: 303, name: "pigeon · err" } },
+            : { ok: true, result: { messageThreadId: 303, name: "pigeon · err" } },
       });
 
       const res1 = await resolveTopic(env.DB, {
@@ -3426,7 +3426,7 @@ describe("topics module and topicName", () => {
       const sessionId = "ses_topic_create_520";
 
       const { client } = fakeTransport({
-        createForumTopic: () => results.error(520, "Unknown Error"),
+        createConversation: () => results.error(520, "Unknown Error"),
       });
 
       const res = await resolveTopic(env.DB, {
@@ -3451,7 +3451,7 @@ describe("topics module and topicName", () => {
       const sessionId = "ses_topic_create_400_rights";
 
       const { client } = fakeTransport({
-        createForumTopic: () => results.error(400, "Bad Request: not enough rights to create a topic"),
+        createConversation: () => results.error(400, "Bad Request: not enough rights to create a topic"),
       });
 
       const res = await resolveTopic(env.DB, {
@@ -3503,7 +3503,7 @@ describe("topics module and topicName", () => {
     it("create returns 429 -> reservation gone and rate_limited propagated with retryAfter", async () => {
       const sessionId = "ses_topic_429";
 
-      const { client } = fakeTransport({ createForumTopic: () => results.rateLimited(15) });
+      const { client } = fakeTransport({ createConversation: () => results.rateLimited(15) });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -3534,7 +3534,7 @@ describe("topics module and topicName", () => {
       });
 
       const { client, calls } = fakeTransport({
-        createForumTopic: () => ({ ok: true, result: { message_thread_id: 404, name: "pigeon · fresh" } }),
+        createConversation: () => ({ ok: true, result: { messageThreadId: 404, name: "pigeon · fresh" } }),
       });
 
       const res = await resolveTopic(env.DB, {
@@ -3548,7 +3548,7 @@ describe("topics module and topicName", () => {
         transport: client,
       });
 
-      expect(calls.createForumTopic).toHaveLength(1);
+      expect(calls.createConversation).toHaveLength(1);
       expect(res).toEqual({ ok: true, messageThreadId: 404 });
 
       const row = await getBySession(env.DB, sessionId);
@@ -3556,17 +3556,17 @@ describe("topics module and topicName", () => {
       expect(row?.machine_id).toBe("devbox");
     });
 
-    it("slow original winner's finalize CAS loses -> compensating deleteForumTopic fires", async () => {
+    it("slow original winner's finalize CAS loses -> compensating deleteConversation fires", async () => {
       const sessionId = "ses_topic_finalize_cas_loses";
 
-      // Winner 1 calls resolveTopic, but right before returning from createForumTopic, Winner 2 finalizes with threadId 999
+      // Winner 1 calls resolveTopic, but right before returning from createConversation, Winner 2 finalizes with threadId 999
       const { client, calls } = fakeTransport({
-        createForumTopic: async () => {
-          // Right before returning from createForumTopic, Winner 2 finalizes
+        createConversation: async () => {
+          // Right before returning from createConversation, Winner 2 finalizes
           await finalize(env.DB, { sessionId, messageThreadId: 999, name: "winner 2" });
           return {
             ok: true as const,
-            result: { message_thread_id: 505, name: "pigeon · cas", icon_color: 7322096 },
+            result: { messageThreadId: 505, name: "pigeon · cas" },
           };
         },
       });
@@ -3581,8 +3581,8 @@ describe("topics module and topicName", () => {
       });
 
       // Winner 1's finalize CAS failed (message_thread_id was already 999)
-      // Winner 1 executed compensating deleteForumTopic for 505
-      expect(calls.deleteForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
+      // Winner 1 executed compensating deleteConversation for 505
+      expect(calls.deleteConversation).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
       // Winner 1 re-read D1 and returned Winner 2's thread id 999
       expect(res).toEqual({ ok: true, messageThreadId: 999 });
     });
@@ -3590,7 +3590,7 @@ describe("topics module and topicName", () => {
     describe("Task T2.6: Reopen-on-closed", () => {
       const sessionId = "ses_closed_topic";
 
-      it("resolving a state='closed' topic calls reopenForumTopic and flips state to open", async () => {
+      it("resolving a state='closed' topic calls unarchiveConversation and flips state to open", async () => {
         const now = Date.now();
         // Seed a closed topic in D1
         await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · closed", now });
@@ -3609,7 +3609,7 @@ describe("topics module and topicName", () => {
           transport: client,
         });
 
-        expect(calls.reopenForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 888 }]);
+        expect(calls.unarchiveConversation).toEqual([{ chatId: topicChatId, messageThreadId: 888 }]);
         expect(res).toEqual({ ok: true, messageThreadId: 888 });
 
         const row = await getBySession(env.DB, sessionId);
@@ -3617,13 +3617,13 @@ describe("topics module and topicName", () => {
         expect(row?.closed_at).toBeNull();
       });
 
-      it("reopenForumTopic returns 429 rate_limited -> propagates rate_limited error", async () => {
+      it("unarchiveConversation returns 429 rate_limited -> propagates rate_limited error", async () => {
         const now = Date.now();
         await reserve(env.DB, { sessionId: "ses_closed_429", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed 429", now });
         await finalize(env.DB, { sessionId: "ses_closed_429", messageThreadId: 889, now });
         await markClosed(env.DB, { sessionId: "ses_closed_429", now });
 
-        const { client } = fakeTransport({ reopenForumTopic: () => results.rateLimited(10) });
+        const { client } = fakeTransport({ unarchiveConversation: () => results.rateLimited(10) });
 
         const res = await resolveTopic(env.DB, {
           sessionId: "ses_closed_429",
@@ -3641,13 +3641,13 @@ describe("topics module and topicName", () => {
         expect(row?.state).toBe("closed");
       });
 
-      it("reopenForumTopic returns topic_not_modified -> returns messageThreadId and flips state to open", async () => {
+      it("unarchiveConversation returns topic_not_modified -> returns messageThreadId and flips state to open", async () => {
         const now = Date.now();
         await reserve(env.DB, { sessionId: "ses_closed_not_mod", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed not mod", now });
         await finalize(env.DB, { sessionId: "ses_closed_not_mod", messageThreadId: 994001, now });
         await markClosed(env.DB, { sessionId: "ses_closed_not_mod", now });
 
-        const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
+        const { client } = fakeTransport({ unarchiveConversation: () => results.notModified() });
 
         const res = await resolveTopic(env.DB, {
           sessionId: "ses_closed_not_mod",
@@ -3665,14 +3665,14 @@ describe("topics module and topicName", () => {
         expect(row?.state).toBe("open");
       });
 
-      it("reopenForumTopic returns generic error (e.g. not enough rights) -> returns messageThreadId but leaves state closed", async () => {
+      it("unarchiveConversation returns generic error (e.g. not enough rights) -> returns messageThreadId but leaves state closed", async () => {
         const now = Date.now();
         await reserve(env.DB, { sessionId: "ses_closed_rights_err", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed rights err", now });
         await finalize(env.DB, { sessionId: "ses_closed_rights_err", messageThreadId: 994002, now });
         await markClosed(env.DB, { sessionId: "ses_closed_rights_err", now });
 
         const { client } = fakeTransport({
-          reopenForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+          unarchiveConversation: () => results.error(400, "Bad Request: not enough rights to manage topics"),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -3695,16 +3695,16 @@ describe("topics module and topicName", () => {
     describe("Task T2.7: Stale-thread recovery in resolveTopic", () => {
       const sessionId = "ses_reopen_stale";
 
-      it("reopenForumTopic returns thread_not_found -> deletes stale D1 row and recreates topic", async () => {
+      it("unarchiveConversation returns thread_not_found -> deletes stale D1 row and recreates topic", async () => {
         const now = Date.now();
         await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · stale closed", now });
         await finalize(env.DB, { sessionId, messageThreadId: 700, now });
         await markClosed(env.DB, { sessionId, now });
 
-        // reopen returns thread_not_found; createForumTopic succeeds for new thread 701
+        // reopen returns thread_not_found; createConversation succeeds for new thread 701
         const { client } = fakeTransport({
-          reopenForumTopic: () => results.threadNotFound(),
-          createForumTopic: () => ({ ok: true, result: { message_thread_id: 701, name: "pigeon · stale closed" } }),
+          unarchiveConversation: () => results.threadNotFound(),
+          createConversation: () => ({ ok: true, result: { messageThreadId: 701, name: "pigeon · stale closed" } }),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -3736,30 +3736,30 @@ describe("topics module and topicName", () => {
        * interceptors into later tests in this file.
        */
       function fakeChat(handlers: {
-        createForumTopic?: (o: any) => any;
-        reopenForumTopic?: (o: any) => any;
-        editForumTopic?: (o: any) => any;
-        deleteForumTopic?: (o: any) => any;
+        createConversation?: (o: any) => any;
+        unarchiveConversation?: (o: any) => any;
+        renameConversation?: (o: any) => any;
+        deleteConversation?: (o: any) => any;
       }) {
         const calls = { create: 0, reopen: 0, edit: 0, delete: 0 };
         const editedNames: string[] = [];
         const client = {
-          createForumTopic: async (o: any) => {
+          createConversation: async (o: any) => {
             calls.create++;
-            return handlers.createForumTopic?.(o) ?? { ok: true, result: { message_thread_id: 1 } };
+            return handlers.createConversation?.(o) ?? { ok: true, result: { messageThreadId: 1 } };
           },
-          reopenForumTopic: async (o: any) => {
+          unarchiveConversation: async (o: any) => {
             calls.reopen++;
-            return handlers.reopenForumTopic?.(o) ?? { ok: true, result: true };
+            return handlers.unarchiveConversation?.(o) ?? { ok: true, result: true };
           },
-          editForumTopic: async (o: any) => {
+          renameConversation: async (o: any) => {
             calls.edit++;
             editedNames.push(o.name);
-            return handlers.editForumTopic?.(o) ?? { ok: true, result: true };
+            return handlers.renameConversation?.(o) ?? { ok: true, result: true };
           },
-          deleteForumTopic: async (o: any) => {
+          deleteConversation: async (o: any) => {
             calls.delete++;
-            return handlers.deleteForumTopic?.(o) ?? { ok: true, result: true };
+            return handlers.deleteConversation?.(o) ?? { ok: true, result: true };
           },
         };
         return { client: client as any, calls, editedNames };
@@ -3792,7 +3792,7 @@ describe("topics module and topicName", () => {
 
       it("a placeholder title never reaches the topic name; the topic is marked provisional", async () => {
         const sessionId = "ses_prov_create";
-        const tg = fakeChat({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 900 } }) });
+        const tg = fakeChat({ createConversation: () => ({ ok: true, result: { messageThreadId: 900 } }) });
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -3811,7 +3811,7 @@ describe("topics module and topicName", () => {
 
       it("a real title at creation is not provisional", async () => {
         const sessionId = "ses_prov_real";
-        const tg = fakeChat({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 901 } }) });
+        const tg = fakeChat({ createConversation: () => ({ ok: true, result: { messageThreadId: 901 } }) });
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -3891,7 +3891,7 @@ describe("topics module and topicName", () => {
         const sessionId = "ses_prov_editfail";
         await seedProvisionalTopic(sessionId, 904, "~/projects/pigeon");
         const tg = fakeChat({
-          editForumTopic: () => ({ ok: false, kind: "rate_limited", retryAfter: 30 }),
+          renameConversation: () => ({ ok: false, kind: "rate_limited", retryAfter: 30 }),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -3910,11 +3910,11 @@ describe("topics module and topicName", () => {
         expect(row?.name_provisional).toBe(1);
       });
 
-      it("an editForumTopic that throws is swallowed and leaves the flag set", async () => {
+      it("an renameConversation that throws is swallowed and leaves the flag set", async () => {
         const sessionId = "ses_prov_editthrow";
         await seedProvisionalTopic(sessionId, 912, "~/projects/pigeon");
         const tg = fakeChat({
-          editForumTopic: () => {
+          renameConversation: () => {
             throw new Error("network down");
           },
         });
@@ -3936,7 +3936,7 @@ describe("topics module and topicName", () => {
         const sessionId = "ses_prov_notmodified";
         await seedProvisionalTopic(sessionId, 905, "~/projects/pigeon");
         const tg = fakeChat({
-          editForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
+          renameConversation: () => ({ ok: false, kind: "topic_not_modified" }),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -4043,7 +4043,7 @@ describe("topics module and topicName", () => {
         await seedProvisionalTopic(sessionId, 910, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
         const tg = fakeChat({
-          reopenForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
+          unarchiveConversation: () => ({ ok: false, kind: "topic_not_modified" }),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -4067,7 +4067,7 @@ describe("topics module and topicName", () => {
         await seedProvisionalTopic(sessionId, 911, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
         const tg = fakeChat({
-          reopenForumTopic: () => ({ ok: false, kind: "error", status: 500 }),
+          unarchiveConversation: () => ({ ok: false, kind: "error", status: 500 }),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -4879,7 +4879,7 @@ describe("topics module and topicName", () => {
       const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
 
       expect(result.reaped).toBe(1);
-      expect(calls.deleteForumTopic).toEqual([]);
+      expect(calls.deleteConversation).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
@@ -4957,7 +4957,7 @@ describe("topics module and topicName", () => {
 
       expect(result.closedOrphans).toBe(1);
       expect(result.rateLimited).toBe(false);
-      expect(calls.closeForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
+      expect(calls.archiveConversation).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.state).toBe("closed");
@@ -4981,7 +4981,7 @@ describe("topics module and topicName", () => {
 
       expect(result.closedOrphans).toBe(1);
       expect(result.rateLimited).toBe(false);
-      expect(calls.closeForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
+      expect(calls.archiveConversation).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.state).toBe("closed");
@@ -5023,7 +5023,7 @@ describe("topics module and topicName", () => {
       const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5, transport: client });
 
       expect(result.closedOrphans).toBe(5);
-      expect(calls.closeForumTopic).toHaveLength(5);
+      expect(calls.archiveConversation).toHaveLength(5);
     });
 
     it("(i) NULL message_thread_id orphan row -> D1 row closed, zero provider calls", async () => {
@@ -5051,13 +5051,13 @@ describe("topics module and topicName", () => {
         await finalize(env.DB, { sessionId, messageThreadId: 62045 + i, now: now - 8 * 86400 * 1000 });
       }
 
-      const { client, calls } = fakeTransport({ closeForumTopic: () => results.rateLimited(10) });
+      const { client, calls } = fakeTransport({ archiveConversation: () => results.rateLimited(10) });
       const result = await runTopicReaper(env.DB, { now, transport: client });
 
       expect(result.rateLimited).toBe(true);
       expect(result.reaped).toBe(0);
       expect(result.closedOrphans).toBe(0);
-      expect(calls.closeForumTopic).toHaveLength(1);
+      expect(calls.archiveConversation).toHaveLength(1);
       const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM topics WHERE session_id LIKE 'ses_t211_rate_orphan_%' AND state = 'open'").first<{ n: number }>();
       expect(open?.n).toBe(3);
     });
@@ -5081,7 +5081,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
       await markClosed(env.DB, { sessionId, now });
 
-      const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
+      const { client } = fakeTransport({ unarchiveConversation: () => results.notModified() });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -5109,7 +5109,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId: sessionId429, messageThreadId: threadId429, now });
       await markClosed(env.DB, { sessionId: sessionId429, now });
 
-      const limited = fakeTransport({ reopenForumTopic: () => results.rateLimited(15) });
+      const limited = fakeTransport({ unarchiveConversation: () => results.rateLimited(15) });
 
       const res429 = await resolveTopic(env.DB, {
         sessionId: sessionId429,
@@ -5135,8 +5135,8 @@ describe("topics module and topicName", () => {
       await markClosed(env.DB, { sessionId: sessionIdTnf, now });
 
       const gone = fakeTransport({
-        reopenForumTopic: () => results.threadNotFound(),
-        createForumTopic: () => ({ ok: true, result: { message_thread_id: newThreadId, name: "pigeon · tnf" } }),
+        unarchiveConversation: () => results.threadNotFound(),
+        createConversation: () => ({ ok: true, result: { messageThreadId: newThreadId, name: "pigeon · tnf" } }),
       });
 
       const resTnf = await resolveTopic(env.DB, {
@@ -5235,7 +5235,7 @@ describe("topics module and topicName", () => {
 
       // 2. Notification arrives -> resolveTopic reopen fails generically (e.g. lost rights)
       const { client } = fakeTransport({
-        reopenForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+        unarchiveConversation: () => results.error(400, "Bad Request: not enough rights to manage topics"),
       });
 
       const resolveRes = await resolveTopic(env.DB, {
@@ -5283,7 +5283,7 @@ describe("topics module and topicName", () => {
       ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
 
       // 2. Notification arrives -> resolveTopic reopen returns topic_not_modified
-      const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
+      const { client } = fakeTransport({ unarchiveConversation: () => results.notModified() });
 
       const resolveRes = await resolveTopic(env.DB, {
         sessionId,
@@ -5328,12 +5328,12 @@ describe("topics module and topicName", () => {
       // No sessions row => orphaned.
 
       const { client, calls } = fakeTransport({
-        closeForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+        archiveConversation: () => results.error(400, "Bad Request: not enough rights to manage topics"),
       });
 
       const now = t0 + 1000;
       const res1 = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
-      expect(calls.closeForumTopic).toHaveLength(1);
+      expect(calls.archiveConversation).toHaveLength(1);
       expect(res1.closedOrphans).toBe(1);
 
       const row = await getBySession(env.DB, sessionId);
@@ -5343,7 +5343,7 @@ describe("topics module and topicName", () => {
       // The point of the fix: a SECOND run must not re-select it, so it cannot pin one of the 5 slots.
       const res2 = await closeOrphanedTopics(env.DB, { now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
       expect(res2.closedOrphans).toBe(0);
-      expect(calls.closeForumTopic).toHaveLength(1);
+      expect(calls.archiveConversation).toHaveLength(1);
     });
 
     it("(F-2) runTopicReaper forwards orphanTtlMs to reapTopics, so both jobs share one definition of live", async () => {
@@ -5460,7 +5460,7 @@ describe("topics module and topicName", () => {
       const res = await runTopicReaper(env.DB, { now, closeOrphans: false, transport: client });
 
       expect(res.closedOrphans).toBe(0);
-      expect(calls.closeForumTopic).toHaveLength(0);
+      expect(calls.archiveConversation).toHaveLength(0);
       expect((await getBySession(env.DB, "ses_4890_gated"))?.state).toBe("open");
     });
 
@@ -6289,8 +6289,8 @@ describe("named topics", () => {
     const { client, calls } = fakeTransport();
     await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
     await reapTopics(env.DB, { now, transport: client });
-    expect(calls.closeForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
-    expect(calls.deleteForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
+    expect(calls.archiveConversation.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
+    expect(calls.deleteConversation.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
   });
 
   test("a message typed in a named topic gets one rate-limited hint", async () => {

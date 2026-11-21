@@ -108,7 +108,7 @@ export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
  * (HTTP 502 topic_unavailable) before falling back to onTopicUnavailable="general" (relocating to General).
  *
  * Keyed per session: sibling entries wait uncounted across ticks until the hold resolves so
- * two stops never appear reversed and each does not probe createForumTopic during a hang outage.
+ * two stops never appear reversed and each does not probe topic creation during a hang outage.
  * Holder retry backoffs within the window are clamped to this edge so fallback lands near 150s.
  * Once the window elapses, the session's queued backlog drains immediately to General without
  * per-sibling holds.
@@ -410,7 +410,7 @@ export class OutboxSender {
    * Tracks topic hold windows per session, keyed by sessionId.
    *
    * Sibling entries must not overtake a held entry across ticks (two stops would appear
-   * reversed) and must not each start their own 150s window and createForumTopic probes
+   * reversed) and must not each start their own 150s window and topic-creation probes
    * (during a hang outage each probe stalls the serial outbox ~57s).
    *
    * If the holder fails terminally, markTerminal deletes the hold immediately. If the window
@@ -1003,7 +1003,7 @@ export class OutboxSender {
                   this.topicHolds.set(entry.sessionId, hold);
                 }
                 // pigeon-81p ordering: a later entry for this session must neither overtake the
-                // held one nor re-hit the same (possibly hung) createForumTopic in this batch.
+                // held one nor re-hit the same (possibly hung) topic create in this batch.
                 deferredSessions.add(entry.sessionId);
                 const heldForMs = heldAt - hold.startedAt;
                 if (heldForMs < TOPIC_HOLD_WINDOW_MS) {

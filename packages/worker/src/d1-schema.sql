@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at    INTEGER NOT NULL
 );
 
--- Messages: Telegram reply routing (replaces DO messages)
+-- Messages: reply routing (a posted message -> its session)
 CREATE TABLE IF NOT EXISTS messages (
   chat_id         TEXT NOT NULL,
   message_id      INTEGER NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS machines (
   last_poll_at  INTEGER NOT NULL
 );
 
--- Topics: Telegram forum topics registry
+-- Topics: one conversation (a Slack channel) per session
 CREATE TABLE IF NOT EXISTS topics (
   session_id        TEXT PRIMARY KEY,
   machine_id        TEXT,
@@ -76,7 +76,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_topics_thread
 CREATE INDEX IF NOT EXISTS idx_topics_reap ON topics(state, closed_at);
 
 
--- Named topics: caller-keyed forum topics with no session (POST /alert `topic`).
+-- Named topics: caller-keyed conversations with no session (POST /alert `topic`).
 -- Separate from `topics` on purpose: the orphan-closer, reaper and inbound routing all treat a
 -- `topics` row as session-owned. See named-topics.ts.
 CREATE TABLE IF NOT EXISTS named_topics (

@@ -263,8 +263,8 @@ async function refuseUnservableLaunch(
     "The command was dropped; nothing was started. Re-send it once the machine can serve that backend.",
   ].join("\n");
 
-  const tg = transportForChat(info.chatId, { env, db });
-  const res = await tg.sendMessage({
+  const chat = transportForChat(info.chatId, { env, db });
+  const res = await chat.sendMessage({
     chatId: info.chatId,
     text,
     messageThreadId: info.messageThreadId ?? undefined,

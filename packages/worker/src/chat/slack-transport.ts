@@ -20,13 +20,13 @@ import { callSlack, slackErrorClass, uploadToSlack, type SlackBody } from "../sl
 import type {
   ChatResult,
   ChatTransport,
-  CloseForumTopicOptions,
-  CreateForumTopicOptions,
-  DeleteForumTopicOptions,
-  EditForumTopicOptions,
-  EditMessageTextOptions,
-  ForumTopic,
-  ReopenForumTopicOptions,
+  ArchiveConversationOptions,
+  CreateConversationOptions,
+  DeleteConversationOptions,
+  RenameConversationOptions,
+  EditMessageOptions,
+  CreatedConversation,
+  UnarchiveConversationOptions,
   SendDocumentOptions,
   SendMessageOptions,
   SendPhotoOptions,
@@ -738,7 +738,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       });
     },
 
-    async editMessageText(options: EditMessageTextOptions) {
+    async editMessage(options: EditMessageOptions) {
       const original = await postForHandle(options.messageId);
       if (!original) return unknownHandle("post");
       if (original.ts.startsWith("file:")) return rejected("not_editable", "slack file posts cannot be edited");
@@ -785,7 +785,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return sendFile(options.document, options.filename, options.messageThreadId, options.replyToMessageId, options.signal);
     },
 
-    async createForumTopic(options: CreateForumTopicOptions): Promise<ChatResult<ForumTopic>> {
+    async createConversation(options: CreateConversationOptions): Promise<ChatResult<CreatedConversation>> {
       const parts = nameParts(options);
       const created = await withUniqueName(parts, (name) =>
         bot("conversations.create", { name, is_private: false }),
@@ -807,7 +807,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       const topic = await bot("conversations.setTopic", { channel: channelId, topic: topicText(options) });
       if (!topic.ok) console.warn("[worker] slack setTopic failed", { channelId, error: slackErr(topic) ?? topic.kind });
 
-      return { ok: true, result: { message_thread_id: handle, name: channelName, icon_color: 0 } };
+      return { ok: true, result: { messageThreadId: handle, name: channelName } };
     },
 
     /**
@@ -815,7 +815,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
      * ends in the session's 8 characters) or a `channelKey` (the name is the key). With neither,
      * a rename would strip the suffix that makes the name unique, so only the topic is edited.
      */
-    async editForumTopic(options: EditForumTopicOptions) {
+    async renameConversation(options: RenameConversationOptions) {
       if (options.name === undefined && options.topic === undefined) return OK_TRUE;
       const target = await targetForHandle(options.messageThreadId);
       if (!target) return unknownHandle("conversation");
@@ -868,11 +868,11 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return OK_TRUE;
     },
 
-    async closeForumTopic(options: CloseForumTopicOptions) {
+    async archiveConversation(options: ArchiveConversationOptions) {
       return archive(options.messageThreadId);
     },
 
-    async reopenForumTopic(options: ReopenForumTopicOptions) {
+    async unarchiveConversation(options: UnarchiveConversationOptions) {
       const target = await targetForHandle(options.messageThreadId);
       if (!target) return unknownHandle("conversation");
       const res = await asUser("conversations.unarchive", { channel: target.channelId });
@@ -886,7 +886,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       return res;
     },
 
-    async deleteForumTopic(options: DeleteForumTopicOptions) {
+    async deleteConversation(options: DeleteConversationOptions) {
       // Bots cannot delete a channel. This is only used to retire a lost-race duplicate.
       return archive(options.messageThreadId);
     },

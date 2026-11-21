@@ -128,3 +128,8 @@ at 13:36Z (after every flip): find out what they are before deleting the webhook
 - PR C folded into nothing: `/topics/unpin` stays a constant ok until old daemons are certainly
   gone (cheap; removing it is part of pigeon-4ogz.25).
 - PR D (docs deletions) opened.
+- PR C done as pigeon-4ogz.25: #250 daemon read-both (5016db9, all three daemons), #251 worker
+  provider names + `/topics/unpin` + numeric chatId removed (916095c, worker d29c31c0).
+- pigeon-4ogz.29: worker `ChatTransport` methods renamed to conversation vocabulary
+  (`createConversation`, `renameConversation`, `archiveConversation`, `unarchiveConversation`,
+  `deleteConversation`, `editMessage`; `CreatedConversation` without `icon_color`); in-process only.

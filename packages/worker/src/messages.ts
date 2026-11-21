@@ -229,10 +229,10 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
   const addr = await authorizeStoredAddress(env, env.DB, principal, chatId, thread as number | undefined);
   if (!addr.ok) return addr.response;
 
-  const tg = transportForChat(addr.chatId, { env, db: env.DB });
+  const chat = transportForChat(addr.chatId, { env, db: env.DB });
   return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
-      await tg.sendMessage({
+      await chat.sendMessage({
         chatId: addr.chatId,
         text,
         ...(entities !== undefined ? { entities: entities as unknown[] } : {}),

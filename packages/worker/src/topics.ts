@@ -1,5 +1,5 @@
 /**
- * D1 repo module for session conversations (`topics` table: forum topics once, Slack channels now).
+ * D1 repo module for session conversations (`topics` table: one Slack channel per session).
  */
 
 export interface TopicRow {
@@ -24,7 +24,7 @@ export interface TopicRow {
 /**
  * opencode core names a brand-new session `New session - <ISO timestamp>` and only replaces it
  * seconds later, once its summarizer has produced a real title. Pigeon must never bake that
- * placeholder into a forum topic name, because topic names are write-once (pigeon-353p).
+ * placeholder into a conversation name, because topic names are write-once (pigeon-353p).
  *
  * Matched here in the worker as well as in the daemon (`parseTitle`) deliberately: the worker
  * deploys centrally while daemons are updated per-machine, so a lagging daemon would otherwise
@@ -75,12 +75,12 @@ export function clampPreservingSurrogates(s: string, max: number): string {
 }
 
 /**
- * Formats a Telegram forum topic name from directory and title.
+ * Formats a conversation (channel) name from directory and title.
  * Format is `${title} · ${dir}` clamped to at most 128 UTF-16 code units.
  * Home directories (/home/<user> or /Users/<user>) in the path are abbreviated to `~`.
  *
- * Internal newlines (\r, \n) are replaced with a single space " " because Telegram
- * topic names are single-line UI headers in topic lists and headers.
+ * Internal newlines (\r, \n) are replaced with a single space " " because a
+ * channel's topic line is a single-line header.
  *
  * Title comes first because the topic LIST truncates a row visually well before 128 chars,
  * so a trailing title is unreadable — the directory used to eat the visible width. The path
@@ -177,7 +177,7 @@ export async function reserve(
   // `changes`, not `rows_written`. The rest of this codebase reads `rows_written`
   // (d1-ops.ts:189,261,283) but every one of those is an UPDATE or DELETE, where the
   // distinction is invisible. Here it is load-bearing: this boolean elects the single
-  // winner of the topic-creation race, so a false positive mints duplicate Telegram
+  // winner of the topic-creation race, so a false positive mints duplicate provider
   // topics. `changes` is contractually SQLite's changes() — 0 for an ignored insert.
   // `rows_written` is a billing counter that says nothing about OR IGNORE; measured
   // against production D1 it reports 2 for a plain insert and 3 for a CREATE TABLE,
@@ -281,11 +281,11 @@ export async function rename(
  * CAS on `name_provisional = 1`, so it is a no-op against a topic that has since been renamed by
  * a human or already upgraded by a rival isolate. Returns whether this caller won.
  *
- * Accepted residual: the CAS protects the D1 row, not Telegram. A `/rename` that lands between
- * this caller's `editForumTopic` and its CAS leaves Telegram showing the automatic name while D1
+ * Accepted residual: the CAS protects the D1 row, not the provider. A `/rename` that lands between
+ * this caller's `renameConversation` and its CAS leaves the provider showing the automatic name while D1
  * holds the human one; re-issuing `/rename` converges. The window is milliseconds wide and the
  * consequence is cosmetic, which is why it is not worth claiming the flag BEFORE the API call —
- * that would trade this for the much worse "one transient Telegram failure and the topic is
+ * that would trade this for the much worse "one transient provider failure and the topic is
  * never upgraded", since every retry of the upgrade is driven by a later notification.
  */
 export async function renameProvisional(
@@ -381,7 +381,7 @@ export async function deleteBySession(
 
 /**
  * Delete a topic record by session_id and message_thread_id.
- * Used for stale-thread recovery when a finalized topic was deleted out-of-band in Telegram.
+ * Used for stale-thread recovery when a finalized topic was deleted out-of-band.
  * Scoped to message_thread_id using SQLite `IS ?` so a late delete against a stale thread id no-ops
  * and cannot delete a newly finalized topic row for the same session (pigeon-5o7).
  * Uses `IS` for NULL-safe comparison (handles reservation rows where message_thread_id IS NULL).

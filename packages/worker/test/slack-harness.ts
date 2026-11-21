@@ -147,14 +147,14 @@ type Handler = (o: any) => any; // eslint-disable-line @typescript-eslint/no-exp
 const METHODS = [
   "sendMessage",
   "sendRichMessage",
-  "editMessageText",
+  "editMessage",
   "sendPhoto",
   "sendDocument",
-  "createForumTopic",
-  "editForumTopic",
-  "closeForumTopic",
-  "reopenForumTopic",
-  "deleteForumTopic",
+  "createConversation",
+  "renameConversation",
+  "archiveConversation",
+  "unarchiveConversation",
+  "deleteConversation",
 ] as const;
 
 /**
@@ -169,14 +169,14 @@ export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number],
   const defaults: Record<(typeof METHODS)[number], Handler> = {
     sendMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     sendRichMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
-    editMessageText: () => ({ ok: true, result: true }),
+    editMessage: () => ({ ok: true, result: true }),
     sendPhoto: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     sendDocument: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
-    createForumTopic: (o) => ({ ok: true, result: { message_thread_id: 1, name: o.name, icon_color: 0 } }),
-    editForumTopic: () => ({ ok: true, result: true }),
-    closeForumTopic: () => ({ ok: true, result: true }),
-    reopenForumTopic: () => ({ ok: true, result: true }),
-    deleteForumTopic: () => ({ ok: true, result: true }),
+    createConversation: (o) => ({ ok: true, result: { messageThreadId: 1, name: o.name } }),
+    renameConversation: () => ({ ok: true, result: true }),
+    archiveConversation: () => ({ ok: true, result: true }),
+    unarchiveConversation: () => ({ ok: true, result: true }),
+    deleteConversation: () => ({ ok: true, result: true }),
   };
   const client = {} as Record<string, Handler>;
   for (const m of METHODS) {
