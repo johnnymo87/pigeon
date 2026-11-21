@@ -16,7 +16,7 @@ describe("wrangler.toml observability configuration", () => {
     expect(blockContent).toMatch(/^\s*enabled\s*=\s*true\b/m);
   });
 
-  test("Telegram's vars are gone from [vars] (the deployed values are inert and removed in the dashboard)", () => {
+  test("Telegram's vars are gone from [vars] (the deployed ones were removed by pigeon-4ogz.26)", () => {
     const code = wranglerToml
       .split("\n")
       .filter((line) => !line.trim().startsWith("#"))
@@ -29,7 +29,7 @@ describe("wrangler.toml observability configuration", () => {
     ]) {
       expect(code).not.toContain(name);
     }
-    // keep_vars must stay on: it is what keeps the dashboard-set SLACK_* vars.
+    // keep_vars must stay on: `wrangler deploy` with it off also drops the secrets.
     expect(code).toMatch(/^keep_vars\s*=\s*true\b/m);
   });
 });
