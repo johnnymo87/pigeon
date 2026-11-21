@@ -182,8 +182,15 @@ coordinator's own notifications go through `getBindingForSession`, never through
 carry-over cannot be lazy. The flip runbook step is a D1 batch: for each binding whose session
 belongs to the machine, create the Slack named channel if it does not exist (at the flip, not on first use) and
 re-point the binding's `chat_id` to `slack:<team>`. Unflip is the inverse batch. Both are a script
-in the repo (`scripts/slack-flip.ts <machine> on|off`) that also puts or deletes the secret, and
-both directions are tested.
+in the repo (`packages/worker/scripts/slack-flip.mjs <machine> on|off`) that also puts or deletes the
+secret, and both directions are tested. The batch is the worker route `POST /topics/named/rehome`,
+which moves a machine's bindings only toward the transport the worker sees it on (so `on` puts the
+secret first and `off` deletes it first, and the script waits out propagation), pages with a cursor
+so a `conversations.create` 429 is retried rather than skipped, and accepts any machine key, since
+it can only converge: it never takes a key another machine's session holds in the target chat, and
+never moves a `_`-prefixed key onto Slack. The script sweeps once more two minutes later, because a
+daemon re-bind landing on an isolate that still sees the old transport moves a binding back. Unflip returns a binding to the one Telegram chat already holding a topic for
+its key, or to `--telegram-chat`.
 
 **`#alerts`**: a `named_topics` row with reserved key `_alerts`, found by name (the runbook creates
 it, so the incoming webhook can target it). It takes everything that goes to General today: `/alert`
