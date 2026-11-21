@@ -5,6 +5,7 @@ import {
   MAX_OUTBOUND_MEDIA_FILES,
   parseStopMedia,
   sanitizeMediaFilename,
+  withMediaExtension,
 } from "../src/outbound-media";
 
 const PNG = Buffer.from("fake png bytes").toString("base64");
@@ -72,6 +73,18 @@ describe("parseStopMedia", () => {
       { mime: "image/png", filename: "/tmp/../x/shot\u0007.png", url: `data:image/png;base64,${PNG}` },
     ]);
     expect(media[0]!.filename).toBe("shot.png");
+  });
+});
+
+describe("filename extension", () => {
+  it("names an unnamed attachment after its mime type", () => {
+    const { media } = parseStopMedia([{ mime: "image/png", filename: "file", url: `data:image/png;base64,${PNG}` }]);
+    expect(media[0]!.filename).toBe("file.png");
+  });
+
+  it("leaves a name that has an extension, and an unknown mime, alone", () => {
+    expect(withMediaExtension("shot.jpeg", "image/png")).toBe("shot.jpeg");
+    expect(withMediaExtension("blob", "application/x-thing")).toBe("blob");
   });
 });
 
