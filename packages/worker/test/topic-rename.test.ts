@@ -4,6 +4,8 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import worker from "../src/index";
 import { clearCredentialCache, sha256Hex } from "../src/credentials";
 import { getBySession } from "../src/topics";
+import { slackChatId } from "../src/chat/slack-config";
+import { envWith, mkSlackMachine, resetSlackCalls, seedChannel, slack, slackCalls, stamp, type SlackMachine } from "./slack-harness";
 
 const SHARED_KEY = "test-api-key";
 const MACHINE_KEY_A = "pgk_" + "A".repeat(43);
@@ -11,11 +13,20 @@ const MACHINE_KEY_B = "pgk_" + "B".repeat(43);
 const MACHINE_A = "mach-alpha";
 const MACHINE_B = "mach-beta";
 
-const topicsEnv = {
-  ...env,
-  TELEGRAM_TOPICS_ENABLED: "true",
-  TELEGRAM_BOT_TOKEN: "test-bot-token",
-} as Env;
+/** The workspace every topic row of this file lives in; `topicsEnv` carries its secret. */
+let machine: SlackMachine;
+let CHAT = "";
+let topicsEnv: Env;
+
+/** A seeded topic row over a conversation Slack knows: its thread is that conversation's handle. */
+async function slackThread(): Promise<{ handle: number; channelId: string }> {
+  const channelId = `CR${stamp()}`.toUpperCase();
+  return { handle: await seedChannel(machine.ws.teamId, channelId), channelId };
+}
+
+/** What Slack names a session's channel: the title's slug, then 8 characters of the id. */
+const sid8 = (sessionId: string) =>
+  sessionId.replace(/^[a-z]{3}_/i, "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 8);
 
 async function addMachineKey(key: string, machineId: string): Promise<void> {
   await env.DB.prepare(
@@ -71,9 +82,13 @@ beforeAll(async () => {
   for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
     await env.DB.prepare(statement).run();
   }
+  machine = await mkSlackMachine();
+  CHAT = slackChatId(machine.ws);
+  topicsEnv = envWith([machine], { TELEGRAM_TOPICS_ENABLED: "true" });
 });
 
 beforeEach(async () => {
+  resetSlackCalls();
   fetchMock.activate();
   fetchMock.disableNetConnect();
   clearCredentialCache();
@@ -183,9 +198,9 @@ describe("POST /topics/rename", () => {
 
     await env.DB.prepare(
       `INSERT OR REPLACE INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at)
-       VALUES ('-1001234567890', 'sw:main', ?, ?)`,
+       VALUES (?, 'sw:main', ?, ?)`,
     )
-      .bind(sessionId, Date.now())
+      .bind(CHAT, sessionId, Date.now())
       .run();
 
     const res = await callRename({
@@ -227,7 +242,7 @@ describe("POST /topics/rename", () => {
     await seedSession(sessionId, MACHINE_A);
     await seedTopic({
       sessionId,
-      chatId: "-1001234567890",
+      chatId: CHAT,
       threadId: null,
       name: "Old Provisional",
     });
@@ -241,31 +256,20 @@ describe("POST /topics/rename", () => {
     expect(await res.json()).toEqual({ renamed: false, reason: "no_topic" });
   });
 
-  it("happy path: edits Telegram with '<title> · ~/dir', writes D1 name with name_provisional=0, leaves sessions.label untouched", async () => {
+  it("happy path: renames the channel and topic line to '<title> · ~/dir', writes D1 name with name_provisional=0, leaves sessions.label untouched", async () => {
     const sessionId = "ses_rename_happy";
-    const chatId = "-1001234567890";
-    const threadId = 884411;
+    const { handle, channelId } = await slackThread();
     await seedSession(sessionId, MACHINE_A, "Old Session Label");
     await seedTopic({
       sessionId,
-      chatId,
-      threadId,
+      chatId: CHAT,
+      threadId: handle,
       name: "Old Provisional · ~/dir",
       provisional: 1,
     });
-
-    let capturedEditPayload: any;
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-      .reply((opts: any) => {
-        capturedEditPayload = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
-        return {
-          statusCode: 200,
-          data: JSON.stringify({ ok: true, result: true }),
-          responseOptions: { headers: { "Content-Type": "application/json" } },
-        };
-      });
+    slack("conversations.info", { ok: true, channel: { name: "old-provisional", topic: { value: "Old" } } });
+    slack("conversations.rename", { ok: true });
+    slack("conversations.setTopic", { ok: true });
 
     const res = await callRename({
       sessionId,
@@ -277,11 +281,12 @@ describe("POST /topics/rename", () => {
     const expectedName = "Fix Authentication Bug · ~/projects/pigeon";
     expect(await res.json()).toEqual({ renamed: true, name: expectedName });
 
-    expect(capturedEditPayload).toEqual({
-      chat_id: chatId,
-      message_thread_id: threadId,
-      name: expectedName,
-    });
+    const rename = slackCalls.find((c) => c.method === "conversations.rename");
+    expect(rename?.params.get("channel")).toBe(channelId);
+    expect(rename?.params.get("name")).toBe(`fix-authentication-bug-${sid8(sessionId)}`);
+    expect(slackCalls.find((c) => c.method === "conversations.setTopic")?.params.get("topic")).toBe(
+      `${expectedName} · 🆔 ${sessionId}`,
+    );
 
     // Verify D1 topic row updated
     const topic = await getBySession(env.DB, sessionId);
@@ -301,54 +306,40 @@ describe("POST /topics/rename", () => {
     ["a provisional, directory-only topic", "~/projects/pigeon", 1],
   ])("keeps the current directory suffix of %s when the caller sends no dir", async (_kind, oldName, provisional) => {
     const sessionId = `ses_keep_dir_${provisional}`;
+    const { handle } = await slackThread();
     await seedSession(sessionId, MACHINE_A);
-    await seedTopic({ sessionId, chatId: "-1001234567890", threadId: 884500 + provisional, name: oldName, provisional });
-
-    let captured: any;
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-      .reply((opts: any) => {
-        captured = typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body;
-        return {
-          statusCode: 200,
-          data: JSON.stringify({ ok: true, result: true }),
-          responseOptions: { headers: { "Content-Type": "application/json" } },
-        };
-      });
+    await seedTopic({ sessionId, chatId: CHAT, threadId: handle, name: oldName, provisional });
+    slack("conversations.info", { ok: true, channel: { name: "old", topic: { value: "Old" } } });
+    slack("conversations.rename", { ok: true });
+    slack("conversations.setTopic", { ok: true });
 
     const res = await callRename({ sessionId, title: "New work", dir: "" });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ renamed: true, name: "New work · ~/projects/pigeon" });
-    expect(captured.name).toBe("New work · ~/projects/pigeon");
+    expect(slackCalls.find((c) => c.method === "conversations.setTopic")?.params.get("topic")).toBe(
+      `New work · ~/projects/pigeon · 🆔 ${sessionId}`,
+    );
   });
 
-  it("treats TOPIC_NOT_MODIFIED as success, updating D1 and returning 200", async () => {
+  it("treats an already-current channel name and topic as success, updating D1 and returning 200", async () => {
+    // The Slack counterpart of Telegram's TOPIC_NOT_MODIFIED: nothing to edit, and the D1 write
+    // (which follows the provider call) must still happen so a repeated /rename converges.
     const sessionId = "ses_topic_not_modified";
-    const chatId = "-1001234567890";
-    const threadId = 884422;
+    const { handle } = await slackThread();
     await seedSession(sessionId, MACHINE_A);
     await seedTopic({
       sessionId,
-      chatId,
-      threadId,
+      chatId: CHAT,
+      threadId: handle,
       name: "Stale Name",
       provisional: 1,
     });
-
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-      .reply(() => ({
-        statusCode: 400,
-        data: JSON.stringify({
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: TOPIC_NOT_MODIFIED",
-        }),
-        responseOptions: { headers: { "Content-Type": "application/json" } },
-      }));
+    const expectedName = "Already Renamed · ~/projects/pigeon";
+    slack("conversations.info", {
+      ok: true,
+      channel: { name: `already-renamed-${sid8(sessionId)}`, topic: { value: `${expectedName} · 🆔 ${sessionId}` } },
+    });
 
     const res = await callRename({
       sessionId,
@@ -357,39 +348,26 @@ describe("POST /topics/rename", () => {
     });
 
     expect(res.status).toBe(200);
-    const expectedName = "Already Renamed · ~/projects/pigeon";
     expect(await res.json()).toEqual({ renamed: true, name: expectedName });
+    expect(slackCalls.map((c) => c.method)).toEqual(["conversations.info"]);
 
     const topic = await getBySession(env.DB, sessionId);
     expect(topic?.name).toBe(expectedName);
     expect(topic?.name_provisional).toBe(0);
   });
 
-  it("returns 502 telegram_failed and leaves D1 untouched when Telegram fails", async () => {
+  it("returns 502 telegram_failed and leaves D1 untouched when the provider fails", async () => {
     const sessionId = "ses_tg_fail";
-    const chatId = "-1001234567890";
-    const threadId = 884433;
+    const { handle } = await slackThread();
     await seedSession(sessionId, MACHINE_A);
     await seedTopic({
       sessionId,
-      chatId,
-      threadId,
+      chatId: CHAT,
+      threadId: handle,
       name: "Untouched Name",
       provisional: 1,
     });
-
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-      .reply(() => ({
-        statusCode: 400,
-        data: JSON.stringify({
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: chat is not a forum",
-        }),
-        responseOptions: { headers: { "Content-Type": "application/json" } },
-      }));
+    slack("conversations.info", { ok: false, error: "missing_scope" });
 
     const res = await callRename({
       sessionId,

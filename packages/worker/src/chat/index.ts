@@ -55,18 +55,19 @@ export interface SlackContext {
 /**
  * The transport for a chat address.
  *
- * `telegram` replaces the Telegram transport only (tests inject fakes this way, through the
- * existing `tgClient` options); a Slack address never reaches it. `slack` is what a Slack address
- * needs: without it, or when no workspace is configured for the address's team, the address gets
- * the `SLACK_UNAVAILABLE` guard. A numeric address ignores it, so with no Slack secret every
- * call behaves exactly as before Slack existed.
+ * `transport` replaces whatever the address would pick (tests inject fakes this way, through the
+ * `transport` options of the topic modules), for a Slack address as much as a numeric one. `slack`
+ * is what a Slack address needs: without it, or when no workspace is configured for the address's
+ * team, the address gets the `SLACK_UNAVAILABLE` guard. A numeric address ignores it, so with no
+ * Slack secret every call behaves exactly as before Slack existed.
  */
 export function transportForChat(
   chatId: string | number,
   botToken: string,
-  telegram?: ChatTransport,
+  transport?: ChatTransport,
   slack?: SlackContext,
 ): ChatTransport {
+  if (transport) return transport;
   if (isSlackChatId(chatId)) {
     const team = teamIdOfChat(chatId);
     const ws = slack && team ? slackWorkspaceForTeam(slack.env, team) : null;
@@ -80,5 +81,5 @@ export function transportForChat(
     }
     return SLACK_UNAVAILABLE;
   }
-  return telegram ?? createTelegramClient(botToken);
+  return createTelegramClient(botToken);
 }

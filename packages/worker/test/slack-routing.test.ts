@@ -410,7 +410,7 @@ describe("supersede", () => {
         botToken: "unused",
         supersede: true,
         env: envFor([m]),
-        tgClient: {
+        transport: {
           ...createTelegramClient("unused"),
           createForumTopic: async (o: { name: string }) => {
             created.push(thread);
@@ -500,7 +500,7 @@ describe("supersede", () => {
       title: "T",
       botToken: "unused",
       supersede: true,
-      tgClient: {
+      transport: {
         ...never,
         createForumTopic: async () => {
           throw new Error("must not create");
@@ -567,7 +567,7 @@ describe("supersede", () => {
         botToken: "unused",
         supersede: true,
         env: e,
-        tgClient: FOREIGN_CREATE(created, 4242),
+        transport: FOREIGN_CREATE(created, 4242),
       });
       expect(res).toMatchObject({ ok: true, messageThreadId: 4242, created: true });
       expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(seeded?.channelId);
@@ -597,7 +597,7 @@ describe("supersede", () => {
         botToken: "unused",
         supersede: true,
         env: e,
-        tgClient: FOREIGN_CREATE(created, 4243),
+        transport: FOREIGN_CREATE(created, 4243),
         delayFn: async () => {
           if (++polls !== 1) return;
           // The rival gave up and the machine's other-transport row took its place.
@@ -625,7 +625,7 @@ describe("supersede", () => {
       title: "T",
       botToken: "unused",
       supersede: true,
-      tgClient: {
+      transport: {
         ...createTelegramClient("unused"),
         createForumTopic: async (o) => {
           // While the 57 s create is in flight, the row moves to Slack.

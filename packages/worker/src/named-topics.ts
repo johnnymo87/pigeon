@@ -105,14 +105,14 @@ export async function resolveNamedTopic(
     staleThreadId?: number;
     botToken: string;
     now?: number;
-    /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
-    tgClient?: ChatTransport;
+    /** Replaces the transport for ANY address, Slack included (tests). */
+    transport?: ChatTransport;
     /** The worker env, which a Slack address needs for its workspace secret. */
     env?: Env;
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.transport, opts.env ? { env: opts.env, db } : undefined);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 

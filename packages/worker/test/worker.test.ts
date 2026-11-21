@@ -24,6 +24,7 @@ import {
   isAllowedChatId,
   generateToken,
   handleSendNotification,
+  handleEditNotification,
   alertRelocation,
 } from "../src/notifications";
 import {
@@ -89,6 +90,29 @@ import {
   TELEGRAM_SLOW_CALL_MS,
 } from "../src/telegram";
 import { withD1, StorageError } from "../src/d1";
+import d1Schema from "../src/d1-schema.sql?raw";
+import { handleTopicLookup } from "../src/topic-lookup";
+import { SLACK_HANDLE_MIN, slackChatId } from "../src/chat/slack-config";
+import {
+  envWith,
+  fakeSlack,
+  fakeTransport,
+  mkSlackMachine,
+  postJson,
+  posted,
+  resetSlackCalls,
+  results,
+  seedAlerts,
+  seedChannel,
+  seedSession,
+  seedSlackTopic,
+  slack,
+  slackCalls,
+  slackCreate,
+  slackOf,
+  stamp,
+  type SlackMachine,
+} from "./slack-harness";
 
 // ─── Global D1 Schema Setup ─────────────────────────────────────────────
 
@@ -178,6 +202,10 @@ const d1SchemaStatements = [
 
 beforeAll(async () => {
   for (const stmt of d1SchemaStatements) {
+    await env.DB.prepare(stmt).run();
+  }
+  // The shipped schema as well: the Slack tables, machine credentials, ...
+  for (const stmt of d1Schema.split(";").map((x) => x.trim()).filter(Boolean)) {
     await env.DB.prepare(stmt).run();
   }
 });
@@ -276,26 +304,6 @@ async function insertCommandRow(row: {
       row.ackedAt ?? null,
     )
     .run();
-}
-
-function mockTelegramSuccess(messageId: number) {
-  fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-    .reply(200, JSON.stringify({ ok: true, result: { message_id: messageId } }), {
-      headers: { "Content-Type": "application/json" },
-    });
-}
-
-function mockTelegramFailure(description: string) {
-  fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-    .reply(
-      200,
-      JSON.stringify({ ok: false, error_code: 400, description }),
-      { headers: { "Content-Type": "application/json" } },
-    );
 }
 
 // ─── Smoke Tests ───────────────────────────────────────────────────────
@@ -492,7 +500,7 @@ describe("POST /sessions/register", () => {
 describe("session cap and high-water alert (pigeon-bea)", () => {
   afterEach(async () => {
     try {
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock.get("https://slack.com").cleanMocks();
     } catch {}
     await env.DB.prepare(
       "DELETE FROM sessions WHERE session_id LIKE 'ses_cap_%' OR session_id LIKE 'ses_hw_%'"
@@ -607,33 +615,22 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       await handleSessionRequest(env.DB, env, req, "register");
     }
 
-    let sentText = "";
+    const hwMachine = await mkSlackMachine();
+    await seedAlerts(hwMachine.ws);
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        200,
-        (opts: Record<string, unknown>) => {
-          try {
-            const rawBody = opts.body;
-            const bodyStr = typeof rawBody === "string" ? rawBody : new TextDecoder().decode(rawBody as ArrayBuffer);
-            const parsed = JSON.parse(bodyStr) as { text?: string };
-            sentText = parsed.text ?? "";
-          } catch {}
-          return JSON.stringify({ ok: true, result: { message_id: 1234 } });
-        },
-        { headers: { "Content-Type": "application/json" } },
-      );
+    slack("chat.postMessage", posted("CALERTS"));
 
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: "12345678" } as Env;
+    // The alert goes to the first allowlisted chat, here the workspace's `#alerts`.
+    const testEnv = envWith([hwMachine], { ALLOWED_CHAT_IDS: slackChatId(hwMachine.ws) });
     const result = await checkSessionHighWaterAlert(env.DB, testEnv, {
       maxSessions,
       thresholdRatio: 0.8,
     });
+    const sentText = slackCalls[0]?.params.get("text") ?? "";
 
-    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
 
     const expectedPct = Math.round(((initialCount + 8) / maxSessions) * 100);
@@ -657,20 +654,15 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       await handleSessionRequest(env.DB, env, req, "register");
     }
 
+    const hwMachine = await mkSlackMachine();
+    await seedAlerts(hwMachine.ws);
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        500,
-        JSON.stringify({ ok: false, error_code: 500, description: "Telegram network error" }),
-        { headers: { "Content-Type": "application/json" } },
-      );
+    slack("chat.postMessage", { ok: false, error: "fatal_error" }, 500);
 
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: "12345678" } as Env;
+    const testEnv = envWith([hwMachine], { ALLOWED_CHAT_IDS: slackChatId(hwMachine.ws) });
     // Should NOT throw
     await expect(
       checkSessionHighWaterAlert(env.DB, testEnv, {
@@ -679,7 +671,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
       }),
     ).resolves.toBeDefined();
 
-    fetchMock.get("https://api.telegram.org").cleanMocks();
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
     expect(spy).toHaveBeenCalled();
     spy.mockRestore();
@@ -929,7 +921,7 @@ describe("POST /sessions/unregister", () => {
   test("bound session unregistered -> binding row gone", async () => {
     const sessionId = `sess-unreg-bound-${Date.now()}`;
     const key = `test:unreg-key-${Date.now()}`;
-    const chat = String(CHAT_ID_NUM);
+    const chat = "slack:TUNREG";
     const now = Date.now();
     await registerSession(sessionId, "devbox");
     await env.DB.prepare(
@@ -962,45 +954,67 @@ describe("GET /sessions", () => {
 // ─── Topic Lookup ──────────────────────────────────────────────────────
 
 describe("POST /topics/lookup", () => {
+  // Rows live in one Slack workspace; an entry carries the conversation's archive url.
+  let lm: SlackMachine;
+  let lEnv: Env;
+  let CHAT: string;
+  const channels = new Map<string, string>();
+
+  beforeAll(async () => {
+    lm = await mkSlackMachine({ domain: "acme" });
+    lEnv = envWith([lm]);
+    CHAT = slackChatId(lm.ws);
+  });
+
+  /** A row over a conversation Slack knows, unless the thread is null (a reservation). */
   async function seedTopic(row: {
     sessionId: string;
-    chatId: string;
-    threadId: number | null;
+    threadId: "new" | null;
     state?: "open" | "closed";
-  }): Promise<void> {
+  }): Promise<number | null> {
+    let thread: number | null = null;
+    if (row.threadId === "new") {
+      const channelId = `CL${stamp()}`.toUpperCase();
+      thread = await seedChannel(lm.ws.teamId, channelId);
+      channels.set(row.sessionId, channelId);
+    }
     await env.DB.prepare(
       `INSERT OR REPLACE INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-      .bind(row.sessionId, "m1", row.chatId, row.threadId, "n", row.state ?? "open", 1, 1)
+      .bind(row.sessionId, "m1", CHAT, thread, "n", row.state ?? "open", 1, 1)
       .run();
+    return thread;
   }
+  const url = (sessionId: string) => `https://acme.slack.com/archives/${channels.get(sessionId)}`;
 
-  function lookup(body: unknown, headers: Record<string, string> = authHeaders): Promise<Response> {
-    return SELF.fetch("https://worker/topics/lookup", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+  function lookup(body: unknown, key: string | null = "test-api-key"): Promise<Response> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (key !== null) headers.Authorization = `Bearer ${key}`;
+    return handleTopicLookup(
+      env.DB,
+      lEnv,
+      new Request("https://worker/topics/lookup", { method: "POST", headers, body: JSON.stringify(body) }),
+    );
   }
 
   test("requires auth", async () => {
-    const res = await lookup({ sessionIds: ["x"] }, { "Content-Type": "application/json" });
+    const res = await lookup({ sessionIds: ["x"] }, null);
     expect(res.status).toBe(401);
   });
 
   test("returns the topic for each known session and null for unknown ones", async () => {
-    await seedTopic({ sessionId: "tl-open", chatId: "-1001234567890", threadId: 42 });
-    await seedTopic({ sessionId: "tl-closed", chatId: "-1001234567890", threadId: 43, state: "closed" });
-    await seedTopic({ sessionId: "tl-reserved", chatId: "-1001234567890", threadId: null });
+    const t1 = await seedTopic({ sessionId: "tl-open", threadId: "new" });
+    const t2 = await seedTopic({ sessionId: "tl-closed", threadId: "new", state: "closed" });
+    await seedTopic({ sessionId: "tl-reserved", threadId: null });
 
     const res = await lookup({ sessionIds: ["tl-open", "tl-closed", "tl-reserved", "tl-missing"] });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       topics: {
-        "tl-open": { chatId: "-1001234567890", messageThreadId: 42, state: "open" },
-        "tl-closed": { chatId: "-1001234567890", messageThreadId: 43, state: "closed" },
-        "tl-reserved": { chatId: "-1001234567890", messageThreadId: null, state: "open" },
+        "tl-open": { chatId: CHAT, messageThreadId: t1, state: "open", url: url("tl-open") },
+        "tl-closed": { chatId: CHAT, messageThreadId: t2, state: "closed", url: url("tl-closed") },
+        "tl-reserved": { chatId: CHAT, messageThreadId: null, state: "open", url: null },
         "tl-missing": null,
       },
     });
@@ -1022,10 +1036,10 @@ describe("POST /topics/lookup", () => {
   });
 
   test("duplicate ids are answered once", async () => {
-    await seedTopic({ sessionId: "tl-dup", chatId: "-1001234567890", threadId: 77 });
+    const t = await seedTopic({ sessionId: "tl-dup", threadId: "new" });
     const res = await lookup({ sessionIds: ["tl-dup", "tl-dup"] });
     expect(await res.json()).toEqual({
-      topics: { "tl-dup": { chatId: "-1001234567890", messageThreadId: 77, state: "open" } },
+      topics: { "tl-dup": { chatId: CHAT, messageThreadId: t, state: "open", url: url("tl-dup") } },
     });
   });
 });
@@ -1103,132 +1117,219 @@ describe("topicsEnabled", () => {
 // ─── Notification: Integration Tests ───────────────────────────────────
 
 describe("POST /notifications/send", () => {
-  const SESSION_ID = "notif-session";
-  const CHAT_ID = "8248645256"; // Matches ALLOWED_CHAT_IDS in wrangler.toml
+  let nm: SlackMachine;
+  let nEnv: Env;
+  let SESSION_ID: string;
+  let channelId: string;
+
+  const sendN = (body: Record<string, unknown>, key: string | null = nm.key, e: Env = nEnv) =>
+    handleSendNotification(
+      env.DB,
+      e,
+      key === null
+        ? new Request("https://worker/notifications/send", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          })
+        : postJson("/notifications/send", key, body),
+    );
 
   beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    await registerSession(SESSION_ID, "machine-1", "test");
+    nm = await mkSlackMachine();
+    nEnv = envWith([nm]);
+    SESSION_ID = await seedSession(nm.machineId, "test");
+    ({ channelId } = await seedSlackTopic(SESSION_ID, nm.machineId, nm.ws));
   });
 
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
   });
 
   it("requires authentication", async () => {
-    const res = await SELF.fetch("https://worker/notifications/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sessionId: SESSION_ID, chatId: CHAT_ID, text: "hello" }),
-    });
+    const res = await sendN({ sessionId: SESSION_ID, text: "hello" }, null);
     expect(res.status).toBe(401);
   });
 
   it("validates required fields", async () => {
-    const res = await sendNotification({ sessionId: SESSION_ID });
+    const res = await sendN({ sessionId: SESSION_ID });
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("sessionId, chatId, and text required");
   });
 
   it("returns 404 for unknown session", async () => {
-    const res = await sendNotification({
-      sessionId: "nonexistent",
-      chatId: CHAT_ID,
-      text: "hello",
-    });
+    const res = await sendN({ sessionId: "nonexistent", text: "hello" });
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("Session not found");
   });
 
-  it("returns 403 for disallowed chat ID", async () => {
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: "999999",
-      text: "hello",
-    });
+  it("refuses a principal that is not on a workspace (the shared key) with 403", async () => {
+    const res = await sendN({ sessionId: SESSION_ID, chatId: slackChatId(nm.ws), text: "hello" }, "test-api-key");
     expect(res.status).toBe(403);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("Chat ID not allowed");
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("sends notification and returns messageId + token", async () => {
-    mockTelegramSuccess(42);
+    slack("chat.postMessage", posted(channelId));
 
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "Session stopped",
-    });
+    const res = await sendN({ sessionId: SESSION_ID, text: "Session stopped" });
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as { ok: boolean; messageId: number; token: string };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(42);
+    expect(body.messageId).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
     expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(slackOf("chat.postMessage")[0]?.params.get("channel")).toBe(channelId);
   });
 
-  it("passes reply_markup to Telegram when provided", async () => {
-    mockTelegramSuccess(43);
+  it("passes reply_markup to the provider when provided", async () => {
+    slack("chat.postMessage", posted(channelId));
     const markup = {
       inline_keyboard: [[{ text: "Approve", callback_data: "approve" }]],
     };
 
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "Approve?",
-      replyMarkup: markup,
-    });
+    const res = await sendN({ sessionId: SESSION_ID, text: "Approve?", replyMarkup: markup });
 
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; messageId: number };
+    const body = (await res.json()) as { ok: boolean };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(43);
+    const blocks = JSON.parse(slackCalls[0]!.params.get("blocks") ?? "[]") as Array<{ type: string; elements?: unknown[] }>;
+    expect(blocks.find((b) => b.type === "actions")?.elements).toMatchObject([{ type: "button", value: "approve" }]);
   });
 
-  it("returns 502 when Telegram API fails", async () => {
-    mockTelegramFailure("Bad Request: chat not found");
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "hello",
-    });
+  it("returns 502 when the provider fails", async () => {
+    slack("chat.postMessage", { ok: false, error: "fatal_error" }, 500);
+    const res = await sendN({ sessionId: SESSION_ID, text: "hello" });
     expect(res.status).toBe(502);
-    const body = (await res.json()) as { error: string; details: unknown };
+    const body = (await res.json()) as { error: string; details: unknown; errorClass?: string };
     expect(body.error).toBe("Telegram API error");
+    expect(body.errorClass).toBe("upstream");
   });
 
-  it("returns 429 when Telegram rate limits with retryAfter", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        429,
-        JSON.stringify({
-          ok: false,
-          error_code: 429,
-          description: "Too Many Requests: retry after 17",
-          parameters: { retry_after: 17 },
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      );
+  it("returns 429 when the provider rate limits with retryAfter", async () => {
+    slack("chat.postMessage", { ok: false, error: "ratelimited" }, 429, { "retry-after": "17" });
 
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "hello",
-    });
+    const res = await sendN({ sessionId: SESSION_ID, text: "hello" });
 
     expect(res.status).toBe(429);
     const body = (await res.json()) as { error: string; retryAfter: number };
-    expect(body).toEqual({
-      error: "rate_limited",
-      retryAfter: 17,
-    });
+    expect(body).toMatchObject({ error: "rate_limited", retryAfter: 17 });
   });
+
+  it("stores unique tokens per notification", async () => {
+    slack("chat.postMessage", posted(channelId, "1.1"));
+    const res1 = await sendN({ sessionId: SESSION_ID, text: "first" });
+    const body1 = (await res1.json()) as { token: string };
+
+    slack("chat.postMessage", posted(channelId, "1.2"));
+    const res2 = await sendN({ sessionId: SESSION_ID, text: "second" });
+    const body2 = (await res2.json()) as { token: string };
+
+    expect(body1.token).not.toBe(body2.token);
+  });
+
+  it("reuses daemon token from callback_data instead of generating own", async () => {
+    const DAEMON_TOKEN = "daemon-supplied-token-abc";
+    slack("chat.postMessage", posted(channelId));
+
+    const res = await sendN({
+      sessionId: SESSION_ID,
+      text: "Question notification",
+      replyMarkup: {
+        inline_keyboard: [
+          [
+            { text: "Blue", callback_data: `cmd:${DAEMON_TOKEN}:q0` },
+            { text: "Green", callback_data: `cmd:${DAEMON_TOKEN}:q1` },
+          ],
+        ],
+      },
+    });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; token: string; messageId: number };
+    expect(body.ok).toBe(true);
+    expect(body.token).toBe(DAEMON_TOKEN);
+  });
+
+  it("generates fresh token when replyMarkup has no cmd: callback_data", async () => {
+    slack("chat.postMessage", posted(channelId));
+
+    const res = await sendN({ sessionId: SESSION_ID, text: "Stop notification", replyMarkup: { inline_keyboard: [] } });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; token: string };
+    expect(body.ok).toBe(true);
+    // Token should be a base64url string (not a specific daemon token)
+    expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(body.token).not.toBe("");
+  });
+
+  /** A named topic bound to `sessionId`, over a conversation Slack knows. */
+  async function bindNamedTopic(sessionId: string, key: string): Promise<{ handle: number; channel: string }> {
+    const channel = `CB${stamp()}`.toUpperCase();
+    const handle = await seedChannel(nm.ws.teamId, channel);
+    const now = Date.now();
+    await env.DB.prepare(
+      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
+    ).bind(slackChatId(nm.ws), key, handle, now, now).run();
+    await env.DB.prepare(
+      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    ).bind(slackChatId(nm.ws), key, sessionId, now).run();
+    return { handle, channel };
+  }
+
+  it("bound session's notification -> sent with the named thread id, no topics row", async () => {
+    const sessionId = await seedSession(nm.machineId, "test");
+    const { channel } = await bindNamedTopic(sessionId, `test:notif-key-${stamp()}`);
+    slack("chat.postMessage", posted(channel));
+
+    const res = await sendN({
+      sessionId,
+      text: "hello in bound named topic",
+      title: "Bound Title",
+      dir: "pigeon",
+      threaded: true,
+    });
+    expect(res.status).toBe(200);
+    expect(slackOf("chat.postMessage")[0]?.params.get("channel")).toBe(channel);
+
+    // Verify no session topic was created in topics table
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+  });
+
+  it("bound session's notification with thread_not_found skips T2.7 and relocates to General", async () => {
+    const sessionId = await seedSession(nm.machineId, "test");
+    const { channel } = await bindNamedTopic(sessionId, `test:notif-key-del-${stamp()}`);
+    const alerts = await seedAlerts(nm.ws);
+    // First send to the bound channel finds it gone, the second relocates to #alerts and succeeds.
+    slack("chat.postMessage", { ok: false, error: "channel_not_found" });
+    slack("chat.postMessage", posted(alerts));
+
+    const res = await sendN({ sessionId, text: "hello in deleted thread", threaded: true });
+    expect(res.status).toBe(200);
+
+    // Relocated to General (the workspace's #alerts)
+    const posts = slackOf("chat.postMessage");
+    expect(posts).toHaveLength(2);
+    expect(posts[0]!.params.get("channel")).toBe(channel);
+    expect(posts[1]!.params.get("channel")).toBe(alerts);
+
+    // Verify no session topic was created in topics table (T2.7 did NOT run)
+    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+    expect(topicRow).toBeNull();
+    expect(slackOf("conversations.create")).toHaveLength(0);
+  });
+});
+
 
 // ─── Telegram Client Module Classifier ─────────────────────────────────────
 
@@ -1731,180 +1832,6 @@ describe("telegram client module classifier", () => {
   });
 });
 
-  it("stores unique tokens per notification", async () => {
-    mockTelegramSuccess(100);
-    const res1 = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "first",
-    });
-    const body1 = (await res1.json()) as { token: string };
-
-    mockTelegramSuccess(101);
-    const res2 = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "second",
-    });
-    const body2 = (await res2.json()) as { token: string };
-
-    expect(body1.token).not.toBe(body2.token);
-  });
-
-  it("reuses daemon token from callback_data instead of generating own", async () => {
-    const DAEMON_TOKEN = "daemon-supplied-token-abc";
-    mockTelegramSuccess(9001);
-
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "Question notification",
-      replyMarkup: {
-        inline_keyboard: [
-          [
-            { text: "Blue", callback_data: `cmd:${DAEMON_TOKEN}:q0` },
-            { text: "Green", callback_data: `cmd:${DAEMON_TOKEN}:q1` },
-          ],
-        ],
-      },
-    });
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; token: string; messageId: number };
-    expect(body.ok).toBe(true);
-    expect(body.token).toBe(DAEMON_TOKEN);
-  });
-
-  it("generates fresh token when replyMarkup has no cmd: callback_data", async () => {
-    mockTelegramSuccess(9002);
-
-    const res = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "Stop notification",
-      replyMarkup: { inline_keyboard: [] },
-    });
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { ok: boolean; token: string };
-    expect(body.ok).toBe(true);
-    // Token should be a base64url string (not a specific daemon token)
-    expect(body.token).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(body.token).not.toBe("");
-  });
-
-  it("bound session's notification -> sent with the named thread id, no topics row", async () => {
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-    const sessionId = `ses_notif_bound_${Date.now()}`;
-    const key = `test:notif-key-${Date.now()}`;
-    const threadId = 887766;
-    const now = Date.now();
-
-    await registerSession(sessionId, "machine-bound", "test");
-
-    await env.DB.prepare(
-      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
-    ).bind(CHAT_ID, key, threadId, now, now).run();
-
-    await env.DB.prepare(
-      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
-    ).bind(CHAT_ID, key, sessionId, now).run();
-
-    let sentPayload: any = null;
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, (opts: any) => {
-        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-        sentPayload = JSON.parse(raw);
-        return { ok: true, result: { message_id: 9911 } };
-      });
-
-    const request = new Request("https://worker/notifications/send", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        sessionId,
-        chatId: CHAT_ID,
-        text: "hello in bound named topic",
-        title: "Bound Title",
-        dir: "pigeon",
-        threaded: true,
-      }),
-    });
-
-    const res = await handleSendNotification(env.DB, testEnv, request);
-    expect(res.status).toBe(200);
-    expect(sentPayload).not.toBeNull();
-    expect(sentPayload.message_thread_id).toBe(threadId);
-
-    // Verify no session topic was created in topics table
-    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
-    expect(topicRow).toBeNull();
-  });
-
-  it("bound session's notification with thread_not_found skips T2.7 and relocates to General", async () => {
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-    const sessionId = `ses_notif_deleted_thread_${Date.now()}`;
-    const key = `test:notif-key-del-${Date.now()}`;
-    const threadId = 887788;
-    const now = Date.now();
-
-    await registerSession(sessionId, "machine-bound", "test");
-
-    await env.DB.prepare(
-      "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Topic', ?, ?)",
-    ).bind(CHAT_ID, key, threadId, now, now).run();
-
-    await env.DB.prepare(
-      "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
-    ).bind(CHAT_ID, key, sessionId, now).run();
-
-    const sends: any[] = [];
-    // First send to topic returns thread_not_found
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(400, JSON.stringify({
-        ok: false,
-        error_code: 400,
-        description: "Bad Request: message thread not found",
-      }), { headers: { "Content-Type": "application/json" } });
-
-    // Second send relocates to General and succeeds
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, (opts: any) => {
-        const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-        sends.push(JSON.parse(raw));
-        return { ok: true, result: { message_id: 99120 } };
-      });
-
-    const request = new Request("https://worker/notifications/send", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({
-        sessionId,
-        chatId: CHAT_ID,
-        text: "hello in deleted thread",
-        threaded: true,
-      }),
-    });
-
-    const res = await handleSendNotification(env.DB, testEnv, request);
-    expect(res.status).toBe(200);
-
-    // Verify it relocated to General (no message_thread_id on the second send)
-    expect(sends).toHaveLength(1);
-    expect(sends[0].message_thread_id).toBeUndefined();
-
-    // Verify no session topic was created in topics table (T2.7 did NOT run)
-    const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
-    expect(topicRow).toBeNull();
-  });
-});
-
 // The allowed Telegram chat (vitest.config.ts) that the surviving Telegram-egress tests post into.
 const CHAT_ID_NUM = 8248645256;
 
@@ -2115,58 +2042,61 @@ describe("media endpoints", () => {
 // ─── Outbound Media: POST /notifications/send with media ──────────────
 
 describe("POST /notifications/send with media", () => {
-  const CHAT_ID = "8248645256";
+  let mm: SlackMachine;
+  let mEnv: Env;
+  let sessionId: string;
+  let channelId: string;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    // Clear any stale interceptors from previous tests
-    fetchMock.get("https://api.telegram.org").cleanMocks();
+    mm = await mkSlackMachine();
+    mEnv = envWith([mm]);
+    sessionId = await seedSession(mm.machineId, "outbound-test");
+    ({ channelId } = await seedSlackTopic(sessionId, mm.machineId, mm.ws));
   });
 
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
   });
 
-  it("sends text message then photo for image mime type", async () => {
-    const now = Date.now();
-    const sessionId = `outbound-photo-session-${now}`;
-    const textMsgId = 3_000_001 + (now % 1000);
-    const photoMsgId = 3_000_002 + (now % 1000);
-    await registerSession(sessionId, "machine-outbound", "outbound-test");
+  const sendM = (body: Record<string, unknown>) =>
+    handleSendNotification(env.DB, mEnv, postJson("/notifications/send", mm.key, { sessionId, ...body }));
 
-    // Upload a file to R2 first
-    const imageKey = `outbound/${now}-aaa/screenshot.png`;
+  /** Upload a file to R2 first, the way the daemon does. */
+  async function uploadToR2(key: string, mime: string, filename: string, content: string) {
     const uploadForm = new FormData();
-    uploadForm.append("key", imageKey);
-    uploadForm.append("mime", "image/png");
-    uploadForm.append("filename", "screenshot.png");
-    uploadForm.append("file", new Blob(["fake-png-data"], { type: "image/png" }), "screenshot.png");
+    uploadForm.append("key", key);
+    uploadForm.append("mime", mime);
+    uploadForm.append("filename", filename);
+    uploadForm.append("file", new Blob([content], { type: mime }), filename);
     await SELF.fetch("https://worker/media/upload", {
       method: "POST",
       body: uploadForm,
       headers: { Authorization: `Bearer ${API_KEY}` },
     });
+  }
 
-    // Mock sendMessage for text
+  /** The three provider steps of one file post (Slack's external upload). */
+  function expectFileUpload(fileId: string) {
+    slack("files.getUploadURLExternal", { ok: true, upload_url: `https://files.slack.com/upload/v1/${fileId}`, file_id: fileId });
     fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
+      .get("https://files.slack.com")
+      .intercept({ method: "POST", path: `/upload/v1/${fileId}` })
+      .reply(200, "OK - 1");
+    slack("files.completeUploadExternal", { ok: true, files: [{ id: fileId }] });
+  }
 
-    // Mock sendPhoto for image
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: photoMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
+  it("sends text message then photo for image mime type", async () => {
+    const now = Date.now();
+    const imageKey = `outbound/${now}-aaa/screenshot.png`;
+    await uploadToR2(imageKey, "image/png", "screenshot.png", "fake-png-data");
+    slack("chat.postMessage", posted(channelId));
+    expectFileUpload("FPHOTO1");
 
-    const res = await sendNotification({
-      sessionId,
-      chatId: CHAT_ID,
+    const res = await sendM({
       text: "Session completed with screenshot",
       media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
     });
@@ -2174,47 +2104,19 @@ describe("POST /notifications/send with media", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { ok: boolean; messageId: number };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(textMsgId);
+    expect(body.messageId).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
+    expect(slackOf("files.getUploadURLExternal")[0]?.params.get("filename")).toBe("screenshot.png");
+    expect(slackOf("files.completeUploadExternal")[0]?.params.get("channel_id")).toBe(channelId);
   });
 
   it("sends text message then document for non-image mime type", async () => {
     const now = Date.now();
-    const sessionId = `outbound-doc-session-${now}`;
-    const textMsgId = 3_100_001 + (now % 1000);
-    const docMsgId = 3_100_002 + (now % 1000);
-    await registerSession(sessionId, "machine-outbound", "outbound-test");
-
     const docKey = `outbound/${now}-bbb/report.pdf`;
-    const uploadForm = new FormData();
-    uploadForm.append("key", docKey);
-    uploadForm.append("mime", "application/pdf");
-    uploadForm.append("filename", "report.pdf");
-    uploadForm.append("file", new Blob(["fake-pdf-data"], { type: "application/pdf" }), "report.pdf");
-    await SELF.fetch("https://worker/media/upload", {
-      method: "POST",
-      body: uploadForm,
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
+    await uploadToR2(docKey, "application/pdf", "report.pdf", "fake-pdf-data");
+    slack("chat.postMessage", posted(channelId));
+    expectFileUpload("FDOC1");
 
-    // Mock sendMessage for text
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    // Mock sendDocument for non-image
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendDocument/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: docMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    const res = await sendNotification({
-      sessionId,
-      chatId: CHAT_ID,
+    const res = await sendM({
       text: "Session completed with document",
       media: [{ key: docKey, mime: "application/pdf", filename: "report.pdf" }],
     });
@@ -2222,46 +2124,17 @@ describe("POST /notifications/send with media", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { ok: boolean; messageId: number };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(textMsgId);
+    expect(slackOf("files.getUploadURLExternal")[0]?.params.get("filename")).toBe("report.pdf");
   });
 
   it("stores media message mapping for reply routing", async () => {
     const now = Date.now();
-    const sessionId = `outbound-map-session-${now}`;
-    const textMsgId = 3_200_001 + (now % 1000);
-    const photoMsgId = 3_200_002 + (now % 1000);
-    await registerSession(sessionId, "machine-outbound", "outbound-test");
-
     const imgKey = `outbound/${now}-ccc/photo.jpg`;
-    const uploadForm = new FormData();
-    uploadForm.append("key", imgKey);
-    uploadForm.append("mime", "image/jpeg");
-    uploadForm.append("filename", "photo.jpg");
-    uploadForm.append("file", new Blob(["fake-jpg"], { type: "image/jpeg" }), "photo.jpg");
-    await SELF.fetch("https://worker/media/upload", {
-      method: "POST",
-      body: uploadForm,
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
+    await uploadToR2(imgKey, "image/jpeg", "photo.jpg", "fake-jpg");
+    slack("chat.postMessage", posted(channelId));
+    expectFileUpload("FMAP1");
 
-    // Mock sendMessage + sendPhoto
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: photoMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    const res = await sendNotification({
-      sessionId,
-      chatId: CHAT_ID,
+    const res = await sendM({
       text: "Done with photo",
       media: [{ key: imgKey, mime: "image/jpeg", filename: "photo.jpg" }],
     });
@@ -2270,57 +2143,32 @@ describe("POST /notifications/send with media", () => {
     const body = await res.json() as { ok: boolean; messageId: number; token: string };
     expect(body.ok).toBe(true);
 
-    // The media message (photoMsgId) should be stored in the messages table for reply routing
-    // Verify by querying D1 directly
-    const { results: mediaMessages } = await env.DB.prepare(
-      "SELECT message_id, session_id FROM messages WHERE chat_id = ? AND message_id = ?",
-    ).bind(CHAT_ID, photoMsgId).all<{ message_id: number; session_id: string }>();
-    expect(mediaMessages).toHaveLength(1);
-    expect(mediaMessages[0]!.session_id).toBe(sessionId);
+    // The media message should be stored in the messages table for reply routing, next to the
+    // text's own row. Verify by querying D1 directly.
+    const { results: rows } = await env.DB.prepare(
+      "SELECT message_id, session_id, token FROM messages WHERE chat_id = ? AND session_id = ? ORDER BY message_id",
+    ).bind(slackChatId(mm.ws), sessionId).all<{ message_id: number; session_id: string; token: string }>();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.token)).toEqual([body.token, body.token]);
+    expect(rows.map((r) => r.message_id)).toContain(body.messageId);
   });
 
   it("backward compat: notification without media still works normally", async () => {
-    const now = Date.now();
-    const sessionId = `outbound-noMedia-session-${now}`;
-    const textMsgId = 3_300_001 + (now % 1000);
-    await registerSession(sessionId, "machine-outbound", "outbound-test");
+    slack("chat.postMessage", posted(channelId));
 
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    const res = await sendNotification({
-      sessionId,
-      chatId: CHAT_ID,
-      text: "Just text, no media",
-    });
+    const res = await sendM({ text: "Just text, no media" });
 
     expect(res.status).toBe(200);
     const body = await res.json() as { ok: boolean; messageId: number };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(textMsgId);
+    expect(slackOf("files.getUploadURLExternal")).toHaveLength(0);
   });
 
   it("continues if media key not found in R2 (best-effort)", async () => {
-    const now = Date.now();
-    const sessionId = `outbound-missing-session-${now}`;
-    const textMsgId = 3_400_001 + (now % 1000);
-    await registerSession(sessionId, "machine-outbound", "outbound-test");
-
     // Don't upload anything — key won't exist in R2
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: textMsgId } }), {
-        headers: { "Content-Type": "application/json" },
-      });
+    slack("chat.postMessage", posted(channelId));
 
-    const res = await sendNotification({
-      sessionId,
-      chatId: CHAT_ID,
+    const res = await sendM({
       text: "Text with missing media",
       media: [{ key: "outbound/nonexistent/file.jpg", mime: "image/jpeg", filename: "file.jpg" }],
     });
@@ -2329,7 +2177,7 @@ describe("POST /notifications/send with media", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { ok: boolean; messageId: number };
     expect(body.ok).toBe(true);
-    expect(body.messageId).toBe(textMsgId);
+    expect(slackOf("files.getUploadURLExternal")).toHaveLength(0);
   });
 });
 
@@ -2862,34 +2710,51 @@ describe("d1-ops", () => {
 // ─── POST /notifications/edit ─────────────────────────────────────────
 
 describe("POST /notifications/edit", () => {
-  const SESSION_ID = "edit-notif-session";
-  const CHAT_ID = "8248645256";
+  let em: SlackMachine;
+  let eEnv: Env;
+  let SESSION_ID: string;
+  let channelId: string;
   const NOTIFICATION_ID = "edit-notif-id-001";
 
   beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    await registerSession(SESSION_ID, "machine-edit", "edit-test");
+    em = await mkSlackMachine();
+    eEnv = envWith([em]);
+    SESSION_ID = await seedSession(em.machineId, "edit-test");
+    ({ channelId } = await seedSlackTopic(SESSION_ID, em.machineId, em.ws));
   });
 
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
   });
 
-  async function editNotification(body: Record<string, unknown>): Promise<Response> {
-    return SELF.fetch("https://worker/notifications/edit", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify(body),
-    });
+  async function editNotification(body: Record<string, unknown>, key: string | null = em.key): Promise<Response> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (key !== null) headers.Authorization = `Bearer ${key}`;
+    return handleEditNotification(
+      env.DB,
+      eEnv,
+      new Request("https://worker/notifications/edit", { method: "POST", headers, body: JSON.stringify(body) }),
+    );
+  }
+
+  /** Send the original notification, so a messages row (and a post to edit) exists. */
+  async function sendOriginal(notificationId: string, text: string): Promise<number> {
+    slack("chat.postMessage", posted(channelId, `1.${stamp()}`));
+    const res = await handleSendNotification(
+      env.DB,
+      eEnv,
+      postJson("/notifications/send", em.key, { sessionId: SESSION_ID, text, notificationId }),
+    );
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { messageId: number }).messageId;
   }
 
   it("returns 401 for unauthenticated requests", async () => {
-    const res = await SELF.fetch("https://worker/notifications/edit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ notificationId: NOTIFICATION_ID, text: "new text" }),
-    });
+    const res = await editNotification({ notificationId: NOTIFICATION_ID, text: "new text" }, null);
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error: "Unauthorized" });
   });
@@ -2919,53 +2784,26 @@ describe("POST /notifications/edit", () => {
   });
 
   it("edits a message by notificationId and returns ok", async () => {
-    // First, send a notification to store a message in the messages table
-    mockTelegramSuccess(555);
-    const notifRes = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "original text",
-      notificationId: NOTIFICATION_ID,
-    });
-    expect(notifRes.status).toBe(200);
-    const notifBody = (await notifRes.json()) as { messageId: number };
-    expect(notifBody.messageId).toBe(555);
+    const id = `${NOTIFICATION_ID}-${stamp()}`;
+    const messageId = await sendOriginal(id, "original text");
+    expect(messageId).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
 
-    // Now mock editMessageText
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: 555 } }), {
-        headers: { "Content-Type": "application/json" },
-      });
+    slack("chat.update", { ok: true, ts: "1.1", channel: channelId });
 
-    const editRes = await editNotification({
-      notificationId: NOTIFICATION_ID,
-      text: "updated text",
-    });
+    const editRes = await editNotification({ notificationId: id, text: "updated text" });
 
     expect(editRes.status).toBe(200);
     const editBody = (await editRes.json()) as { ok: boolean };
     expect(editBody.ok).toBe(true);
+    expect(slackOf("chat.update")[0]?.params.get("channel")).toBe(channelId);
+    expect(slackOf("chat.update")[0]?.params.get("text")).toContain("updated text");
   });
 
-  it("passes replyMarkup to editMessageText when provided", async () => {
-    const uniqueNotifId = `edit-markup-notif-${Date.now()}`;
-    mockTelegramSuccess(556);
-    const notifRes = await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "original with markup",
-      notificationId: uniqueNotifId,
-    });
-    expect(notifRes.status).toBe(200);
+  it("passes replyMarkup to the edit when provided", async () => {
+    const uniqueNotifId = `edit-markup-notif-${stamp()}`;
+    await sendOriginal(uniqueNotifId, "original with markup");
 
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: 556 } }), {
-        headers: { "Content-Type": "application/json" },
-      });
+    slack("chat.update", { ok: true, ts: "1.1", channel: channelId });
 
     const markup = { inline_keyboard: [[{ text: "Next step", callback_data: "next" }]] };
     const editRes = await editNotification({
@@ -2977,26 +2815,15 @@ describe("POST /notifications/edit", () => {
     expect(editRes.status).toBe(200);
     const editBody = (await editRes.json()) as { ok: boolean };
     expect(editBody.ok).toBe(true);
+    const blocks = JSON.parse(slackOf("chat.update")[0]!.params.get("blocks") ?? "[]") as Array<{ type: string; elements?: unknown[] }>;
+    expect(blocks.find((b) => b.type === "actions")?.elements).toMatchObject([{ type: "button", value: "next" }]);
   });
 
-  it("returns 502 when Telegram editMessageText API fails", async () => {
-    const uniqueNotifId = `edit-fail-notif-${Date.now()}`;
-    mockTelegramSuccess(557);
-    await sendNotification({
-      sessionId: SESSION_ID,
-      chatId: CHAT_ID,
-      text: "original text",
-      notificationId: uniqueNotifId,
-    });
+  it("returns 502 when the provider's edit API fails", async () => {
+    const uniqueNotifId = `edit-fail-notif-${stamp()}`;
+    await sendOriginal(uniqueNotifId, "original text");
 
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/editMessageText/ })
-      .reply(
-        200,
-        JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message not modified" }),
-        { headers: { "Content-Type": "application/json" } },
-      );
+    slack("chat.update", { ok: false, error: "cant_update_message" });
 
     const editRes = await editNotification({
       notificationId: uniqueNotifId,
@@ -3939,29 +3766,20 @@ describe("topics module and topicName", () => {
   });
 
   describe("topic manager resolveTopic", () => {
-    const topicChatId = "-1001234567890";
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-    });
+    // Provider results are scripted through an injected transport (Slack-shaped addresses).
+    const topicChatId = "slack:TTOPICMGR";
+    const FAKE_TOKEN = "fake-bot-token";
 
     it("two concurrent resolveTopic calls -> exactly one createForumTopic, both get same thread id", async () => {
       const sessionId = "ses_topic_concurrent";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
-      let createCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(200, () => {
-          createCalls++;
-          return { ok: true, result: { message_thread_id: 101, name: "pigeon · test", icon_color: 7322096 } };
-        });
+      const { client, calls } = fakeTransport({
+        createForumTopic: () => ({
+          ok: true,
+          result: { message_thread_id: 101, name: "pigeon · test", icon_color: 7322096 },
+        }),
+      });
 
       const noopDelay = async () => {};
 
@@ -3974,6 +3792,7 @@ describe("topics module and topicName", () => {
           title: "test",
           botToken,
           delayFn: noopDelay,
+          transport: client,
         }),
         resolveTopic(env.DB, {
           sessionId,
@@ -3983,14 +3802,15 @@ describe("topics module and topicName", () => {
           title: "test",
           botToken,
           delayFn: noopDelay,
+          transport: client,
         }),
       ]);
 
-      expect(createCalls).toBe(1);
+      expect(calls.createForumTopic).toHaveLength(1);
       expect(res1).toMatchObject({ ok: true, messageThreadId: 101 });
       expect(res2).toMatchObject({ ok: true, messageThreadId: 101 });
       // Exactly one caller created the topic, so exactly one carries `created` (pigeon-ud6s):
-      // whichever won the reserve. The other must not, or the auto-pin would be unpinned twice.
+      // whichever won the reserve.
       const createdFlags = [res1, res2].map((r) => (r as any).created === true);
       expect(createdFlags.filter(Boolean)).toHaveLength(1);
 
@@ -4000,7 +3820,7 @@ describe("topics module and topicName", () => {
 
     it("slow winner -> loser polls to success and shares thread id", async () => {
       const sessionId = "ses_topic_slow_winner";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
       let pollCount = 0;
 
@@ -4036,7 +3856,7 @@ describe("topics module and topicName", () => {
 
     it("winner never finalizes -> loser exhausts bound -> General fallback", async () => {
       const sessionId = "ses_topic_never_finalizes";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
       // Winner reserves but never finalizes
       await reserve(env.DB, {
@@ -4073,15 +3893,9 @@ describe("topics module and topicName", () => {
     // defer to. That path sent to General in silence.
     it("lost finalize CAS with no winner row warns that the notification will go to General", async () => {
       const sessionId = "ses_bit4_warn_no_winner";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/deleteForumTopic`, method: "POST" })
-        .reply(200, { ok: true, result: true });
-
-      const mockTgClient = {
-        ...createTelegramClient(botToken),
+      const { client, calls } = fakeTransport({
         createForumTopic: async () => {
           // A rival deletes the reservation instead of finalizing it, so the CAS below
           // matches zero rows AND the re-read finds nothing.
@@ -4091,7 +3905,7 @@ describe("topics module and topicName", () => {
             result: { message_thread_id: 606, name: "pigeon · no winner", icon_color: 7322096 },
           };
         },
-      };
+      });
 
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
@@ -4102,10 +3916,11 @@ describe("topics module and topicName", () => {
           dir: "pigeon",
           title: "no winner",
           botToken,
-          tgClient: mockTgClient,
+          transport: client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: null, reason: "finalize_lost_no_winner", transient: true });
+        expect(calls.deleteForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 606 }]);
         const warn = warnSpy.mock.calls.find(
           (c) => typeof c[0] === "string" && c[0].includes("no topic resolved"),
         );
@@ -4120,7 +3935,7 @@ describe("topics module and topicName", () => {
     // exactly the kind of load that produced the incident, and it returned null in silence.
     it("poll exhaustion warns that the notification will go to General", async () => {
       const sessionId = "ses_bit4_warn_poll_exhausted";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
       await reserve(env.DB, {
         sessionId,
@@ -4156,12 +3971,15 @@ describe("topics module and topicName", () => {
 
     it("create rejects (non-429) -> reservation row gone -> next resolveTopic wins and creates", async () => {
       const sessionId = "ses_topic_create_rejects";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: chat not found" });
+      let call = 0;
+      const { client } = fakeTransport({
+        createForumTopic: () =>
+          ++call === 1
+            ? results.error(400, "Bad Request: chat not found")
+            : { ok: true, result: { message_thread_id: 303, name: "pigeon · err" } },
+      });
 
       const res1 = await resolveTopic(env.DB, {
         sessionId,
@@ -4170,6 +3988,7 @@ describe("topics module and topicName", () => {
         dir: "pigeon",
         title: "err",
         botToken,
+        transport: client,
       });
 
       expect(res1).toEqual({
@@ -4183,11 +4002,6 @@ describe("topics module and topicName", () => {
       expect(await getBySession(env.DB, sessionId)).toBeNull();
 
       // Next resolveTopic call succeeds
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(200, { ok: true, result: { message_thread_id: 303, name: "pigeon · err" } });
-
       const res2 = await resolveTopic(env.DB, {
         sessionId,
         machineId: "devbox",
@@ -4195,20 +4009,19 @@ describe("topics module and topicName", () => {
         dir: "pigeon",
         title: "err",
         botToken,
+        transport: client,
       });
 
       expect(res2).toEqual({ ok: true, messageThreadId: 303, created: true });
       expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
     });
 
-    it("create rejects with Telegram 5xx (520) -> transient true, createError carries error_code", async () => {
+    it("create rejects with a 5xx (520) -> transient true, createError carries error_code", async () => {
       const sessionId = "ses_topic_create_520";
-      const botToken = "fake-bot-token";
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
+      const { client } = fakeTransport({
+        createForumTopic: () => results.error(520, "Unknown Error"),
+      });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -4216,7 +4029,8 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err520",
-        botToken,
+        botToken: FAKE_TOKEN,
+        transport: client,
       });
 
       expect(res).toEqual({
@@ -4230,12 +4044,10 @@ describe("topics module and topicName", () => {
 
     it("create rejects with 4xx (400 not enough rights) -> transient false, createError carries error_code", async () => {
       const sessionId = "ses_topic_create_400_rights";
-      const botToken = "fake-bot-token";
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to create a topic" });
+      const { client } = fakeTransport({
+        createForumTopic: () => results.error(400, "Bad Request: not enough rights to create a topic"),
+      });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -4243,7 +4055,8 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err400",
-        botToken,
+        botToken: FAKE_TOKEN,
+        transport: client,
       });
 
       expect(res).toEqual({
@@ -4261,7 +4074,7 @@ describe("topics module and topicName", () => {
       await reserve(env.DB, {
         sessionId,
         machineId: "devbox",
-        chatId: "-1009999999999", // different chat
+        chatId: "slack:TOTHERCHAT", // different chat
         name: "pigeon · other",
         now,
       });
@@ -4273,7 +4086,7 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "other",
-        botToken: "fake-bot-token",
+        botToken: FAKE_TOKEN,
       });
 
       expect(res).toEqual({
@@ -4286,17 +4099,8 @@ describe("topics module and topicName", () => {
 
     it("create returns 429 -> reservation gone and rate_limited propagated with retryAfter", async () => {
       const sessionId = "ses_topic_429";
-      const botToken = "fake-bot-token";
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(429, {
-          ok: false,
-          error_code: 429,
-          description: "Too Many Requests",
-          parameters: { retry_after: 15 },
-        });
+      const { client } = fakeTransport({ createForumTopic: () => results.rateLimited(15) });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -4304,7 +4108,8 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "rate",
-        botToken,
+        botToken: FAKE_TOKEN,
+        transport: client,
       });
 
       expect(res).toEqual({ ok: false, kind: "rate_limited", retryAfter: 15 });
@@ -4314,7 +4119,6 @@ describe("topics module and topicName", () => {
 
     it("stale NULL reservation (past TTL) -> steal -> create -> finalize", async () => {
       const sessionId = "ses_topic_stale_steal";
-      const botToken = "fake-bot-token";
       const now = Date.now();
       const staleTime = now - RESERVATION_TTL_MS - 5000; // 125s ago (> 120s TTL)
 
@@ -4327,14 +4131,9 @@ describe("topics module and topicName", () => {
         now: staleTime,
       });
 
-      let createCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(200, () => {
-          createCalled = true;
-          return { ok: true, result: { message_thread_id: 404, name: "pigeon · fresh" } };
-        });
+      const { client, calls } = fakeTransport({
+        createForumTopic: () => ({ ok: true, result: { message_thread_id: 404, name: "pigeon · fresh" } }),
+      });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -4342,12 +4141,13 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "fresh",
-        botToken,
+        botToken: FAKE_TOKEN,
         now,
         delayFn: async () => {},
+        transport: client,
       });
 
-      expect(createCalled).toBe(true);
+      expect(calls.createForumTopic).toHaveLength(1);
       expect(res).toEqual({ ok: true, messageThreadId: 404, created: true });
 
       const row = await getBySession(env.DB, sessionId);
@@ -4357,22 +4157,9 @@ describe("topics module and topicName", () => {
 
     it("slow original winner's finalize CAS loses -> compensating deleteForumTopic fires", async () => {
       const sessionId = "ses_topic_finalize_cas_loses";
-      const botToken = "fake-bot-token";
-
-      let deleteCalls: Array<{ chatId: string; messageThreadId: number }> = [];
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/deleteForumTopic`, method: "POST" })
-        .reply(200, (opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          deleteCalls.push({ chatId: body.chat_id, messageThreadId: body.message_thread_id });
-          return { ok: true, result: true };
-        });
 
       // Winner 1 calls resolveTopic, but right before returning from createForumTopic, Winner 2 finalizes with threadId 999
-      const mockTgClient = {
-        ...createTelegramClient(botToken),
+      const { client, calls } = fakeTransport({
         createForumTopic: async () => {
           // Right before returning from createForumTopic, Winner 2 finalizes
           await finalize(env.DB, { sessionId, messageThreadId: 999, name: "winner 2" });
@@ -4381,7 +4168,7 @@ describe("topics module and topicName", () => {
             result: { message_thread_id: 505, name: "pigeon · cas", icon_color: 7322096 },
           };
         },
-      };
+      });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -4389,20 +4176,20 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "cas",
-        botToken,
-        tgClient: mockTgClient,
+        botToken: FAKE_TOKEN,
+        transport: client,
       });
 
       // Winner 1's finalize CAS failed (message_thread_id was already 999)
       // Winner 1 executed compensating deleteForumTopic for 505
-      expect(deleteCalls).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
+      expect(calls.deleteForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 505 }]);
       // Winner 1 re-read D1 and returned Winner 2's thread id 999
       expect(res).toEqual({ ok: true, messageThreadId: 999 });
     });
 
     describe("Task T2.6: Reopen-on-closed", () => {
       const sessionId = "ses_closed_topic";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
       it("resolving a state='closed' topic calls reopenForumTopic and flips state to open", async () => {
         const now = Date.now();
@@ -4411,17 +4198,7 @@ describe("topics module and topicName", () => {
         await finalize(env.DB, { sessionId, messageThreadId: 888, now });
         await markClosed(env.DB, { sessionId, now });
 
-        let reopenCalled = false;
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-          .reply(200, (opts: any) => {
-            reopenCalled = true;
-            const body = JSON.parse(opts.body as string);
-            expect(body.chat_id).toBe(topicChatId);
-            expect(body.message_thread_id).toBe(888);
-            return { ok: true, result: true };
-          });
+        const { client, calls } = fakeTransport();
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4431,9 +4208,10 @@ describe("topics module and topicName", () => {
           title: "closed",
           botToken,
           now: now + 1000,
+          transport: client,
         });
 
-        expect(reopenCalled).toBe(true);
+        expect(calls.reopenForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: 888 }]);
         expect(res).toEqual({ ok: true, messageThreadId: 888 });
 
         const row = await getBySession(env.DB, sessionId);
@@ -4447,10 +4225,7 @@ describe("topics module and topicName", () => {
         await finalize(env.DB, { sessionId: "ses_closed_429", messageThreadId: 889, now });
         await markClosed(env.DB, { sessionId: "ses_closed_429", now });
 
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-          .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 10 } });
+        const { client } = fakeTransport({ reopenForumTopic: () => results.rateLimited(10) });
 
         const res = await resolveTopic(env.DB, {
           sessionId: "ses_closed_429",
@@ -4460,6 +4235,7 @@ describe("topics module and topicName", () => {
           title: "closed 429",
           botToken,
           now: now + 1000,
+          transport: client,
         });
 
         expect(res).toEqual({ ok: false, kind: "rate_limited", retryAfter: 10 });
@@ -4468,16 +4244,13 @@ describe("topics module and topicName", () => {
         expect(row?.state).toBe("closed");
       });
 
-      it("reopenForumTopic returns TOPIC_NOT_MODIFIED -> returns messageThreadId and flips state to open", async () => {
+      it("reopenForumTopic returns topic_not_modified -> returns messageThreadId and flips state to open", async () => {
         const now = Date.now();
         await reserve(env.DB, { sessionId: "ses_closed_not_mod", machineId: "devbox", chatId: topicChatId, name: "pigeon · closed not mod", now });
         await finalize(env.DB, { sessionId: "ses_closed_not_mod", messageThreadId: 994001, now });
         await markClosed(env.DB, { sessionId: "ses_closed_not_mod", now });
 
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-          .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+        const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
 
         const res = await resolveTopic(env.DB, {
           sessionId: "ses_closed_not_mod",
@@ -4487,6 +4260,7 @@ describe("topics module and topicName", () => {
           title: "closed not mod",
           botToken,
           now: now + 1000,
+          transport: client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 994001 });
@@ -4501,10 +4275,9 @@ describe("topics module and topicName", () => {
         await finalize(env.DB, { sessionId: "ses_closed_rights_err", messageThreadId: 994002, now });
         await markClosed(env.DB, { sessionId: "ses_closed_rights_err", now });
 
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-          .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to manage topics" });
+        const { client } = fakeTransport({
+          reopenForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+        });
 
         const res = await resolveTopic(env.DB, {
           sessionId: "ses_closed_rights_err",
@@ -4514,6 +4287,7 @@ describe("topics module and topicName", () => {
           title: "closed rights err",
           botToken,
           now: now + 1000,
+          transport: client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 994002 });
@@ -4525,7 +4299,7 @@ describe("topics module and topicName", () => {
 
     describe("Task T2.7: Stale-thread recovery in resolveTopic", () => {
       const sessionId = "ses_reopen_stale";
-      const botToken = "fake-bot-token";
+      const botToken = FAKE_TOKEN;
 
       it("reopenForumTopic returns thread_not_found -> deletes stale D1 row and recreates topic", async () => {
         const now = Date.now();
@@ -4533,17 +4307,11 @@ describe("topics module and topicName", () => {
         await finalize(env.DB, { sessionId, messageThreadId: 700, now });
         await markClosed(env.DB, { sessionId, now });
 
-        // reopen returns thread_not_found
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-          .reply(400, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
-
-        // createForumTopic succeeds for new thread 701
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-          .reply(200, { ok: true, result: { message_thread_id: 701, name: "pigeon · stale closed" } });
+        // reopen returns thread_not_found; createForumTopic succeeds for new thread 701
+        const { client } = fakeTransport({
+          reopenForumTopic: () => results.threadNotFound(),
+          createForumTopic: () => ({ ok: true, result: { message_thread_id: 701, name: "pigeon · stale closed" } }),
+        });
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4553,6 +4321,7 @@ describe("topics module and topicName", () => {
           title: "stale closed",
           botToken,
           now: now + 1000,
+          transport: client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 701, created: true });
@@ -4567,14 +4336,14 @@ describe("topics module and topicName", () => {
       const botToken = "fake-bot-token";
 
       /**
-       * These tests inject a fake TelegramClient rather than using `fetchMock`.
+       * These tests inject a fake transport rather than using `fetchMock`.
        * That is deliberate: `upgradeProvisionalName` swallows every error, so an unexpected call
        * against an unregistered undici interceptor throws MockNotMatchedError, is caught, and the
        * "no Telegram call was made" assertions pass whether or not the call happened. A counting
        * fake makes those assertions capable of failing, and it also avoids leaking unconsumed
        * interceptors into later tests in this file.
        */
-      function fakeTg(handlers: {
+      function fakeChat(handlers: {
         createForumTopic?: (o: any) => any;
         reopenForumTopic?: (o: any) => any;
         editForumTopic?: (o: any) => any;
@@ -4631,7 +4400,7 @@ describe("topics module and topicName", () => {
 
       it("a placeholder title never reaches the topic name; the topic is marked provisional", async () => {
         const sessionId = "ses_prov_create";
-        const tg = fakeTg({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 900 } }) });
+        const tg = fakeChat({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 900 } }) });
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4640,7 +4409,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "New session - 2026-08-11T10:11:16.127Z",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toMatchObject({ ok: true, messageThreadId: 900 });
@@ -4651,7 +4420,7 @@ describe("topics module and topicName", () => {
 
       it("a real title at creation is not provisional", async () => {
         const sessionId = "ses_prov_real";
-        const tg = fakeTg({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 901 } }) });
+        const tg = fakeChat({ createForumTopic: () => ({ ok: true, result: { message_thread_id: 901 } }) });
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -4660,7 +4429,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         const row = await getBySession(env.DB, sessionId);
@@ -4671,7 +4440,7 @@ describe("topics module and topicName", () => {
       it("a later notification carrying a real title renames the topic once and clears the flag", async () => {
         const sessionId = "ses_prov_upgrade";
         await seedProvisionalTopic(sessionId, 902, "~/projects/protos/.worktrees/pr-698");
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4680,7 +4449,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "PR review using .lgtm-review-prompt.md",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 902 });
@@ -4702,7 +4471,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "A drifted TUI title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
         expect(res2).toEqual({ ok: true, messageThreadId: 902 });
         expect(tg.calls.edit).toBe(1);
@@ -4714,7 +4483,7 @@ describe("topics module and topicName", () => {
       it("a provisional topic with no title yet burns no Telegram call", async () => {
         const sessionId = "ses_prov_notitle";
         await seedProvisionalTopic(sessionId, 903, "~/projects/pigeon");
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4723,7 +4492,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "New session - 2026-08-11T10:11:16.127Z",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 903 });
@@ -4734,7 +4503,7 @@ describe("topics module and topicName", () => {
       it("a failed edit leaves the flag set and never fails the notification", async () => {
         const sessionId = "ses_prov_editfail";
         await seedProvisionalTopic(sessionId, 904, "~/projects/pigeon");
-        const tg = fakeTg({
+        const tg = fakeChat({
           editForumTopic: () => ({ ok: false, kind: "rate_limited", retryAfter: 30 }),
         });
 
@@ -4745,7 +4514,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         // Delivery is unaffected: a cosmetic rename must never turn into a 429 for the caller.
@@ -4758,7 +4527,7 @@ describe("topics module and topicName", () => {
       it("an editForumTopic that throws is swallowed and leaves the flag set", async () => {
         const sessionId = "ses_prov_editthrow";
         await seedProvisionalTopic(sessionId, 912, "~/projects/pigeon");
-        const tg = fakeTg({
+        const tg = fakeChat({
           editForumTopic: () => {
             throw new Error("network down");
           },
@@ -4771,7 +4540,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 912 });
@@ -4781,7 +4550,7 @@ describe("topics module and topicName", () => {
       it("topic_not_modified counts as success and clears the flag", async () => {
         const sessionId = "ses_prov_notmodified";
         await seedProvisionalTopic(sessionId, 905, "~/projects/pigeon");
-        const tg = fakeTg({
+        const tg = fakeChat({
           editForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
         });
 
@@ -4792,7 +4561,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 905 });
@@ -4802,7 +4571,7 @@ describe("topics module and topicName", () => {
       it("falls back to the provisional name as the dir when the notification carries none", async () => {
         const sessionId = "ses_prov_nodir";
         await seedProvisionalTopic(sessionId, 906, "~/projects/pigeon");
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -4811,7 +4580,7 @@ describe("topics module and topicName", () => {
           dir: "",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
@@ -4827,7 +4596,7 @@ describe("topics module and topicName", () => {
           908,
           "New session - 2026-08-11T10:11:16.127Z · ~/projects/pigeon",
         );
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -4836,7 +4605,7 @@ describe("topics module and topicName", () => {
           dir: "",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(tg.editedNames).toEqual(["Real title"]);
@@ -4850,7 +4619,7 @@ describe("topics module and topicName", () => {
           913,
           "New session - 2026-08-11T10:11:16.127Z · ~/projects/pigeon",
         );
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -4859,7 +4628,7 @@ describe("topics module and topicName", () => {
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
           botToken,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(tg.editedNames).toEqual(["Real title · ~/projects/pigeon"]);
@@ -4870,7 +4639,7 @@ describe("topics module and topicName", () => {
         const now = Date.now();
         await seedProvisionalTopic(sessionId, 909, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
-        const tg = fakeTg({});
+        const tg = fakeChat({});
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -4880,7 +4649,7 @@ describe("topics module and topicName", () => {
           title: "Real title",
           botToken,
           now: now + 1000,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 909 });
@@ -4893,7 +4662,7 @@ describe("topics module and topicName", () => {
         const now = Date.now();
         await seedProvisionalTopic(sessionId, 910, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
-        const tg = fakeTg({
+        const tg = fakeChat({
           reopenForumTopic: () => ({ ok: false, kind: "topic_not_modified" }),
         });
 
@@ -4905,7 +4674,7 @@ describe("topics module and topicName", () => {
           title: "Real title",
           botToken,
           now: now + 1000,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 910 });
@@ -4918,7 +4687,7 @@ describe("topics module and topicName", () => {
         const now = Date.now();
         await seedProvisionalTopic(sessionId, 911, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
-        const tg = fakeTg({
+        const tg = fakeChat({
           reopenForumTopic: () => ({ ok: false, kind: "error", status: 500 }),
         });
 
@@ -4930,7 +4699,7 @@ describe("topics module and topicName", () => {
           title: "Real title",
           botToken,
           now: now + 1000,
-          tgClient: tg.client,
+          transport: tg.client,
         });
 
         expect(res).toEqual({ ok: true, messageThreadId: 911 });
@@ -4954,351 +4723,636 @@ describe("topics module and topicName", () => {
     });
   });
 
-  describe("Task T2.7: Stale-thread recovery on sendNotification", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+  // The threading, recovery, fallback and hold rules of POST /notifications/send (T2.5, T2.7, T2.8,
+  // T2.9, pigeon-iqpd, pigeon-533h, pigeon-bit4), run against a Slack workspace. A "topic" is a
+  // channel and its thread id a handle; "thread not found" is `channel_not_found`.
+  describe("notification delivery on Slack: threads, recovery, fallback and holds", () => {
+    let dm: SlackMachine;
+    let dEnv: Env;
+    let srv: ReturnType<typeof fakeSlack>;
 
-    beforeEach(() => {
+    beforeEach(async () => {
+      resetSlackCalls();
       fetchMock.activate();
       fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      dm = await mkSlackMachine();
+      dEnv = envWith([dm]);
+      srv = fakeSlack();
     });
 
     afterEach(() => {
+      fetchMock.get("https://slack.com").cleanMocks();
+      fetchMock.get("https://files.slack.com").cleanMocks();
       fetchMock.deactivate();
     });
 
-    it("sendMessage returns thread_not_found -> deletes stale D1 row, recreates topic, and retries sendMessage once", async () => {
-      const sessionId = "ses_stale_send";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · stale send", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 700, now });
-
-      let sendThreadIds: Array<number | undefined> = [];
-
-      // Intercept 1st sendMessage (thread 700 -> thread_not_found)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sendThreadIds.push(body.message_thread_id);
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      // Intercept 2nd sendMessage (thread 701 -> success)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sendThreadIds.push(body.message_thread_id);
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 9999 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      let createTopicCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 701, name: "pigeon · stale send" } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification on deleted topic",
-          title: "stale send",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      expect(createTopicCalled || sendThreadIds.length === 2).toBe(true);
-      expect(sendThreadIds).toEqual([700, 701]);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.message_thread_id).toBe(701);
-    });
-
-    it("recursion guard: second sendMessage also returns thread_not_found -> does NOT retry again (at most once)", async () => {
-      const sessionId = "ses_stale_recursion_guard";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recursion", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 705, now });
-
-      let sendMessageCalls = 0;
-
-      // Intercept 1st sendMessage
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      // Intercept 2nd sendMessage (retry on recreated topic fails again)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      // Intercept 3rd sendMessage (fallback to General)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_id: 99981 } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      let createTopicCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, () => {
-          createTopicCalls++;
-          return { ok: true, result: { message_thread_id: 702, name: "pigeon · recursion" } };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification on double deleted topic",
-          title: "recursion",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200); // Falls back to General and delivers
-      expect(createTopicCalls).toBe(1); // Exactly 1 recreate attempt
-    });
-  });
-
-  // pigeon-533h: a topics row lives in ONE chat. On 2026-10-20 the macOS daemon pushed a swarm
-  // notice for a cloudbox session carrying the Mac's chat; the chat-agnostic lookup handed back
-  // the cloudbox thread id, Telegram said "thread not found" (it does not exist in the Mac chat),
-  // and the stale-thread recovery deleted the cloudbox row and minted a topic in the Mac chat. The
-  // next cloudbox notification then did the same in reverse. Net: the original topic lost its row.
-  describe("cross-chat notifications never touch another chat's topic (pigeon-533h)", () => {
-    const CLOUDBOX_CHAT = "-1004391832753";
-    const MAC_CHAT = "-1003983501132";
-    const ALERT_CHAT = "8248645256";
-    const testEnv = {
-      ...env,
-      TELEGRAM_TOPICS_ENABLED: "true",
-      // First entry is where relocation alerts go (alertRelocation), kept apart from both chats.
-      ALLOWED_CHAT_IDS: `${ALERT_CHAT},${CLOUDBOX_CHAT},${MAC_CHAT}`,
-    } as Env;
-
-    /**
-     * A Telegram that knows which threads exist in which chat, so that sending into a thread id
-     * from another chat fails exactly the way it did in production.
-     */
-    function fakeTelegram(threads: Record<string, Set<number>>) {
-      const sends: Array<{ chat_id: string; message_thread_id?: number }> = [];
-      const created: Array<{ chat_id: string; thread: number }> = [];
-      const reopens: Array<{ chat_id: string; message_thread_id: number }> = [];
-      let nextThread = 90_000;
-      let nextMessage = 50_000_000 + Math.floor(Math.random() * 1_000_000_000);
-      const parse = (opts: any) =>
-        JSON.parse(typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body));
-      const json = (data: unknown) => ({
-        statusCode: 200,
-        data: JSON.stringify(data),
-        responseOptions: { headers: { "Content-Type": "application/json" } },
-      });
-      const tg = fetchMock.get("https://api.telegram.org");
-      tg.intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = parse(opts);
-          const chat = String(body.chat_id);
-          sends.push({ chat_id: chat, message_thread_id: body.message_thread_id });
-          if (body.message_thread_id !== undefined && !threads[chat]?.has(body.message_thread_id)) {
-            return json({ ok: false, error_code: 400, description: "Bad Request: message thread not found" });
-          }
-          return json({ ok: true, result: { message_id: nextMessage++ } });
-        })
-        .persist();
-      tg.intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply((opts: any) => {
-          const body = parse(opts);
-          const chat = String(body.chat_id);
-          const thread = nextThread++;
-          (threads[chat] ??= new Set()).add(thread);
-          created.push({ chat_id: chat, thread });
-          return json({ ok: true, result: { message_thread_id: thread, name: body.name } });
-        })
-        .persist();
-      tg.intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
-        .reply((opts: any) => {
-          const body = parse(opts);
-          const chat = String(body.chat_id);
-          reopens.push({ chat_id: chat, message_thread_id: body.message_thread_id });
-          if (!threads[chat]?.has(body.message_thread_id)) {
-            return json({ ok: false, error_code: 400, description: "Bad Request: message thread not found" });
-          }
-          return json({ ok: true, result: true });
-        })
-        .persist();
-      tg.intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(() => json({ ok: true, result: true }))
-        .persist();
-      return { sends, created, reopens };
-    }
-
-    function send(sessionId: string, chatId: string, notificationId: string) {
-      return handleSendNotification(
+    const chat = () => slackChatId(dm.ws);
+    const newSession = (label = "pigeon") => seedSession(dm.machineId, label);
+    const send = (sessionId: string, extra: Record<string, unknown> = {}, key = dm.key, e = dEnv) =>
+      handleSendNotification(
         env.DB,
-        testEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId,
-            text: `notice ${notificationId}`,
-            notificationId,
-            title: "SCCM node development scoping",
-            dir: "/home/dev/projects/mono",
-            threaded: true,
-          }),
+        e,
+        postJson("/notifications/send", key, {
+          sessionId,
+          text: "Task completed",
+          title: "My Topic",
+          dir: "pigeon",
+          threaded: true,
+          ...extra,
         }),
       );
-    }
+    const handleOf = async (channelId: string) =>
+      (await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
+        .bind(dm.ws.teamId, channelId)
+        .first<{ handle: number }>())!.handle;
+    const gone = { ok: false, error: "channel_not_found" };
+    const badGateway = { status: 502, body: { ok: false, error: "bad_gateway" } };
+    const messagesFor = (sessionId: string) =>
+      env.DB.prepare("SELECT * FROM messages WHERE session_id = ?").bind(sessionId).first();
+    const warnSpy = () => vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
+    // ── T2.5: threaded delivery ──
 
-    afterEach(() => {
-      fetchMock.deactivate();
-    });
+    it("threaded: false -> the post is unthreaded (the workspace's #alerts) and no topic is created", async () => {
+      const sessionId = await newSession();
+      const alerts = await seedAlerts(dm.ws);
 
-    it("reproduces the incident: a Mac-chat push and a cloudbox-chat push leave the cloudbox row intact", async () => {
-      const sessionId = `ses_cross_chat_${Date.now()}`;
-      await registerSession(sessionId, "cloudbox", "mono");
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "SCCM · ~/projects/mono", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 32082, now });
+      const res = await send(sessionId, { threaded: false });
 
-      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32082]), [MAC_CHAT]: new Set() });
-
-      // 1. The Mac's push. It must not be threaded into a thread id that belongs to another
-      //    chat, and must neither delete the row nor create a topic in the Mac chat.
-      const macRes = await send(sessionId, MAC_CHAT, `w:mac_${sessionId}`);
-      expect(macRes.status).toBe(200);
-      expect(tg.created).toEqual([]);
-      const macSends = tg.sends.filter((s) => s.chat_id === MAC_CHAT);
-      expect(macSends).toEqual([{ chat_id: MAC_CHAT, message_thread_id: undefined }]);
-
-      // The cross-chat push is anomalous, so it is reported like any other relocation.
-      expect(tg.sends.filter((s) => s.chat_id === ALERT_CHAT)).toHaveLength(1);
-
-      let row = await getBySession(env.DB, sessionId);
-      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
-      expect(row?.message_thread_id).toBe(32082);
-
-      // 2. The owner's next push still lands in the original topic, with no new topic anywhere.
-      const cbRes = await send(sessionId, CLOUDBOX_CHAT, `s:cb_${sessionId}`);
-      expect(cbRes.status).toBe(200);
-      expect(tg.created).toEqual([]);
-      expect(tg.sends.filter((s) => s.chat_id === CLOUDBOX_CHAT)).toEqual([
-        { chat_id: CLOUDBOX_CHAT, message_thread_id: 32082 },
-      ]);
-
-      row = await getBySession(env.DB, sessionId);
-      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
-      expect(row?.message_thread_id).toBe(32082);
-    });
-
-    it("a closed topic in another chat is neither reopened nor deleted by a cross-chat push", async () => {
-      const sessionId = `ses_cross_chat_closed_${Date.now()}`;
-      await registerSession(sessionId, "cloudbox", "mono");
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "closed", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 32083, now });
-      await markClosed(env.DB, { sessionId, now });
-
-      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32083]), [MAC_CHAT]: new Set() });
-
-      const res = await send(sessionId, MAC_CHAT, `w:mac_closed_${sessionId}`);
       expect(res.status).toBe(200);
-      expect(tg.reopens).toEqual([]);
-      expect(tg.created).toEqual([]);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.chat_id).toBe(CLOUDBOX_CHAT);
-      expect(row?.message_thread_id).toBe(32083);
-      expect(row?.state).toBe("closed");
-    });
-
-    it("a named-topic binding in another chat is not used for a cross-chat push", async () => {
-      const sessionId = `ses_cross_chat_bound_${Date.now()}`;
-      const key = `test:cross-chat-${Date.now()}`;
-      await registerSession(sessionId, "cloudbox", "mono");
-      const now = Date.now();
-      await env.DB.prepare(
-        "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Digest', ?, ?)",
-      ).bind(CLOUDBOX_CHAT, key, 32090, now, now).run();
-      await env.DB.prepare(
-        "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
-      ).bind(CLOUDBOX_CHAT, key, sessionId, now).run();
-
-      const tg = fakeTelegram({ [CLOUDBOX_CHAT]: new Set([32090]), [MAC_CHAT]: new Set() });
-
-      const res = await send(sessionId, MAC_CHAT, `w:mac_bound_${sessionId}`);
-      expect(res.status).toBe(200);
-      expect(tg.sends.filter((s) => s.chat_id !== ALERT_CHAT)).toEqual([
-        { chat_id: MAC_CHAT, message_thread_id: undefined },
-      ]);
-      expect(tg.created).toEqual([]);
-      const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
-      expect(topicRow).toBeNull();
-    });
-
-    it("deleteTopicBySession is scoped to the chat: the same thread id in another chat is not deleted", async () => {
-      const sessionId = `ses_cross_chat_delete_${Date.now()}`;
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "cloudbox", chatId: CLOUDBOX_CHAT, name: "x", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 650, now });
-
-      expect(await deleteTopicBySession(env.DB, sessionId, MAC_CHAT, 650)).toBe(false);
-      expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(650);
-      expect(await deleteTopicBySession(env.DB, sessionId, CLOUDBOX_CHAT, 650)).toBe(true);
+      expect(srv.postedTo()).toEqual([alerts]);
+      expect(srv.created).toEqual([]);
       expect(await getBySession(env.DB, sessionId)).toBeNull();
+    });
+
+    it("topic resolution succeeds -> a channel is created and the post carries its handle", async () => {
+      const sessionId = await newSession();
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(200);
+      expect(srv.created).toHaveLength(1);
+      expect(srv.created[0]!.name).toMatch(/^my-topic-/);
+      expect(srv.postedTo()).toEqual([srv.created[0]!.id]);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.chat_id).toBe(chat());
+      expect(row?.message_thread_id).toBe(await handleOf(srv.created[0]!.id));
+    });
+
+    // ── T2.7: stale-thread recovery ──
+
+    it("a conversation deleted out of band -> deletes the stale row, recreates the topic, retries the send once", async () => {
+      const sessionId = await newSession();
+      const old = await seedSlackTopic(sessionId, dm.machineId, dm.ws, "pigeon · stale send");
+      srv.gone.add(old.channelId);
+
+      const res = await send(sessionId, { title: "stale send" });
+
+      expect(res.status).toBe(200);
+      expect(srv.created).toHaveLength(1);
+      expect(srv.postedTo()).toEqual([old.channelId, srv.created[0]!.id]);
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.message_thread_id).toBe(await handleOf(srv.created[0]!.id));
+      expect(row?.message_thread_id).not.toBe(old.handle);
+    });
+
+    it("recursion guard: the retry also finds nothing -> does NOT recreate again (at most once)", async () => {
+      const sessionId = await newSession();
+      const old = await seedSlackTopic(sessionId, dm.machineId, dm.ws, "pigeon · recursion");
+      const alerts = await seedAlerts(dm.ws);
+      srv.script("chat.postMessage", gone, gone);
+
+      const res = await send(sessionId, { title: "recursion" });
+
+      expect(res.status).toBe(200); // Falls back to General and delivers
+      expect(srv.created).toHaveLength(1); // Exactly 1 recreate attempt
+      const posted = srv.postedTo();
+      expect(posted[0]).toBe(old.channelId);
+      expect(posted[1]).toBe(srv.created[0]!.id);
+      expect(posted[2]).toBe(alerts); // then General
+    });
+
+    // ── T2.8: fallback rules ──
+
+    it("a permanent failure of a topic send -> falls back to General and succeeds", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws, "pigeon · fallback");
+      const alerts = await seedAlerts(dm.ws);
+      // Slack refuses the payload, and refuses the transport's own plain retry too.
+      const refused = { ok: false, error: "invalid_blocks" };
+      srv.script("chat.postMessage", refused, refused);
+
+      const res = await send(sessionId, { title: "fallback" });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, messageId: expect.any(Number), token: expect.any(String) });
+      const posted = srv.postedTo();
+      expect(posted.slice(0, 2)).toEqual([topic.channelId, topic.channelId]);
+      expect(posted[2]).toBe(alerts); // General
+    });
+
+    // pigeon-bit4: a 5xx is transient, so relocating the message to General discards the topic
+    // permanently for a condition that would have cleared on the next attempt. The outbox retries
+    // a 502, and it retries into the RIGHT topic.
+    it("5xx topic send failure -> returns 502 for outbox retry and does NOT fall back to General", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      srv.script("chat.postMessage", badGateway);
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(502);
+      // A second send is the bug.
+      expect(srv.postedTo()).toEqual([topic.channelId]);
+      // Pin the error_code that reaches the daemon: delivery-policy rule 6 keys on
+      // details.error_code === 400 and would answer a retryable 502 with strip_entities.
+      const body = (await res.json()) as { details?: { error_code?: number } };
+      expect(body.details?.error_code).toBe(502);
+    });
+
+    it("an unparseable gateway page on a topic send -> returns 502 and does NOT fall back to General", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      srv.script("chat.postMessage", { status: 502, body: "<html><body>Bad Gateway</body></html>" });
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(502);
+      expect(srv.postedTo()).toEqual([topic.channelId]);
+      const body = (await res.json()) as { details?: { error_code?: number } };
+      expect(body.details?.error_code).toBe(502);
+    });
+
+    // The recreate path rewrites messageThreadId, so the relocation guard below it runs against a
+    // DIFFERENT thread id than the one resolveTopic first returned. A 5xx on that retry must still
+    // retry rather than relocate.
+    it("5xx after a successful topic recreate -> returns 502 and does NOT fall back to General", async () => {
+      const sessionId = await newSession();
+      const old = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      srv.script("chat.postMessage", gone, badGateway);
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(502);
+      // The second send used the RECREATED conversation, and there was no third (General) send.
+      expect(srv.postedTo()).toEqual([old.channelId, srv.created[0]!.id]);
+    });
+
+    // pigeon-bit4 / S2: every path that silently sends to General instead of the session's topic
+    // must say so in the log.
+    it("permanent relocation to General emits a console.warn naming the session and thread", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      const refused = { ok: false, error: "invalid_blocks" };
+      srv.script("chat.postMessage", refused, refused);
+      const spy = warnSpy();
+      try {
+        const res = await send(sessionId);
+        expect(res.status).toBe(200);
+        const relocateWarn = spy.mock.calls.find(
+          (c) => typeof c[0] === "string" && c[0].includes("relocating notification to General"),
+        );
+        expect(relocateWarn).toBeDefined();
+        expect(relocateWarn![1]).toMatchObject({ sessionId, messageThreadId: topic.handle, reason: "send_failed" });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("recreate-failed relocation to General emits a console.warn", async () => {
+      const sessionId = await newSession();
+      await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      srv.script("chat.postMessage", gone);
+      srv.script("conversations.create", { ok: false, error: "restricted_action" });
+      const spy = warnSpy();
+      try {
+        const res = await send(sessionId);
+        expect(res.status).toBe(200);
+        const warns = spy.mock.calls.filter((c) => typeof c[0] === "string");
+        expect(warns.some((c) => (c[0] as string).includes("topic creation failed"))).toBe(true);
+        expect(
+          warns.some(
+            (c) =>
+              (c[0] as string).includes("relocating notification to General") &&
+              (c[1] as Record<string, unknown>)?.reason === "recreate_failed",
+          ),
+        ).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("media attachment failure emits a console.warn instead of being silently skipped", async () => {
+      const sessionId = await newSession();
+      await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      const mediaKey = `outbound/${Date.now()}-bit4/photo.png`;
+      await env.MEDIA.put(mediaKey, new Uint8Array([1, 2, 3]));
+      srv.script("files.getUploadURLExternal", { ok: false, error: "invalid_arguments" });
+      const spy = warnSpy();
+      try {
+        const res = await send(sessionId, { media: [{ key: mediaKey, mime: "image/png", filename: "photo.png" }] });
+        expect(res.status).toBe(200);
+        expect(
+          spy.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("media attachment not delivered")),
+        ).toBe(true);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // pigeon-bit4 / S3: one column cannot express this. message_thread_id IS NULL is already
+    // five-way ambiguous, so placement is recorded as the pair (intended, actual).
+    it("records intended and actual thread ids as equal on a normal threaded send", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+
+      const res = await send(sessionId);
+      expect(res.status).toBe(200);
+      const { messageId } = (await res.json()) as { messageId: number };
+
+      const row = await env.DB.prepare(
+        "SELECT intended_thread_id, actual_thread_id FROM messages WHERE chat_id = ? AND message_id = ?",
+      )
+        .bind(chat(), messageId)
+        .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
+      expect(row).toMatchObject({ intended_thread_id: topic.handle, actual_thread_id: topic.handle });
+    });
+
+    it("records intended set and actual null when a notification is relocated to General", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      const refused = { ok: false, error: "invalid_blocks" };
+      srv.script("chat.postMessage", refused, refused);
+      const spy = warnSpy();
+      try {
+        const res = await send(sessionId);
+        expect(res.status).toBe(200);
+        const { messageId } = (await res.json()) as { messageId: number };
+        const row = await env.DB.prepare(
+          "SELECT intended_thread_id, actual_thread_id FROM messages WHERE chat_id = ? AND message_id = ?",
+        )
+          .bind(chat(), messageId)
+          .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
+        // This pair -- intended non-null, actual null -- IS the definition of a relocation.
+        expect(row).toMatchObject({ intended_thread_id: topic.handle, actual_thread_id: null });
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    // The columns are added to prod by a manual ALTER. If the code ships first, or the ALTER is
+    // rolled back, the write MUST degrade to a warn: an INSERT that referenced a missing column
+    // would throw AFTER the provider accepted the message -> 503 -> the daemon retries a message
+    // that was in fact delivered.
+    it("still inserts the message row, and warns, when the placement columns do not exist", async () => {
+      const sessionId = await newSession();
+      // Must be a THREADED send: with no thread on either side there is no placement to record.
+      await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      let spy: ReturnType<typeof vi.spyOn> | undefined;
+      try {
+        spy = warnSpy();
+        await env.DB.prepare("ALTER TABLE messages DROP COLUMN intended_thread_id").run();
+
+        const res = await send(sessionId);
+
+        // The notification is delivered and acknowledged; only the bookkeeping is lost.
+        expect(res.status).toBe(200);
+        const { messageId } = (await res.json()) as { messageId: number };
+        const row = await env.DB.prepare("SELECT session_id FROM messages WHERE chat_id = ? AND message_id = ?")
+          .bind(chat(), messageId)
+          .first<{ session_id: string }>();
+        expect(row?.session_id).toBe(sessionId);
+        expect(
+          spy.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("thread placement not recorded")),
+        ).toBe(true);
+      } finally {
+        // Restore before anything else: the DB is shared across the whole file.
+        await env.DB.prepare("ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER").run().catch(() => {});
+        spy?.mockRestore();
+      }
+    });
+
+    it("429 topic send failure -> returns 429 with retryAfter and does NOT fall back to General", async () => {
+      const sessionId = await newSession();
+      const topic = await seedSlackTopic(sessionId, dm.machineId, dm.ws);
+      srv.script("chat.postMessage", { status: 429, body: { ok: false, error: "ratelimited" }, headers: { "retry-after": "12" } });
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(429);
+      expect(await res.json()).toMatchObject({ error: "rate_limited", retryAfter: 12 });
+      expect(srv.postedTo()).toEqual([topic.channelId]); // exactly 1 call, no General fallback
+    });
+
+    it("a permanent (4xx) create failure -> falls back to General and succeeds", async () => {
+      const sessionId = await newSession();
+      const alerts = await seedAlerts(dm.ws);
+      srv.script("conversations.create", { ok: false, error: "invalid_blocks" });
+
+      const res = await send(sessionId);
+
+      expect(res.status).toBe(200);
+      expect(srv.of("conversations.create")).toHaveLength(1);
+      expect(srv.postedTo()[0]).toBe(alerts); // Sent to General
+    });
+
+    // ── pigeon-533h: a topics row lives in ONE chat ──
+    // On 2026-10-20 a push for a cloudbox session carrying the Mac's chat was handed the cloudbox
+    // thread id by the chat-agnostic lookup, the provider said "not found", and the stale-thread
+    // recovery deleted the cloudbox row and minted a topic in the Mac chat.
+
+    describe("cross-chat notifications never touch another chat's topic (pigeon-533h)", () => {
+      let owner: SlackMachine;
+      let other: SlackMachine;
+      let both: Env;
+
+      beforeEach(async () => {
+        owner = await mkSlackMachine();
+        other = await mkSlackMachine();
+        both = envWith([owner, other]);
+      });
+
+      const pushFrom = (m: SlackMachine, sessionId: string, notificationId: string) =>
+        send(sessionId, { notificationId, text: `notice ${notificationId}`, title: "SCCM node development scoping", dir: "/home/dev/projects/mono" }, m.key, both);
+
+      it("reproduces the incident: a push from the other workspace and one from the owner leave the owner's row intact", async () => {
+        const sessionId = await seedSession(owner.machineId, "mono");
+        const topic = await seedSlackTopic(sessionId, owner.machineId, owner.ws, "SCCM · ~/projects/mono");
+        const otherAlerts = await seedAlerts(other.ws);
+
+        // 1. The other machine's push. It must not be threaded into a conversation that belongs to
+        //    another chat, and must neither delete the row nor create a conversation.
+        const res1 = await pushFrom(other, sessionId, `w:other_${sessionId}`);
+        expect(res1.status).toBe(200);
+        expect(srv.created).toEqual([]);
+        // It lands unthreaded in its own workspace, and the anomaly is reported like any relocation.
+        expect(srv.postedTo()).toEqual([otherAlerts, otherAlerts]);
+
+        let row = await getBySession(env.DB, sessionId);
+        expect(row?.chat_id).toBe(slackChatId(owner.ws));
+        expect(row?.message_thread_id).toBe(topic.handle);
+
+        // 2. The owner's next push still lands in the original topic, with no new conversation.
+        const res2 = await pushFrom(owner, sessionId, `s:own_${sessionId}`);
+        expect(res2.status).toBe(200);
+        expect(srv.created).toEqual([]);
+        expect(srv.postedTo().slice(2)).toEqual([topic.channelId]);
+
+        row = await getBySession(env.DB, sessionId);
+        expect(row?.chat_id).toBe(slackChatId(owner.ws));
+        expect(row?.message_thread_id).toBe(topic.handle);
+      });
+
+      it("a closed topic in another chat is neither reopened nor deleted by a cross-chat push", async () => {
+        const sessionId = await seedSession(owner.machineId, "mono");
+        await seedSlackTopic(sessionId, owner.machineId, owner.ws, "closed");
+        await markClosed(env.DB, { sessionId, now: Date.now() });
+        await seedAlerts(other.ws);
+
+        const res = await pushFrom(other, sessionId, `w:other_closed_${sessionId}`);
+        expect(res.status).toBe(200);
+        expect(srv.of("conversations.unarchive")).toEqual([]);
+        expect(srv.created).toEqual([]);
+
+        const row = await getBySession(env.DB, sessionId);
+        expect(row?.chat_id).toBe(slackChatId(owner.ws));
+        expect(row?.state).toBe("closed");
+      });
+
+      it("a named-topic binding in another chat is not used for a cross-chat push", async () => {
+        const sessionId = await seedSession(owner.machineId, "mono");
+        const key = `test:cross-chat-${stamp()}`;
+        const channelId = `CD${stamp()}`.toUpperCase();
+        const handle = await seedChannel(owner.ws.teamId, channelId);
+        const now = Date.now();
+        await env.DB.prepare(
+          "INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at) VALUES (?, ?, ?, 'Digest', ?, ?)",
+        ).bind(slackChatId(owner.ws), key, handle, now, now).run();
+        await env.DB.prepare(
+          "INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+        ).bind(slackChatId(owner.ws), key, sessionId, now).run();
+        const otherAlerts = await seedAlerts(other.ws);
+
+        const res = await pushFrom(other, sessionId, `w:other_bound_${sessionId}`);
+        expect(res.status).toBe(200);
+        expect(srv.postedTo()).not.toContain(channelId);
+        expect(srv.postedTo()[0]).toBe(otherAlerts);
+        expect(srv.created).toEqual([]);
+        const topicRow = await env.DB.prepare("SELECT * FROM topics WHERE session_id = ?").bind(sessionId).first();
+        expect(topicRow).toBeNull();
+      });
+
+      it("deleteTopicBySession is scoped to the chat: the same thread id in another chat is not deleted", async () => {
+        const sessionId = `ses_cross_chat_delete_${stamp()}`;
+        const now = Date.now();
+        await reserve(env.DB, { sessionId, machineId: owner.machineId, chatId: slackChatId(owner.ws), name: "x", now });
+        await finalize(env.DB, { sessionId, messageThreadId: SLACK_HANDLE_MIN + 650, now });
+
+        expect(await deleteTopicBySession(env.DB, sessionId, slackChatId(other.ws), SLACK_HANDLE_MIN + 650)).toBe(false);
+        expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(SLACK_HANDLE_MIN + 650);
+        expect(await deleteTopicBySession(env.DB, sessionId, slackChatId(owner.ws), SLACK_HANDLE_MIN + 650)).toBe(true);
+        expect(await getBySession(env.DB, sessionId)).toBeNull();
+      });
+    });
+
+    // ── pigeon-iqpd: hold transiently-unresolvable topics for retry ──
+
+    describe("pigeon-iqpd: hold transiently-unresolvable topics for retry (onTopicUnavailable)", () => {
+      it("first notification, the create fails (5xx), onTopicUnavailable:'retry' -> 502 topic_unavailable, no send, no alert, no messages row, no retryAfter/details", async () => {
+        const sessionId = await newSession();
+        srv.script("conversations.create", badGateway);
+
+        const res = await send(sessionId, { onTopicUnavailable: "retry" });
+
+        expect(res.status).toBe(502);
+        expect(res.headers.get("Retry-After")).toBeNull();
+        const json = (await res.json()) as Record<string, unknown>;
+        expect(json.error).toBe("topic_unavailable");
+        expect(json.reason).toBe("create_failed");
+        expect(json).not.toHaveProperty("retryAfter");
+        expect(json).not.toHaveProperty("details");
+        expect(json.createError).toMatchObject({ ok: false, error_code: 502 });
+        expect(json.errorClass).toBe("upstream");
+
+        expect(srv.postedTo()).toEqual([]);
+        expect(await messagesFor(sessionId)).toBeNull();
+      });
+
+      it("the create fails (5xx), onTopicUnavailable absent -> relocates to General (200)", async () => {
+        const sessionId = await newSession();
+        const alerts = await seedAlerts(dm.ws);
+        srv.script("conversations.create", badGateway);
+
+        const res = await send(sessionId);
+
+        expect(res.status).toBe(200);
+        expect(srv.postedTo()[0]).toBe(alerts); // Posted to General
+      });
+
+      it("the create fails (5xx), onTopicUnavailable 'general' -> relocates to General (200)", async () => {
+        const sessionId = await newSession();
+        const alerts = await seedAlerts(dm.ws);
+        srv.script("conversations.create", badGateway);
+
+        const res = await send(sessionId, { onTopicUnavailable: "general" });
+
+        expect(res.status).toBe(200);
+        expect(srv.postedTo()[0]).toBe(alerts);
+      });
+
+      it("4xx create failure with onTopicUnavailable:'retry' -> relocates as today", async () => {
+        const sessionId = await newSession();
+        const alerts = await seedAlerts(dm.ws);
+        srv.script("conversations.create", { ok: false, error: "invalid_blocks" });
+
+        const res = await send(sessionId, { onTopicUnavailable: "retry" });
+
+        expect(res.status).toBe(200);
+        expect(srv.postedTo()[0]).toBe(alerts); // Relocated to General
+      });
+
+      it("topic_in_other_chat with onTopicUnavailable:'retry' -> relocates as today", async () => {
+        const sessionId = await newSession();
+        const alerts = await seedAlerts(dm.ws);
+        const now = Date.now();
+        await reserve(env.DB, {
+          sessionId,
+          machineId: dm.machineId,
+          chatId: "slack:TDIFFERENTCHAT", // Different chat
+          name: "pigeon · other chat",
+          now,
+        });
+        await finalize(env.DB, { sessionId, messageThreadId: SLACK_HANDLE_MIN + 444, now });
+
+        const res = await send(sessionId, { onTopicUnavailable: "retry" });
+
+        expect(res.status).toBe(200);
+        expect(srv.postedTo()[0]).toBe(alerts); // Relocated to General
+      });
+
+      it("T2.7 recreate path: the create fails (5xx) with onTopicUnavailable:'retry' -> 502 topic_unavailable, only one failed send made", async () => {
+        const sessionId = await newSession();
+        await seedSlackTopic(sessionId, dm.machineId, dm.ws, "pigeon · recreate5xx");
+        srv.script("chat.postMessage", gone);
+        srv.script("conversations.create", badGateway);
+
+        const res = await send(sessionId, { onTopicUnavailable: "retry" });
+
+        expect(res.status).toBe(502);
+        const json = (await res.json()) as Record<string, unknown>;
+        expect(json.error).toBe("topic_unavailable");
+        expect(json.reason).toBe("recreate_failed:create_failed");
+        expect(json.createError).toMatchObject({ ok: false, error_code: 502 });
+        expect(json).not.toHaveProperty("retryAfter");
+        expect(json).not.toHaveProperty("details");
+
+        // Crucial: only the one failed send was made
+        expect(srv.of("chat.postMessage")).toHaveLength(1);
+        expect(await messagesFor(sessionId)).toBeNull();
+      });
+
+      it("after a held 502, a subsequent request whose create succeeds posts into the new topic", async () => {
+        const sessionId = await newSession();
+        srv.script("conversations.create", badGateway);
+
+        const res1 = await send(sessionId, { onTopicUnavailable: "retry", text: "Attempt 1: held" });
+        expect(res1.status).toBe(502);
+
+        // The reservation row was cleaned up so the next attempt can reserve and create
+        expect(await getBySession(env.DB, sessionId)).toBeNull();
+
+        const res2 = await send(sessionId, { onTopicUnavailable: "retry", text: "Attempt 2: succeeds" });
+        expect(res2.status).toBe(200);
+        expect(srv.created).toHaveLength(1);
+        expect(srv.postedTo()).toEqual([srv.created[0]!.id]); // Posted into the newly created topic!
+      });
+
+      it("poll_exhausted with onTopicUnavailable:'retry' -> 502 topic_unavailable", async () => {
+        const sessionId = await newSession();
+        // Reserve the session row so this caller is not the winner
+        await reserve(env.DB, {
+          sessionId,
+          machineId: "another-machine",
+          chatId: chat(),
+          name: "pigeon · exhausted",
+          now: Date.now(),
+        });
+
+        const res = await send(sessionId, { onTopicUnavailable: "retry" });
+
+        expect(res.status).toBe(502);
+        const json = (await res.json()) as Record<string, unknown>;
+        expect(json.error).toBe("topic_unavailable");
+        expect(json.reason).toBe("poll_exhausted");
+        expect(json).not.toHaveProperty("retryAfter");
+        expect(json).not.toHaveProperty("details");
+      });
+    });
+
+    // ── T2.9: media follows the thread ──
+
+    describe("Task T2.9: Media passes the conversation", () => {
+      async function stage(key: string, mime: string, filename: string, content: string) {
+        const form = new FormData();
+        form.append("key", key);
+        form.append("mime", mime);
+        form.append("filename", filename);
+        form.append("file", new Blob([content], { type: mime }), filename);
+        await SELF.fetch("https://worker/media/upload", {
+          method: "POST",
+          body: form,
+          headers: { Authorization: `Bearer ${API_KEY}` },
+        });
+      }
+
+      it("topic resolved -> a photo and a document are both posted into the session's conversation", async () => {
+        const sessionId = await newSession();
+        const imageKey = `media_test/img_${stamp()}.png`;
+        const docKey = `media_test/doc_${stamp()}.pdf`;
+        await stage(imageKey, "image/png", "screenshot.png", "png_data");
+        await stage(docKey, "application/pdf", "report.pdf", "pdf_data");
+
+        const res = await send(sessionId, {
+          title: "Media Topic",
+          media: [
+            { key: imageKey, mime: "image/png", filename: "screenshot.png" },
+            { key: docKey, mime: "application/pdf", filename: "report.pdf" },
+          ],
+        });
+
+        expect(res.status).toBe(200);
+        const channel = srv.created[0]!.id;
+        expect(srv.of("files.completeUploadExternal").map((c) => c.params.get("channel_id"))).toEqual([channel, channel]);
+      });
+
+      it("media follows the recreated conversation after T2.7 stale-thread recovery", async () => {
+        // Regression: messageThreadId was assigned once and never updated by the T2.7 retry, so the
+        // media loop kept sending to the DELETED thread and the attachments were dropped with no log.
+        const sessionId = await newSession();
+        const imageKey = `media_test/img_recov_${stamp()}.png`;
+        await stage(imageKey, "image/png", "shot.png", "png_data");
+        const old = await seedSlackTopic(sessionId, dm.machineId, dm.ws, "pigeon · Recovered");
+        srv.gone.add(old.channelId);
+
+        const res = await send(sessionId, {
+          title: "Recovered",
+          media: [{ key: imageKey, mime: "image/png", filename: "shot.png" }],
+        });
+
+        expect(res.status).toBe(200);
+        // Text recovered onto the new conversation...
+        expect(srv.postedTo()).toEqual([old.channelId, srv.created[0]!.id]);
+        // ...and the photo follows the text, not the deleted one.
+        expect(srv.of("files.completeUploadExternal").map((c) => c.params.get("channel_id"))).toEqual([srv.created[0]!.id]);
+      });
     });
   });
 
-  describe("Task T2.5: Threaded notification delivery", () => {
+  // Telegram-only behaviour (the topics flag, an unparseable 200 with no error code, a rate limit on
+  // topic creation, which Slack treats as a hold): kept until the Telegram transport is deleted.
+  describe("Telegram-only leftovers of the topic delivery tests", () => {
     const topicChatId = String(CHAT_ID_NUM);
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
     let msgCounter = 850000;
     const nextMsgId = () => ++msgCounter;
 
@@ -5345,103 +5399,6 @@ describe("topics module and topicName", () => {
       expect(row).toBeNull();
     });
 
-    it("flag on + threaded: false -> sendMessage payload has no message_thread_id", async () => {
-      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-      const sessionId = "ses_t25_threaded_false";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      let sentPayload: any = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sentPayload = JSON.parse(raw);
-          return { ok: true, result: { message_id: nextMsgId() } };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Current state overview",
-          title: "Overview",
-          dir: "pigeon",
-          threaded: false,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      expect(sentPayload).not.toBeNull();
-      expect(sentPayload.message_thread_id).toBeUndefined();
-
-      // Verify no topic created in D1
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("flag on + topic resolution succeeds -> sendMessage payload carries message_thread_id", async () => {
-      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-      const sessionId = "ses_t25_flag_on_success";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      let createTopicPayload: any = null;
-      let sendMessagePayload: any = null;
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          createTopicPayload = JSON.parse(raw);
-          return { ok: true, result: { message_thread_id: 888, name: "My Topic · pigeon" } };
-        });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sendMessagePayload = JSON.parse(raw);
-          return { ok: true, result: { message_id: nextMsgId() } };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Task completed",
-          title: "My Topic",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      expect(createTopicPayload).toEqual({
-        chat_id: topicChatId,
-        name: "My Topic · pigeon",
-        icon_color: 7322096,
-      });
-      expect(sendMessagePayload).toEqual({
-        chat_id: topicChatId,
-        message_thread_id: 888,
-        text: "Task completed",
-      });
-
-      // Verify topic row in D1
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.message_thread_id).toBe(888);
-    });
-
     it("flag on + topic resolution rate limited -> returns 429 with retryAfter", async () => {
       const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
       const sessionId = "ses_t25_rate_limited";
@@ -5471,137 +5428,7 @@ describe("topics module and topicName", () => {
       const json = await res.json();
       expect(json).toEqual({ error: "rate_limited", retryAfter: 25 });
     });
-  });
 
-  describe("Task T2.8: Fallback rules", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-    });
-
-    it("non-429 topic sendMessage failure (e.g. CHAT_NOT_A_FORUM) -> falls back to General and succeeds", async () => {
-      const sessionId = "ses_t28_non429_send_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fallback", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 500, now });
-
-      const sentThreadIds: Array<number | undefined> = [];
-
-      // Intercept 1st sendMessage (with topic thread_id 500 -> non-429 error)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadIds.push(body.message_thread_id);
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      // Intercept 2nd sendMessage (General fallback without message_thread_id -> success)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadIds.push(body.message_thread_id);
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 8888 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification falling back to General",
-          title: "fallback",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      const json = await res.json();
-      expect(json).toEqual({ ok: true, messageId: 8888, token: expect.any(String) });
-      expect(sentThreadIds).toEqual([500, undefined]);
-    });
-
-    // pigeon-bit4: a 5xx from Telegram is transient, so relocating the message to General
-    // discards the topic permanently for a condition that would have cleared on the next
-    // attempt. The outbox retries a 502, and it retries into the RIGHT topic.
-    it("5xx topic sendMessage failure -> returns 502 for outbox retry and does NOT fall back to General", async () => {
-      const sessionId = "ses_bit4_5xx_no_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · 5xx", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 520, now });
-
-      const sentThreadIds: Array<number | undefined> = [];
-
-      // Two interceptors registered, but only ONE must be consumed. A second send is the bug.
-      for (let i = 0; i < 2; i++) {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply((opts: any) => {
-            const body = JSON.parse(opts.body as string);
-            sentThreadIds.push(body.message_thread_id);
-            return {
-              statusCode: 502,
-              data: JSON.stringify({ ok: false, error_code: 502, description: "Bad Gateway" }),
-              responseOptions: { headers: { "Content-Type": "application/json" } },
-            };
-          });
-      }
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification that must not be relocated",
-          title: "5xx",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(502);
-      expect(sentThreadIds).toEqual([520]);
-      // Pin the error_code that reaches the daemon. delivery-policy rule 6 keys on
-      // details.error_code === 400 and would answer a retryable 502 with strip_entities,
-      // charging an attempt and terminal-dropping the message after ~10 of them.
-      const body520 = (await res.json()) as { details?: { error_code?: number } };
-      expect(body520.details?.error_code).toBe(502);
-    });
-
-    // A 200 whose body does not parse yields kind:"error" with NO errorCode. That most likely
-    // means Telegram processed the send, so a relocation would guarantee a misfiled copy while
-    // a retry only risks a duplicate in the correct topic.
     it("undefined errorCode on a topic send -> returns 502 and does NOT fall back to General", async () => {
       const sessionId = "ses_bit4_undef_no_fallback";
       await registerSession(sessionId, "devbox", "pigeon");
@@ -5650,556 +5477,6 @@ describe("topics module and topicName", () => {
       expect(body521.details?.error_code).toBeUndefined();
     });
 
-    // The incident-shaped 5xx: a gateway error arrives as HTML or an empty body, not as JSON
-    // with an error_code, so it takes a different branch of parseTgResponse (res.status rather
-    // than data.error_code). That is the shape actually observed during the slow episode.
-    it("non-JSON gateway 502 on a topic send -> returns 502 and does NOT fall back to General", async () => {
-      const sessionId = "ses_bit4_5xx_html_no_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · html", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 522, now });
-
-      const sentThreadIds: Array<number | undefined> = [];
-      for (let i = 0; i < 2; i++) {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply((opts: any) => {
-            const body = JSON.parse(opts.body as string);
-            sentThreadIds.push(body.message_thread_id);
-            return {
-              statusCode: 502,
-              data: "<html><body>Bad Gateway</body></html>",
-              responseOptions: { headers: { "Content-Type": "text/html" } },
-            };
-          });
-      }
-
-      const res = await handleSendNotification(
-        env.DB,
-        testEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId: topicChatId,
-            text: "gateway error",
-            title: "html",
-            dir: "pigeon",
-            threaded: true,
-          }),
-        }),
-      );
-
-      expect(res.status).toBe(502);
-      expect(sentThreadIds).toEqual([522]);
-      const body = (await res.json()) as { details?: { error_code?: number } };
-      expect(body.details?.error_code).toBe(502);
-    });
-
-    // The recreate path rewrites messageThreadId, so the relocation guard below it runs against
-    // a DIFFERENT thread id than the one resolveTopic first returned. A 5xx on that retry must
-    // still retry rather than relocate.
-    it("5xx after a successful topic recreate -> returns 502 and does NOT fall back to General", async () => {
-      const sessionId = "ses_bit4_recreate_then_5xx";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recreate5xx", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 523, now });
-
-      const sentThreadIds: Array<number | undefined> = [];
-
-      // 1st send -> thread not found.
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          sentThreadIds.push(JSON.parse(opts.body as string).message_thread_id);
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-      // Recreate succeeds with a NEW thread id.
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, { ok: true, result: { message_thread_id: 620, name: "pigeon · recreate5xx", icon_color: 7322096 } }, {
-          headers: { "Content-Type": "application/json" },
-        });
-      // Retry into the new thread -> 5xx. Must NOT relocate.
-      for (let i = 0; i < 2; i++) {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply((opts: any) => {
-            sentThreadIds.push(JSON.parse(opts.body as string).message_thread_id);
-            return {
-              statusCode: 502,
-              data: JSON.stringify({ ok: false, error_code: 502, description: "Bad Gateway" }),
-              responseOptions: { headers: { "Content-Type": "application/json" } },
-            };
-          });
-      }
-
-      const res = await handleSendNotification(
-        env.DB,
-        testEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId: topicChatId,
-            text: "recreated then 5xx",
-            title: "recreate5xx",
-            dir: "pigeon",
-            threaded: true,
-          }),
-        }),
-      );
-
-      expect(res.status).toBe(502);
-      // Second send used the RECREATED thread, and there was no third (General) send.
-      expect(sentThreadIds).toEqual([523, 620]);
-    });
-
-    // pigeon-bit4 / S2: every path that silently sends to General instead of the session's
-    // topic must say so in the log. The incident was undiagnosable for exactly this reason --
-    // the relocation left no trace anywhere.
-    it("permanent 4xx relocation to General emits a console.warn naming the session and thread", async () => {
-      const sessionId = "ses_bit4_warn_relocate";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · warn", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 530, now });
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }, {
-            headers: { "Content-Type": "application/json" },
-          });
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: true, result: { message_id: 9301 } }, {
-            headers: { "Content-Type": "application/json" },
-          });
-
-        const res = await handleSendNotification(
-          env.DB,
-          testEnv,
-          new Request("https://worker/notifications/send", {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify({
-              sessionId,
-              chatId: topicChatId,
-              text: "relocated",
-              title: "warn",
-              dir: "pigeon",
-              threaded: true,
-            }),
-          }),
-        );
-        expect(res.status).toBe(200);
-
-        const relocateWarn = warnSpy.mock.calls.find(
-          (c) => typeof c[0] === "string" && c[0].includes("relocating notification to General"),
-        );
-        expect(relocateWarn).toBeDefined();
-        expect(relocateWarn![1]).toMatchObject({
-          sessionId,
-          messageThreadId: 530,
-          reason: "send_failed",
-        });
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
-
-    it("recreate-failed relocation to General emits a console.warn", async () => {
-      const sessionId = "ses_bit4_warn_recreate";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · recreate", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 531, now });
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        // 1st send -> thread not found, triggering the recreate path.
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: false, error_code: 400, description: "Bad Request: message thread not found" }, {
-            headers: { "Content-Type": "application/json" },
-          });
-        // createForumTopic fails non-429 -> resolveTopic returns null -> General.
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-          .reply(200, { ok: false, error_code: 400, description: "Bad Request: not enough rights" }, {
-            headers: { "Content-Type": "application/json" },
-          });
-        // Retry send, now unthreaded -> succeeds.
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: true, result: { message_id: 9302 } }, {
-            headers: { "Content-Type": "application/json" },
-          });
-
-        const res = await handleSendNotification(
-          env.DB,
-          testEnv,
-          new Request("https://worker/notifications/send", {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify({
-              sessionId,
-              chatId: topicChatId,
-              text: "recreate then general",
-              title: "recreate",
-              dir: "pigeon",
-              threaded: true,
-            }),
-          }),
-        );
-        expect(res.status).toBe(200);
-
-        const warns = warnSpy.mock.calls.filter((c) => typeof c[0] === "string");
-        expect(
-          warns.some((c) => (c[0] as string).includes("topic creation failed")),
-        ).toBe(true);
-        expect(
-          warns.some(
-            (c) =>
-              (c[0] as string).includes("relocating notification to General") &&
-              (c[1] as Record<string, unknown>)?.reason === "recreate_failed",
-          ),
-        ).toBe(true);
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
-
-    it("media attachment failure emits a console.warn instead of being silently skipped", async () => {
-      const sessionId = "ses_bit4_warn_media";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: true, result: { message_id: 9303 } }, {
-            headers: { "Content-Type": "application/json" },
-          });
-        // sendPhoto fails -> today the loop swallows it with `continue`.
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-          .reply(200, { ok: false, error_code: 400, description: "Bad Request: PHOTO_INVALID_DIMENSIONS" }, {
-            headers: { "Content-Type": "application/json" },
-          });
-
-        const mediaKey = `outbound/${Date.now()}-bit4/photo.png`;
-        await env.MEDIA.put(mediaKey, new Uint8Array([1, 2, 3]));
-
-        const res = await handleSendNotification(
-          env.DB,
-          { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env,
-          new Request("https://worker/notifications/send", {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify({
-              sessionId,
-              chatId: topicChatId,
-              text: "with media",
-              media: [{ key: mediaKey, mime: "image/png", filename: "photo.png" }],
-            }),
-          }),
-        );
-        expect(res.status).toBe(200);
-
-        expect(
-          warnSpy.mock.calls.some(
-            (c) => typeof c[0] === "string" && c[0].includes("media attachment not delivered"),
-          ),
-        ).toBe(true);
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
-
-    // pigeon-bit4 / S3: one column cannot express this. message_thread_id IS NULL is already
-    // five-way ambiguous (relocated / threaded:false / topics off / no topic resolved / media
-    // row), so placement is recorded as the pair (intended, actual).
-    it("records intended and actual thread ids as equal on a normal threaded send", async () => {
-      const sessionId = "ses_bit4_cols_threaded";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · cols", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 540, now });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, { ok: true, result: { message_id: 9401 } }, {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const res = await handleSendNotification(
-        env.DB,
-        testEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId: topicChatId,
-            text: "threaded",
-            title: "cols",
-            dir: "pigeon",
-            threaded: true,
-          }),
-        }),
-      );
-      expect(res.status).toBe(200);
-
-      const row = await env.DB.prepare(
-        "SELECT intended_thread_id, actual_thread_id FROM messages WHERE message_id = ?",
-      )
-        .bind(9401)
-        .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
-      expect(row).toMatchObject({ intended_thread_id: 540, actual_thread_id: 540 });
-    });
-
-    it("records intended set and actual null when a notification is relocated to General", async () => {
-      const sessionId = "ses_bit4_cols_relocated";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reloc", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 541, now });
-
-      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" }, {
-            headers: { "Content-Type": "application/json" },
-          });
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: true, result: { message_id: 9402 } }, {
-            headers: { "Content-Type": "application/json" },
-          });
-
-        const res = await handleSendNotification(
-          env.DB,
-          testEnv,
-          new Request("https://worker/notifications/send", {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify({
-              sessionId,
-              chatId: topicChatId,
-              text: "relocated",
-              title: "reloc",
-              dir: "pigeon",
-              threaded: true,
-            }),
-          }),
-        );
-        expect(res.status).toBe(200);
-
-        const row = await env.DB.prepare(
-          "SELECT intended_thread_id, actual_thread_id FROM messages WHERE message_id = ?",
-        )
-          .bind(9402)
-          .first<{ intended_thread_id: number | null; actual_thread_id: number | null }>();
-        // This pair -- intended non-null, actual null -- IS the definition of a relocation,
-        // and is the query that will finally give us a relocation rate.
-        expect(row).toMatchObject({ intended_thread_id: 541, actual_thread_id: null });
-      } finally {
-        warnSpy.mockRestore();
-      }
-    });
-
-    // The columns are added to prod by a manual ALTER. If the code ships first, or the ALTER
-    // is rolled back, the write MUST degrade to a warn. An INSERT that referenced a missing
-    // column would throw AFTER Telegram already accepted the message -> 503 -> the daemon
-    // retries a message that was in fact delivered, every 5-120s for 24h.
-    it("still inserts the message row, and warns, when the placement columns do not exist", async () => {
-      const sessionId = "ses_bit4_cols_missing";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      // Must be a THREADED send: with no thread on either side there is no placement to
-      // record, recordThreadPlacement returns early, and this test would pass vacuously.
-      const nowMissing = Date.now();
-      await reserve(env.DB, {
-        sessionId,
-        machineId: "devbox",
-        chatId: topicChatId,
-        name: "pigeon · missing",
-        now: nowMissing,
-      });
-      await finalize(env.DB, { sessionId, messageThreadId: 542, now: nowMissing });
-
-      let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
-      try {
-        warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-        await env.DB.prepare("ALTER TABLE messages DROP COLUMN intended_thread_id").run();
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply(200, { ok: true, result: { message_id: 9403 } }, {
-            headers: { "Content-Type": "application/json" },
-          });
-
-        const res = await handleSendNotification(
-          env.DB,
-          testEnv,
-          new Request("https://worker/notifications/send", {
-            method: "POST",
-            headers: authHeaders,
-            body: JSON.stringify({
-              sessionId,
-              chatId: topicChatId,
-              text: "no columns",
-              title: "missing",
-              dir: "pigeon",
-              threaded: true,
-            }),
-          }),
-        );
-
-        // The notification is delivered and acknowledged; only the bookkeeping is lost.
-        expect(res.status).toBe(200);
-        const row = await env.DB.prepare("SELECT session_id FROM messages WHERE message_id = ?")
-          .bind(9403)
-          .first<{ session_id: string }>();
-        expect(row?.session_id).toBe(sessionId);
-        expect(
-          warnSpy.mock.calls.some(
-            (c) => typeof c[0] === "string" && c[0].includes("thread placement not recorded"),
-          ),
-        ).toBe(true);
-      } finally {
-        // Restore before anything else: the DB is shared across the whole file
-        // (isolatedStorage: false), so a missing column would leak into later tests.
-        await env.DB.prepare(
-          "ALTER TABLE messages ADD COLUMN intended_thread_id INTEGER",
-        ).run().catch(() => {});
-        warnSpy?.mockRestore();
-      }
-    });
-
-    it("429 topic sendMessage failure -> returns 429 with retryAfter and does NOT fall back to General", async () => {
-      const sessionId = "ses_t28_429_send_no_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · rate limit", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 501, now });
-
-      let sendCalls = 0;
-
-      // Intercept 1st sendMessage (with topic thread_id 501 -> 429 rate limit)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          sendCalls++;
-          return {
-            statusCode: 429,
-            data: JSON.stringify({ ok: false, error_code: 429, parameters: { retry_after: 12 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification hit rate limit on topic send",
-          title: "rate limit",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(429);
-      const json = await res.json();
-      expect(json).toEqual({ error: "rate_limited", retryAfter: 12 });
-      expect(sendCalls).toBe(1); // Crucial assertion: exactly 1 call, no General fallback call made
-    });
-
-    it("non-429 createForumTopic failure -> falls back to General and succeeds", async () => {
-      const sessionId = "ses_t28_non429_create_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      let createTopicCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, () => {
-          createTopicCalls++;
-          return { ok: false, error_code: 400, description: "Bad Request: FORUM_CLOSED" };
-        });
-
-      let sentThreadId: number | undefined = 99;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 7777 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Fallback from create failure",
-          title: "create fallback",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      expect(createTopicCalls).toBe(1);
-      expect(sentThreadId).toBeUndefined(); // Sent to General
-    });
-
     it("429 createForumTopic failure -> returns 429 with retryAfter and does NOT call sendMessage", async () => {
       const sessionId = "ses_t28_429_create_no_send";
       await registerSession(sessionId, "devbox", "pigeon");
@@ -6238,107 +5515,51 @@ describe("topics module and topicName", () => {
       expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
       expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
     });
-  });
 
-  describe("pigeon-iqpd: hold transiently-unresolvable topics for retry (onTopicUnavailable)", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-      delete (env as any).TELEGRAM_TOPICS_ENABLED;
-    });
-
-    it("first notification, createForumTopic returns 520, onTopicUnavailable:'retry' -> 502 topic_unavailable, no sendMessage, no alert, no messages row, no retryAfter/details", async () => {
-      const sessionId = "ses_iqpd_first_520_retry";
+    it("flag off -> sendPhoto and sendDocument do NOT carry message_thread_id", async () => {
+      const sessionId = "ses_t29_flag_off_media";
       await registerSession(sessionId, "devbox", "pigeon");
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(520, { ok: false, error_code: 520, description: "Web server is returning an unknown error" });
+      const imageKey = `media_test/img_off_${Date.now()}.png`;
 
-      let sendMessageCalled = false;
+      const uploadForm1 = new FormData();
+      uploadForm1.append("key", imageKey);
+      uploadForm1.append("mime", "image/png");
+      uploadForm1.append("filename", "screenshot.png");
+      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
+      await SELF.fetch("https://worker/media/upload", {
+        method: "POST",
+        body: uploadForm1,
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      });
+
       fetchMock
         .get("https://api.telegram.org")
         .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, () => {
-          sendMessageCalled = true;
-          return { ok: true, result: { message_id: 1111 } };
+        .reply(200, JSON.stringify({ ok: true, result: { message_id: 2000 } }), {
+          headers: { "Content-Type": "application/json" },
         });
 
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "First notification to hold",
-          title: "first520",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(502);
-      expect(res.headers.get("Retry-After")).toBeNull();
-
-      const json = (await res.json()) as Record<string, unknown>;
-      expect(json.error).toBe("topic_unavailable");
-      expect(json.reason).toBe("create_failed");
-      expect(json).not.toHaveProperty("retryAfter");
-      expect(json).not.toHaveProperty("details");
-      expect(json.createError).toEqual({
-        ok: false,
-        error_code: 520,
-        description: "Web server is returning an unknown error",
-      });
-
-      expect(sendMessageCalled).toBe(false);
-
-      const msgRow = await env.DB.prepare("SELECT * FROM messages WHERE session_id = ?")
-        .bind(sessionId)
-        .first();
-      expect(msgRow).toBeNull();
-    });
-
-    it("createForumTopic returns 520, onTopicUnavailable absent -> relocates to General (200)", async () => {
-      const sessionId = "ses_iqpd_first_520_absent";
-      await registerSession(sessionId, "devbox", "pigeon");
-
+      let photoThreadId: string | null = null;
+      let photoCalled = false;
       fetchMock
         .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
-
-      let sentThreadId: number | undefined = 99;
-      // 1st sendMessage: actual notification to General
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
         .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
+          photoCalled = true;
+          if (opts.body instanceof FormData) {
+            photoThreadId = opts.body.get("message_thread_id") as string | null;
+          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
+            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
+            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
+            photoThreadId = match ? match[1] : null;
+          }
           return {
             statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 2221 } }),
+            data: JSON.stringify({ ok: true, result: { message_id: 2001 } }),
             responseOptions: { headers: { "Content-Type": "application/json" } },
           };
         });
-      // 2nd sendMessage: relocation alert
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, { ok: true, result: { message_id: 2222 } });
 
       const request = new Request("https://worker/notifications/send", {
         method: "POST",
@@ -6346,365 +5567,54 @@ describe("topics module and topicName", () => {
         body: JSON.stringify({
           sessionId,
           chatId: topicChatId,
-          text: "Notification without flag",
-          title: "absent",
+          text: "Notification with photo with flag off",
+          title: "Media Topic",
           dir: "pigeon",
           threaded: true,
+          media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
         }),
       });
 
-      const res = await handleSendNotification(env.DB, testEnv, request);
+      const res = await handleSendNotification(env.DB, env, request);
+
       expect(res.status).toBe(200);
-      expect(sentThreadId).toBeUndefined(); // Posted to General
+      expect(photoCalled).toBe(true);
+      expect(photoThreadId).toBeNull();
     });
 
-    it("createForumTopic returns 520, onTopicUnavailable 'general' -> relocates to General (200)", async () => {
-      const sessionId = "ses_iqpd_first_520_general";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
-
-      let sentThreadId: number | undefined = 99;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 2223 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-      // Relocation alert
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, { ok: true, result: { message_id: 2224 } });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with general flag",
-          title: "general",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "general",
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-      expect(res.status).toBe(200);
-      expect(sentThreadId).toBeUndefined();
-    });
-
-    it("4xx create failure with onTopicUnavailable:'retry' -> relocates as today", async () => {
-      const sessionId = "ses_iqpd_create_400_retry";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, { ok: false, error_code: 400, description: "Bad Request: FORUM_CLOSED" });
-
-      let sentThreadId: number | undefined = 99;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 3331 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-      // Relocation alert
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, { ok: true, result: { message_id: 3332 } });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with permanent 400 create error",
-          title: "perm400",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-      expect(res.status).toBe(200);
-      expect(sentThreadId).toBeUndefined(); // Relocated to General
-    });
-
-    it("topic_in_other_chat with onTopicUnavailable:'retry' -> relocates as today", async () => {
-      const sessionId = "ses_iqpd_other_chat_retry";
+    it("T2.10 (d) flag OFF -> topic row is left completely untouched (still state='open') and zero Telegram calls", async () => {
+      const sessionId = "ses_t210_case_d";
       await registerSession(sessionId, "devbox", "pigeon");
 
       const now = Date.now();
-      await reserve(env.DB, {
-        sessionId,
-        machineId: "devbox",
-        chatId: "-1009999999999", // Different chat
-        name: "pigeon · other chat",
-        now,
-      });
-      await finalize(env.DB, { sessionId, messageThreadId: 444, now });
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg d", now });
+      await finalize(env.DB, { sessionId, messageThreadId: 61004, now });
 
-      let sentThreadId: number | undefined = 99;
+      let telegramCalled = false;
       fetchMock
         .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 4441 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
+        .intercept({ method: "POST", path: /\/bot.*/ })
+        .reply(() => {
+          telegramCalled = true;
+          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
         });
-      // Relocation alert
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, { ok: true, result: { message_id: 4442 } });
 
-      const request = new Request("https://worker/notifications/send", {
+      const request = new Request("https://worker/sessions/unregister", {
         method: "POST",
         headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification when topic in other chat",
-          title: "other chat",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
+        body: JSON.stringify({ sessionId }),
       });
 
-      const res = await handleSendNotification(env.DB, testEnv, request);
+      const res = await handleSessionRequest(env.DB, env, request, "unregister");
       expect(res.status).toBe(200);
-      expect(sentThreadId).toBeUndefined(); // Relocated to General
+      expect(await res.json()).toEqual({ ok: true });
+
+      expect(telegramCalled).toBe(false);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+      expect(row?.closed_at).toBeNull();
     });
-
-    it("T2.7 recreate path: createForumTopic 5xx with onTopicUnavailable:'retry' -> 502 topic_unavailable, only one failed sendMessage made", async () => {
-      const sessionId = "ses_iqpd_recreate_5xx_retry";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, {
-        sessionId,
-        machineId: "devbox",
-        chatId: topicChatId,
-        name: "pigeon · recreate5xx",
-        now,
-      });
-      await finalize(env.DB, { sessionId, messageThreadId: 555, now });
-
-      let sendMessageCalls = 0;
-      // 1st send -> thread not found (400)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(() => {
-          sendMessageCalls++;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      // T2.7 recreate -> createForumTopic fails with 520
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(520, { ok: false, error_code: 520, description: "Bad Gateway" });
-
-      // If a second sendMessage were called, intercept it to fail or record
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(() => {
-          sendMessageCalls++;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 5552 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Recreation fails 520 with retry",
-          title: "recreate5xx",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-      expect(res.status).toBe(502);
-
-      const json = (await res.json()) as Record<string, unknown>;
-      expect(json.error).toBe("topic_unavailable");
-      expect(json.reason).toBe("recreate_failed:create_failed");
-      expect(json.createError).toEqual({
-        ok: false,
-        error_code: 520,
-        description: "Bad Gateway",
-      });
-      expect(json).not.toHaveProperty("retryAfter");
-      expect(json).not.toHaveProperty("details");
-
-      // Crucial: only the one failed sendMessage was made
-      expect(sendMessageCalls).toBe(1);
-
-      const msgRow = await env.DB.prepare("SELECT * FROM messages WHERE session_id = ?")
-        .bind(sessionId)
-        .first();
-      expect(msgRow).toBeNull();
-    });
-
-    it("after a held 502, subsequent request whose createForumTopic succeeds posts into the new topic", async () => {
-      const sessionId = "ses_iqpd_retry_after_held";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      // 1st request: createForumTopic returns 520
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(520, { ok: false, error_code: 520, description: "Unknown Error" });
-
-      const req1 = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Attempt 1: held",
-          title: "retry_after_held",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res1 = await handleSendNotification(env.DB, testEnv, req1);
-      expect(res1.status).toBe(502);
-
-      // Verify reservation row was cleaned up so next attempt can reserve and create
-      expect(await getBySession(env.DB, sessionId)).toBeNull();
-
-      // 2nd request: createForumTopic succeeds with thread 789
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, {
-          ok: true,
-          result: { message_thread_id: 789, name: "pigeon · retry_after_held", icon_color: 7322096 },
-        });
-
-      let sentThreadId: number | undefined;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          sentThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 998877 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      // Unpin call after create
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(200, { ok: true, result: true });
-
-      const req2 = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Attempt 2: succeeds",
-          title: "retry_after_held",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res2 = await handleSendNotification(env.DB, testEnv, req2);
-      expect(res2.status).toBe(200);
-      expect(sentThreadId).toBe(789); // Posted into the newly created topic!
-    });
-
-    it("poll_exhausted with onTopicUnavailable:'retry' -> 502 topic_unavailable", async () => {
-      const sessionId = "ses_iqpd_poll_exhausted_retry";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      // Reserve the session row so this caller is not the winner
-      await reserve(env.DB, {
-        sessionId,
-        machineId: "another-machine",
-        chatId: topicChatId,
-        name: "pigeon · exhausted",
-        now: Date.now(),
-      });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Poll exhausted",
-          title: "exhausted",
-          dir: "pigeon",
-          threaded: true,
-          onTopicUnavailable: "retry",
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-      expect(res.status).toBe(502);
-
-      const json = (await res.json()) as Record<string, unknown>;
-      expect(json.error).toBe("topic_unavailable");
-      expect(json.reason).toBe("poll_exhausted");
-      expect(json).not.toHaveProperty("retryAfter");
-      expect(json).not.toHaveProperty("details");
-    });
-
-    // Note: finalize_lost_no_winner under handleSendNotification requires racing an async D1 delete
-    // inside synchronous fetchMock interceptors; covered by resolveTopic unit test at line 7977.
   });
 
   describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {
@@ -6843,346 +5753,46 @@ describe("topics module and topicName", () => {
     });
   });
 
-  describe("Task T2.9: Media passes message_thread_id", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-      delete (env as any).TELEGRAM_TOPICS_ENABLED;
-    });
-
-    it("flag on + topic resolved -> sendPhoto and sendDocument carry message_thread_id in FormData", async () => {
-      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-      const sessionId = "ses_t29_flag_on_media";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      // Upload image and document to R2
-      const imageKey = `media_test/img_${Date.now()}.png`;
-      const docKey = `media_test/doc_${Date.now()}.pdf`;
-
-      const uploadForm1 = new FormData();
-      uploadForm1.append("key", imageKey);
-      uploadForm1.append("mime", "image/png");
-      uploadForm1.append("filename", "screenshot.png");
-      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
-      await SELF.fetch("https://worker/media/upload", {
-        method: "POST",
-        body: uploadForm1,
-        headers: { Authorization: `Bearer ${API_KEY}` },
-      });
-
-      const uploadForm2 = new FormData();
-      uploadForm2.append("key", docKey);
-      uploadForm2.append("mime", "application/pdf");
-      uploadForm2.append("filename", "report.pdf");
-      uploadForm2.append("file", new Blob(["pdf_data"], { type: "application/pdf" }), "report.pdf");
-      await SELF.fetch("https://worker/media/upload", {
-        method: "POST",
-        body: uploadForm2,
-        headers: { Authorization: `Bearer ${API_KEY}` },
-      });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 9888, name: "pigeon · Media Topic" } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_id: 1000 } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      let photoThreadId: string | null = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-        .reply((opts: any) => {
-          if (opts.body instanceof FormData) {
-            photoThreadId = opts.body.get("message_thread_id") as string | null;
-          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
-            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
-            photoThreadId = match ? match[1] : null;
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 1001 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      let docThreadId: string | null = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendDocument/ })
-        .reply((opts: any) => {
-          if (opts.body instanceof FormData) {
-            docThreadId = opts.body.get("message_thread_id") as string | null;
-          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
-            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
-            docThreadId = match ? match[1] : null;
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 1002 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with photo and document",
-          title: "Media Topic",
-          dir: "pigeon",
-          threaded: true,
-          media: [
-            { key: imageKey, mime: "image/png", filename: "screenshot.png" },
-            { key: docKey, mime: "application/pdf", filename: "report.pdf" },
-          ],
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      expect(photoThreadId).toBe("9888");
-      expect(docThreadId).toBe("9888");
-    });
-
-    it("media follows the recreated thread after T2.7 stale-thread recovery", async () => {
-      // Regression: messageThreadId was assigned once and never updated by the T2.7
-      // retry, so the media loop kept sending to the DELETED thread. sendPhoto then
-      // failed and the item was silently skipped -- attachments dropped with no log.
-      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-      const sessionId = "ses_t29_media_after_recovery";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const imageKey = `media_test/img_recov_${Date.now()}.png`;
-      const uploadForm = new FormData();
-      uploadForm.append("key", imageKey);
-      uploadForm.append("mime", "image/png");
-      uploadForm.append("filename", "shot.png");
-      uploadForm.append("file", new Blob(["png_data"], { type: "image/png" }), "shot.png");
-      await SELF.fetch("https://worker/media/upload", {
-        method: "POST",
-        body: uploadForm,
-        headers: { Authorization: `Bearer ${API_KEY}` },
-      });
-
-      // Seed a finalized topic pointing at thread 500, which Telegram no longer has.
-      await reserve(env.DB, {
-        sessionId,
-        machineId: "devbox",
-        chatId: topicChatId,
-        name: "pigeon · Recovered",
-        now: Date.now(),
-      });
-      await finalize(env.DB, { sessionId, messageThreadId: 51500, now: Date.now() });
-
-      // The recreate produces thread 777.
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_thread_id: 51777, name: "pigeon · Recovered" } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      // First send hits the dead thread; the retry after recovery succeeds.
-      const sentThreadIds: (number | undefined)[] = [];
-      let sendCount = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply((opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sentThreadIds.push(JSON.parse(raw).message_thread_id);
-          sendCount++;
-          if (sendCount === 1) {
-            return {
-              statusCode: 400,
-              data: JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }),
-              responseOptions: { headers: { "Content-Type": "application/json" } },
-            };
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 520001 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        })
-        .times(2);
-
-      let photoThreadId: string | null = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-        .reply((opts: any) => {
-          if (opts.body instanceof FormData) {
-            photoThreadId = opts.body.get("message_thread_id") as string | null;
-          } else {
-            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
-            photoThreadId = match ? match[1] : null;
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 520002 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with photo",
-          title: "Recovered",
-          dir: "pigeon",
-          threaded: true,
-          media: [{ key: imageKey, mime: "image/png", filename: "shot.png" }],
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(200);
-      // Text recovered onto the new thread.
-      expect(sentThreadIds).toEqual([51500, 51777]);
-      // The photo must follow the text onto 777, not chase the deleted 500.
-      expect(photoThreadId).toBe("51777");
-    });
-
-    it("flag off -> sendPhoto and sendDocument do NOT carry message_thread_id", async () => {
-      const sessionId = "ses_t29_flag_off_media";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const imageKey = `media_test/img_off_${Date.now()}.png`;
-
-      const uploadForm1 = new FormData();
-      uploadForm1.append("key", imageKey);
-      uploadForm1.append("mime", "image/png");
-      uploadForm1.append("filename", "screenshot.png");
-      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
-      await SELF.fetch("https://worker/media/upload", {
-        method: "POST",
-        body: uploadForm1,
-        headers: { Authorization: `Bearer ${API_KEY}` },
-      });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_id: 2000 } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      let photoThreadId: string | null = null;
-      let photoCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-        .reply((opts: any) => {
-          photoCalled = true;
-          if (opts.body instanceof FormData) {
-            photoThreadId = opts.body.get("message_thread_id") as string | null;
-          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
-            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
-            photoThreadId = match ? match[1] : null;
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 2001 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with photo with flag off",
-          title: "Media Topic",
-          dir: "pigeon",
-          threaded: true,
-          media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, env, request);
-
-      expect(res.status).toBe(200);
-      expect(photoCalled).toBe(true);
-      expect(photoThreadId).toBeNull();
-    });
-  });
-
   describe("Task T2.10: Unregister topic closing", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    let um: SlackMachine;
+    let uEnv: Env;
+    let srv: ReturnType<typeof fakeSlack>;
 
-    beforeEach(() => {
+    beforeEach(async () => {
+      resetSlackCalls();
       fetchMock.activate();
       fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      um = await mkSlackMachine();
+      uEnv = envWith([um]);
+      srv = fakeSlack();
     });
 
     afterEach(() => {
+      fetchMock.get("https://slack.com").cleanMocks();
       fetchMock.deactivate();
     });
 
-    it("(a) flag ON, finalized topic row -> row state='closed', closed_at set, closeForumTopic called, topic row still exists", async () => {
-      const sessionId = "ses_t210_case_a";
-      await registerSession(sessionId, "devbox", "pigeon");
+    const unregister = (sessionId: string, immediate: boolean) =>
+      handleSessionRequest(
+        env.DB,
+        uEnv,
+        new Request("https://worker/sessions/unregister", {
+          method: "POST",
+          headers: authHeaders,
+          body: JSON.stringify(immediate ? { sessionId, immediate: true } : { sessionId }),
+        }),
+        "unregister",
+      );
 
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg a", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61001, now });
+    it("(a) finalized topic row -> row state='closed', closed_at set, the conversation archived, topic row still exists", async () => {
+      const sessionId = await seedSession(um.machineId);
+      const topic = await seedSlackTopic(sessionId, um.machineId, um.ws, "pigeon · unreg a");
 
-      let closeCalledWith: { chatId: unknown; messageThreadId: unknown } | null = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          closeCalledWith = { chatId: String(body.chat_id), messageThreadId: body.message_thread_id };
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId, immediate: true }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      const res = await unregister(sessionId, true);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true });
 
-      expect(closeCalledWith).toEqual({ chatId: topicChatId, messageThreadId: 61001 });
+      expect(srv.of("conversations.archive").map((c) => c.params.get("channel"))).toEqual([topic.channelId]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).not.toBeNull();
@@ -7191,28 +5801,12 @@ describe("topics module and topicName", () => {
       expect(row?.closed_at).toBeGreaterThan(0);
     });
 
-    it("(b) flag ON, Telegram closeForumTopic fails -> returns 200 {ok:true} and row is STILL marked closed", async () => {
-      const sessionId = "ses_t210_case_b";
-      await registerSession(sessionId, "devbox", "pigeon");
+    it("(b) the provider's close fails -> returns 200 {ok:true} and row is STILL marked closed", async () => {
+      const sessionId = await seedSession(um.machineId);
+      await seedSlackTopic(sessionId, um.machineId, um.ws, "pigeon · unreg b");
+      srv.script("conversations.archive", { ok: false, error: "channel_not_found" });
 
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg b", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61002, now });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(400, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId, immediate: true }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      const res = await unregister(sessionId, true);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true });
 
@@ -7221,133 +5815,45 @@ describe("topics module and topicName", () => {
       expect(typeof row?.closed_at).toBe("number");
     });
 
-    it("(c) flag ON, reservation row with NULL message_thread_id -> row marked closed, zero Telegram calls", async () => {
-      const sessionId = "ses_t210_case_c";
-      await registerSession(sessionId, "devbox", "pigeon");
+    it("(c) reservation row with NULL message_thread_id -> row marked closed, zero provider calls", async () => {
+      const sessionId = await seedSession(um.machineId);
+      await reserve(env.DB, { sessionId, machineId: um.machineId, chatId: slackChatId(um.ws), name: "pigeon · unreg c", now: Date.now() });
 
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg c", now });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId, immediate: true }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      const res = await unregister(sessionId, true);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true });
 
-      expect(telegramCalled).toBe(false);
+      expect(slackCalls).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.state).toBe("closed");
       expect(row?.message_thread_id).toBeNull();
     });
 
-    it("(d) flag OFF -> topic row is left completely untouched (still state='open') and zero Telegram calls", async () => {
-      const sessionId = "ses_t210_case_d";
-      await registerSession(sessionId, "devbox", "pigeon");
+    it("(e) session with no topic row -> 200, no provider call, no crash", async () => {
+      const sessionId = await seedSession(um.machineId);
 
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg d", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61004, now });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
-      });
-
-      const res = await handleSessionRequest(env.DB, env, request, "unregister");
+      const res = await unregister(sessionId, false);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true });
 
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("open");
-      expect(row?.closed_at).toBeNull();
+      expect(slackCalls).toEqual([]);
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
     });
 
-    it("(e) flag ON, session with no topic row -> 200, no Telegram call, no crash", async () => {
-      const sessionId = "ses_t210_case_e";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true });
-
-      expect(telegramCalled).toBe(false);
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("(f) flag ON, no `immediate` -> topic is LEFT OPEN for the daily close window, zero Telegram calls", async () => {
+    it("(f) no `immediate` -> topic is LEFT OPEN for the daily close window, zero provider calls", async () => {
       // pigeon-xehy. This is the janitorial path: the daemon's hourly session reaper, dead-session
       // cleanup and the outbox's compensating unregister all land here. Leaving the row
       // state='open' with its `sessions` row deleted is precisely what `listOrphaned` selects, so
       // the windowed orphan-closer collects it instead of a service message appearing off-window.
-      const sessionId = "ses_t210_case_f";
-      await registerSession(sessionId, "devbox", "pigeon");
+      const sessionId = await seedSession(um.machineId);
+      await seedSlackTopic(sessionId, um.machineId, um.ws, "pigeon · unreg f");
 
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg f", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61006, now });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      const res = await unregister(sessionId, false);
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true });
 
-      expect(telegramCalled).toBe(false);
+      expect(slackCalls).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.state).toBe("open");
@@ -7360,43 +5866,237 @@ describe("topics module and topicName", () => {
       expect(sess).toBeNull();
     });
 
-    it("(g) flag ON, immediate, topic ALREADY closed -> closed_at is not rewritten and no Telegram call", async () => {
+    it("(g) immediate, topic ALREADY closed -> closed_at is not rewritten and no provider call", async () => {
       // `markClosed` is unconditional, so without the state guard a second unregister would reset
       // closed_at and restart the reaper's 30-day delete clock, keeping a dead topic alive.
-      const sessionId = "ses_t210_case_g";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg g", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61007, now });
-      await markClosed(env.DB, { sessionId, now: now - 29 * 24 * 60 * 60 * 1000 });
+      const sessionId = await seedSession(um.machineId);
+      await seedSlackTopic(sessionId, um.machineId, um.ws, "pigeon · unreg g");
+      await markClosed(env.DB, { sessionId, now: Date.now() - 29 * 24 * 60 * 60 * 1000 });
       const before = await getBySession(env.DB, sessionId);
 
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId, immediate: true }),
-      });
-
-      const res = await handleSessionRequest(env.DB, testEnv, request, "unregister");
+      const res = await unregister(sessionId, true);
       expect(res.status).toBe(200);
 
-      expect(telegramCalled).toBe(false);
+      expect(slackCalls).toEqual([]);
       const after = await getBySession(env.DB, sessionId);
       expect(after?.closed_at).toBe(before?.closed_at);
     });
   });
 
   describe("Task T2.11: Topic reaper cron jobs", () => {
+    // Rows live in a Slack workspace; the provider is a scripted fake transport.
+    const topicChatId = "slack:TREAPER";
+    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
+    const botToken = "fake-bot-token";
+
+    beforeEach(async () => {
+      await env.DB.prepare("DELETE FROM topics").run();
+      await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_t211_%'").run();
+    });
+
+    it("(a) reap deletes a closed topic older than 30d: D1 row gone (Slack has nothing to delete, so no provider call)", async () => {
+      const sessionId = "ses_t211_reap_old";
+      const threadId = 62001;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000); // older than 30d
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap old", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      const { client, calls } = fakeTransport();
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+
+      expect(result.reaped).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(calls.deleteForumTopic).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(b) reap does NOT touch a closed topic younger than 30d", async () => {
+      const sessionId = "ses_t211_reap_recent";
+      const threadId = 62002;
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS - 60_000); // 1 minute younger than 30d
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap recent", now: closedAt - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      const { client, calls } = fakeTransport();
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+
+      expect(result.reaped).toBe(0);
+      expect(result.rateLimited).toBe(false);
+      expect(Object.values(calls).flat()).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).not.toBeNull();
+      expect(row?.state).toBe("closed");
+    });
+
+    it("(d) reap cap: with 8 eligible rows, at most 5 are processed in one run", async () => {
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      for (let i = 0; i < 8; i++) {
+        const sessionId = `ses_t211_reap_cap_${i}`;
+        const threadId = 62010 + i;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · cap ${i}`, now: closedAt - 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
+        await markClosed(env.DB, { sessionId, now: closedAt });
+      }
+
+      const { client } = fakeTransport();
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, limit: 5, transport: client });
+
+      expect(result.reaped).toBe(5);
+      const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM topics WHERE session_id LIKE 'ses_t211_reap_cap_%'").first<{ n: number }>();
+      expect(left?.n).toBe(3);
+    });
+
+    it("NULL message_thread_id reap row -> D1 row deleted, zero provider calls", async () => {
+      const sessionId = "ses_t211_null_thread_reap";
+      const now = Date.now();
+      const closedAt = now - (REAP_TTL_MS + 1000);
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread reap", now: closedAt - 1000 });
+      await markClosed(env.DB, { sessionId, now: closedAt });
+
+      const { client, calls } = fakeTransport();
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+
+      expect(result.reaped).toBe(1);
+      expect(Object.values(calls).flat()).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row).toBeNull();
+    });
+
+    it("(e) orphan-close closes an open topic whose sessions row is absent", async () => {
+      const sessionId = "ses_t211_orphan_no_session";
+      const threadId = 62020;
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan no sess", now: now - 8 * 86400 * 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
+
+      const { client, calls } = fakeTransport();
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(calls.closeForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(typeof row?.closed_at).toBe("number");
+    });
+
+    it("(f) orphan-close closes an open topic whose sessions.updated_at is older than 7d TTL", async () => {
+      const sessionId = "ses_t211_orphan_stale_session";
+      const threadId = 62021;
+      const now = Date.now();
+      const oldTime = now - (ORPHAN_TTL_MS + 1000);
+
+      await registerSession(sessionId, "devbox", "stale session");
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(oldTime, sessionId).run();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan stale sess", now: oldTime });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: oldTime });
+
+      const { client, calls } = fakeTransport();
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(result.rateLimited).toBe(false);
+      expect(calls.closeForumTopic).toEqual([{ chatId: topicChatId, messageThreadId: threadId }]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+    });
+
+    it("(g) orphan-close does NOT touch an open topic with a fresh sessions row", async () => {
+      const sessionId = "ses_t211_fresh_session";
+      const threadId = 62022;
+      const now = Date.now();
+
+      await registerSession(sessionId, "devbox", "fresh session");
+      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(now - 1000, sessionId).run();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fresh sess", now: now - 1000 });
+      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 1000 });
+
+      const { client, calls } = fakeTransport();
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+
+      expect(result.closedOrphans).toBe(0);
+      expect(result.rateLimited).toBe(false);
+      expect(Object.values(calls).flat()).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("open");
+    });
+
+    it("(h) orphan cap: with 8 eligible, at most 5 processed", async () => {
+      const now = Date.now();
+
+      for (let i = 0; i < 8; i++) {
+        const sessionId = `ses_t211_orphan_cap_${i}`;
+        const threadId = 62030 + i;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · orphan cap ${i}`, now: now - 8 * 86400 * 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
+      }
+
+      const { client, calls } = fakeTransport();
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5, transport: client });
+
+      expect(result.closedOrphans).toBe(5);
+      expect(calls.closeForumTopic).toHaveLength(5);
+    });
+
+    it("(i) NULL message_thread_id orphan row -> D1 row closed, zero provider calls", async () => {
+      const sessionId = "ses_t211_null_thread_orphan";
+      const now = Date.now();
+
+      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread orphan", now: now - 8 * 86400 * 1000 });
+
+      const { client, calls } = fakeTransport();
+      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+
+      expect(result.closedOrphans).toBe(1);
+      expect(Object.values(calls).flat()).toEqual([]);
+
+      const row = await getBySession(env.DB, sessionId);
+      expect(row?.state).toBe("closed");
+      expect(row?.message_thread_id).toBeNull();
+    });
+
+    it("(j) a rate_limited close stops the run early: the remaining orphans stay open and rateLimited is reported", async () => {
+      const now = Date.now();
+      for (let i = 0; i < 3; i++) {
+        const sessionId = `ses_t211_rate_orphan_${i}`;
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · rate orphan ${i}`, now: now - 8 * 86400 * 1000 });
+        await finalize(env.DB, { sessionId, messageThreadId: 62045 + i, now: now - 8 * 86400 * 1000 });
+      }
+
+      const { client, calls } = fakeTransport({ closeForumTopic: () => results.rateLimited(10) });
+      const result = await runTopicReaper(env.DB, testEnv, { now, transport: client });
+
+      expect(result.rateLimited).toBe(true);
+      expect(result.reaped).toBe(0);
+      expect(result.closedOrphans).toBe(0);
+      expect(calls.closeForumTopic).toHaveLength(1);
+      const open = await env.DB.prepare("SELECT COUNT(*) AS n FROM topics WHERE session_id LIKE 'ses_t211_rate_orphan_%' AND state = 'open'").first<{ n: number }>();
+      expect(open?.n).toBe(3);
+    });
+  });
+
+  // Telegram-only reaper behaviour (a delete call per reaped topic, thread-not-found on that delete, a
+  // 429 on it, the topics flag): kept until the Telegram branch of the reaper is deleted.
+  describe("Telegram-only leftovers of the topic reaper tests", () => {
     const topicChatId = String(CHAT_ID_NUM);
     const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
     const botToken = "fake-bot-token";
@@ -7445,36 +6145,6 @@ describe("topics module and topicName", () => {
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
-    });
-
-    it("(b) reap does NOT touch a closed topic younger than 30d", async () => {
-      const sessionId = "ses_t211_reap_recent";
-      const threadId = 62002;
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS - 60_000); // 1 minute younger than 30d
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap recent", now: closedAt - 1000 });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
-      await markClosed(env.DB, { sessionId, now: closedAt });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
-
-      expect(result.reaped).toBe(0);
-      expect(result.rateLimited).toBe(false);
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).not.toBeNull();
-      expect(row?.state).toBe("closed");
     });
 
     it("(c) reap on thread_not_found still deletes the D1 row", async () => {
@@ -7531,186 +6201,6 @@ describe("topics module and topicName", () => {
 
       expect(result.reaped).toBe(5);
       expect(deleteCalls).toBe(5);
-    });
-
-    it("NULL message_thread_id reap row -> D1 row deleted, zero Telegram calls", async () => {
-      const sessionId = "ses_t211_null_thread_reap";
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000);
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread reap", now: closedAt - 1000 });
-      await markClosed(env.DB, { sessionId, now: closedAt });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
-
-      expect(result.reaped).toBe(1);
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("(e) orphan-close closes an open topic whose sessions row is absent", async () => {
-      const sessionId = "ses_t211_orphan_no_session";
-      const threadId = 62020;
-      const now = Date.now();
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan no sess", now: now - 8 * 86400 * 1000 });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
-
-      let closedThreadId: number | undefined;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          closedThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
-
-      expect(result.closedOrphans).toBe(1);
-      expect(result.rateLimited).toBe(false);
-      expect(closedThreadId).toBe(threadId);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("closed");
-      expect(typeof row?.closed_at).toBe("number");
-    });
-
-    it("(f) orphan-close closes an open topic whose sessions.updated_at is older than 7d TTL", async () => {
-      const sessionId = "ses_t211_orphan_stale_session";
-      const threadId = 62021;
-      const now = Date.now();
-      const oldTime = now - (ORPHAN_TTL_MS + 1000);
-
-      await registerSession(sessionId, "devbox", "stale session");
-      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(oldTime, sessionId).run();
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · orphan stale sess", now: oldTime });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: oldTime });
-
-      let closedThreadId: number | undefined;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          closedThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
-
-      expect(result.closedOrphans).toBe(1);
-      expect(result.rateLimited).toBe(false);
-      expect(closedThreadId).toBe(threadId);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("closed");
-    });
-
-    it("(g) orphan-close does NOT touch an open topic with a fresh sessions row", async () => {
-      const sessionId = "ses_t211_fresh_session";
-      const threadId = 62022;
-      const now = Date.now();
-
-      await registerSession(sessionId, "devbox", "fresh session");
-      await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(now - 1000, sessionId).run();
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · fresh sess", now: now - 1000 });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 1000 });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
-
-      expect(result.closedOrphans).toBe(0);
-      expect(result.rateLimited).toBe(false);
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("open");
-    });
-
-    it("(h) orphan cap: with 8 eligible, at most 5 processed", async () => {
-      const now = Date.now();
-
-      for (let i = 0; i < 8; i++) {
-        const sessionId = `ses_t211_orphan_cap_${i}`;
-        const threadId = 62030 + i;
-        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · orphan cap ${i}`, now: now - 8 * 86400 * 1000 });
-        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
-      }
-
-      let closeCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => {
-          closeCalls++;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        })
-        .persist();
-
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5 });
-
-      expect(result.closedOrphans).toBe(5);
-      expect(closeCalls).toBe(5);
-    });
-
-    it("(i) NULL message_thread_id orphan row -> D1 row closed, zero Telegram calls", async () => {
-      const sessionId = "ses_t211_null_thread_orphan";
-      const now = Date.now();
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread orphan", now: now - 8 * 86400 * 1000 });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
-
-      expect(result.closedOrphans).toBe(1);
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("closed");
-      expect(row?.message_thread_id).toBeNull();
     });
 
     it("(j) rate_limited response stops the run early", async () => {
@@ -7797,22 +6287,16 @@ describe("topics module and topicName", () => {
   });
 
   describe("F1 Defect Fixes: sticky-closed topics and reaper liveness check", () => {
-    const topicChatId = String(CHAT_ID_NUM);
+    // Rows live in a Slack workspace; the provider is a scripted fake transport.
+    const topicChatId = "slack:TF1DEFECTS";
     const botToken = "fake-bot-token";
 
     beforeEach(async () => {
       await env.DB.prepare("DELETE FROM topics").run();
       await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_f1_%'").run();
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
     });
 
-    afterEach(() => {
-      fetchMock.deactivate();
-    });
-
-    it("(a) reopen returns TOPIC_NOT_MODIFIED (already open in Telegram) -> flips D1 row state to open", async () => {
+    it("(a) reopen returns topic_not_modified (already open at the provider) -> flips D1 row state to open", async () => {
       const sessionId = "ses_f1_a_not_modified";
       const threadId = 65001;
       const now = Date.now();
@@ -7821,10 +6305,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now });
       await markClosed(env.DB, { sessionId, now });
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+      const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
 
       const res = await resolveTopic(env.DB, {
         sessionId,
@@ -7834,6 +6315,7 @@ describe("topics module and topicName", () => {
         title: "not modified",
         botToken,
         now: now + 1000,
+        transport: client,
       });
 
       expect(res).toEqual({ ok: true, messageThreadId: threadId });
@@ -7852,10 +6334,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId: sessionId429, messageThreadId: threadId429, now });
       await markClosed(env.DB, { sessionId: sessionId429, now });
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 15 } });
+      const limited = fakeTransport({ reopenForumTopic: () => results.rateLimited(15) });
 
       const res429 = await resolveTopic(env.DB, {
         sessionId: sessionId429,
@@ -7865,6 +6344,7 @@ describe("topics module and topicName", () => {
         title: "429",
         botToken,
         now: now + 1000,
+        transport: limited.client,
       });
 
       expect(res429).toEqual({ ok: false, kind: "rate_limited", retryAfter: 15 });
@@ -7880,15 +6360,10 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId: sessionIdTnf, messageThreadId: threadIdTnf, now });
       await markClosed(env.DB, { sessionId: sessionIdTnf, now });
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/createForumTopic`, method: "POST" })
-        .reply(200, { ok: true, result: { message_thread_id: newThreadId, name: "pigeon · tnf" } });
+      const gone = fakeTransport({
+        reopenForumTopic: () => results.threadNotFound(),
+        createForumTopic: () => ({ ok: true, result: { message_thread_id: newThreadId, name: "pigeon · tnf" } }),
+      });
 
       const resTnf = await resolveTopic(env.DB, {
         sessionId: sessionIdTnf,
@@ -7898,6 +6373,7 @@ describe("topics module and topicName", () => {
         title: "tnf",
         botToken,
         now: now + 1000,
+        transport: gone.client,
       });
 
       expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId, created: true });
@@ -7921,7 +6397,7 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", now - 1000, now - 1000).run();
 
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(0);
       const row = await getBySession(env.DB, sessionId);
@@ -7941,19 +6417,9 @@ describe("topics module and topicName", () => {
 
       // No sessions row created
 
-      let deleteCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, (opts: any) => {
-          deleteCalled = true;
-          return { ok: true, result: true };
-        });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(1);
-      expect(deleteCalled).toBe(true);
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
     });
@@ -7973,19 +6439,9 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", staleSessionTime, staleSessionTime).run();
 
-      let deleteCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, (opts: any) => {
-          deleteCalled = true;
-          return { ok: true, result: true };
-        });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(1);
-      expect(deleteCalled).toBe(true);
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
     });
@@ -8005,10 +6461,9 @@ describe("topics module and topicName", () => {
       ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
 
       // 2. Notification arrives -> resolveTopic reopen fails generically (e.g. lost rights)
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: not enough rights to manage topics" });
+      const { client } = fakeTransport({
+        reopenForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+      });
 
       const resolveRes = await resolveTopic(env.DB, {
         sessionId,
@@ -8018,6 +6473,7 @@ describe("topics module and topicName", () => {
         title: "generic e2e",
         botToken,
         now: t0 + 1000,
+        transport: client,
       });
 
       expect(resolveRes).toEqual({ ok: true, messageThreadId: threadId });
@@ -8031,26 +6487,16 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      let deleteCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, (opts: any) => {
-          deleteCalled = true;
-          return { ok: true, result: true };
-        });
-
-      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(reapRes.reaped).toBe(0);
-      expect(deleteCalled).toBe(false);
 
       const rowAfterReap = await getBySession(env.DB, sessionId);
       expect(rowAfterReap).not.toBeNull();
       expect(rowAfterReap?.state).toBe("closed");
     });
 
-    it("(g) end-to-end composition: close topic, TOPIC_NOT_MODIFIED on reopen -> state becomes open, then reaper 30d later does NOT delete it", async () => {
+    it("(g) end-to-end composition: close topic, topic_not_modified on reopen -> state becomes open, then reaper 30d later does NOT delete it", async () => {
       const sessionId = "ses_f1_g_not_mod_e2e";
       const threadId = 65009;
       const t0 = Date.now();
@@ -8064,11 +6510,8 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", t0, t0).run();
 
-      // 2. Notification arrives -> resolveTopic reopen returns TOPIC_NOT_MODIFIED
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ path: `/bot${botToken}/reopenForumTopic`, method: "POST" })
-        .reply(400, { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" });
+      // 2. Notification arrives -> resolveTopic reopen returns topic_not_modified
+      const { client } = fakeTransport({ reopenForumTopic: () => results.notModified() });
 
       const resolveRes = await resolveTopic(env.DB, {
         sessionId,
@@ -8078,6 +6521,7 @@ describe("topics module and topicName", () => {
         title: "not mod e2e",
         botToken,
         now: t0 + 1000,
+        transport: client,
       });
 
       expect(resolveRes).toEqual({ ok: true, messageThreadId: threadId });
@@ -8091,19 +6535,9 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      let deleteCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, (opts: any) => {
-          deleteCalled = true;
-          return { ok: true, result: true };
-        });
-
-      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(reapRes.reaped).toBe(0);
-      expect(deleteCalled).toBe(false);
 
       const rowAfterReap = await getBySession(env.DB, sessionId);
       expect(rowAfterReap).not.toBeNull();
@@ -8112,7 +6546,7 @@ describe("topics module and topicName", () => {
 
     // ── Follow-ups from the second fable review of 601c8d4 ──────────────────
 
-    it("(F-1) orphan-closer marks the row closed even when closeForumTopic fails generically, so it cannot pin a slot forever", async () => {
+    it("(F-1) orphan-closer marks the row closed even when the provider's close fails generically, so it cannot pin a slot forever", async () => {
       const sessionId = "ses_f1b_generic";
       const threadId = 66001;
       const t0 = Date.now();
@@ -8122,19 +6556,13 @@ describe("topics module and topicName", () => {
       ).bind(sessionId, topicChatId, threadId, t0, t0).run();
       // No sessions row => orphaned.
 
-      let closeCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(200, () => {
-          closeCalls++;
-          return { ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" };
-        })
-        .times(5);
+      const { client, calls } = fakeTransport({
+        closeForumTopic: () => results.error(400, "Bad Request: not enough rights to manage topics"),
+      });
 
       const now = t0 + 1000;
-      const res1 = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS });
-      expect(closeCalls).toBe(1);
+      const res1 = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      expect(calls.closeForumTopic).toHaveLength(1);
       expect(res1.closedOrphans).toBe(1);
 
       const row = await getBySession(env.DB, sessionId);
@@ -8142,9 +6570,9 @@ describe("topics module and topicName", () => {
       expect(row?.closed_at).not.toBeNull();
 
       // The point of the fix: a SECOND run must not re-select it, so it cannot pin one of the 5 slots.
-      const res2 = await closeOrphanedTopics(env.DB, { botToken, now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS });
+      const res2 = await closeOrphanedTopics(env.DB, { botToken, now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
       expect(res2.closedOrphans).toBe(0);
-      expect(closeCalls).toBe(1);
+      expect(calls.closeForumTopic).toHaveLength(1);
     });
 
     it("(F-2) runTopicReaper forwards orphanTtlMs to reapTopics, so both jobs share one definition of live", async () => {
@@ -8161,52 +6589,50 @@ describe("topics module and topicName", () => {
         `INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, 'devbox', null, ?, ?)`,
       ).bind(sessionId, closedLongAgo, t0 - 3 * 24 * 60 * 60 * 1000).run();
 
-      let deleted = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, () => { deleted = true; return { ok: true, result: true }; });
-
       // With a 1-day liveness cutoff the session reads as dead, so the reaper MUST reap.
       // If orphanTtlMs is not forwarded, reapTopics falls back to 7d, sees a live session, and reaps nothing.
       const res = await runTopicReaper(
         env.DB,
         { TELEGRAM_TOPICS_ENABLED: "true", TELEGRAM_BOT_TOKEN: botToken },
-        { now: t0, orphanTtlMs: 24 * 60 * 60 * 1000 },
+        { now: t0, orphanTtlMs: 24 * 60 * 60 * 1000, transport: fakeTransport().client },
       );
 
       expect(res.reaped).toBe(1);
-      expect(deleted).toBe(true);
+      expect(await getBySession(env.DB, sessionId)).toBeNull();
     });
 
   });
 
   // ─── pigeon-4890: daily topic-close window ─────────────────────────────────
   //
-  // The orphan-closer posts a "topic closed" service message, which marks the topic UNREAD in
-  // the Telegram sidebar. Firing it on every hourly cron trickled those into the unread feed all
-  // day. It is now gated to a morning UTC window so the day's closures land in one batch, with
-  // the trailing hours of the window acting as a stateless catch-up for a 429 or an over-cap day.
+  // The orphan-closer closes a topic, which (on Telegram) posts a service message and marks the
+  // topic UNREAD in the sidebar. Firing it on every hourly cron trickled those into the unread
+  // feed all day. It is now gated to a single UTC tick so the day's closures land in one batch.
 
   describe("pigeon-4890: daily topic-close window", () => {
-    const topicChatId = "-1009900004890";
+    let wm: SlackMachine;
+    let wEnv: Env;
+    let topicChatId = "";
     const botToken = "fake-bot-token";
     const testEnv = {
       TELEGRAM_TOPICS_ENABLED: "true",
       TELEGRAM_BOT_TOKEN: botToken,
     };
 
-    beforeEach(() => {
+    beforeEach(async () => {
+      resetSlackCalls();
       fetchMock.activate();
       fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      wm = await mkSlackMachine();
+      wEnv = envWith([wm]);
+      topicChatId = slackChatId(wm.ws);
     });
 
     afterEach(() => {
+      fetchMock.get("https://slack.com").cleanMocks();
       fetchMock.deactivate();
     });
 
-    /** Epoch ms for a given UTC hour on a fixed date. */
     /**
      * Today's date at a given UTC hour.
      *
@@ -8223,9 +6649,11 @@ describe("topics module and topicName", () => {
       return Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), hour, 0, 0);
     }
 
-    /** An open, finalized topic whose session row is absent => an orphan. */
-    async function seedOrphan(sessionId: string, threadId: number, now: number) {
+    /** An open, finalized topic whose session row is absent => an orphan, over a conversation Slack knows. */
+    async function seedOrphan(sessionId: string, now: number) {
       const old = now - 8 * 86400 * 1000;
+      const channelId = `CO${stamp()}`.toUpperCase();
+      const handle = await seedChannel(wm.ws.teamId, channelId);
       await reserve(env.DB, {
         sessionId,
         machineId: "devbox",
@@ -8233,7 +6661,8 @@ describe("topics module and topicName", () => {
         name: `pigeon · ${sessionId}`,
         now: old,
       });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: old });
+      await finalize(env.DB, { sessionId, messageThreadId: handle, now: old });
+      return channelId;
     }
 
     it("(a) the window opens at the configured hour and spans the configured number of hours", () => {
@@ -8259,21 +6688,13 @@ describe("topics module and topicName", () => {
 
     it("(b) closeOrphans:false skips the orphan-closer entirely, leaving the row open", async () => {
       const now = atUtcHour(3);
-      await seedOrphan("ses_4890_gated", 68010, now);
+      await seedOrphan("ses_4890_gated", now);
 
-      let closeCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => {
-          closeCalls++;
-          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
-        });
-
-      const res = await runTopicReaper(env.DB, testEnv, { now, closeOrphans: false });
+      const { client, calls } = fakeTransport();
+      const res = await runTopicReaper(env.DB, testEnv, { now, closeOrphans: false, transport: client });
 
       expect(res.closedOrphans).toBe(0);
-      expect(closeCalls).toBe(0);
+      expect(calls.closeForumTopic).toHaveLength(0);
       expect((await getBySession(env.DB, "ses_4890_gated"))?.state).toBe("open");
     });
 
@@ -8283,16 +6704,11 @@ describe("topics module and topicName", () => {
       expect(DEFAULT_ORPHAN_CAP).toBeGreaterThanOrEqual(batch);
 
       for (let i = 0; i < batch; i++) {
-        await seedOrphan(`ses_4890_batch_${i}`, 68100 + i, now);
+        await seedOrphan(`ses_4890_batch_${i}`, now);
       }
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => ({ statusCode: 200, data: JSON.stringify({ ok: true, result: true }) }))
-        .persist();
-
-      const res = await runTopicReaper(env.DB, testEnv, { now });
+      const { client } = fakeTransport();
+      const res = await runTopicReaper(env.DB, testEnv, { now, transport: client });
 
       // >= rather than ==: earlier cases in this describe leave their own orphans behind, and
       // the point of the assertion is that ONE run drains more than the old cap of 5.
@@ -8305,19 +6721,10 @@ describe("topics module and topicName", () => {
     it("(d) scheduled() outside the window leaves an orphan open (pins the cron wiring)", async () => {
       const now = atUtcHour(TOPIC_CLOSE_WINDOW_START_HOUR_UTC - 1);
       const sessionId = "ses_4890_cron_outside";
-      await seedOrphan(sessionId, 68200, now);
+      await seedOrphan(sessionId, now);
+      const srv = fakeSlack();
 
-      let closeCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => {
-          closeCalls++;
-          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
-        })
-        .persist();
-
-      const cronEnv = { ...env, ...testEnv } as Env;
+      const cronEnv = { ...wEnv, ...testEnv } as Env;
       const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
@@ -8326,22 +6733,17 @@ describe("topics module and topicName", () => {
       );
       await waitOnExecutionContext(ctx);
 
-      expect(closeCalls).toBe(0);
+      expect(srv.of("conversations.archive")).toHaveLength(0);
       expect((await getBySession(env.DB, sessionId))?.state).toBe("open");
     });
 
     it("(e) scheduled() inside the window closes the orphan", async () => {
       const now = atUtcHour(TOPIC_CLOSE_WINDOW_START_HOUR_UTC);
       const sessionId = "ses_4890_cron_inside";
-      await seedOrphan(sessionId, 68300, now);
+      const channelId = await seedOrphan(sessionId, now);
+      const srv = fakeSlack();
 
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => ({ statusCode: 200, data: JSON.stringify({ ok: true, result: true }) }))
-        .persist();
-
-      const cronEnv = { ...env, ...testEnv } as Env;
+      const cronEnv = { ...wEnv, ...testEnv } as Env;
       const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
@@ -8350,6 +6752,7 @@ describe("topics module and topicName", () => {
       );
       await waitOnExecutionContext(ctx);
 
+      expect(srv.of("conversations.archive").map((c) => c.params.get("channel"))).toContain(channelId);
       expect((await getBySession(env.DB, sessionId))?.state).toBe("closed");
     });
   });
@@ -8369,6 +6772,8 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
   });
 
   afterEach(() => {
+    // Also sweeps interceptors the Telegram-only tests above leave unconsumed, which the Telegram
+    // timing tests below would otherwise pick up.
     fetchMock.get("https://api.telegram.org").cleanMocks();
     fetchMock.deactivate();
   });
@@ -8459,6 +6864,16 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
   // ─── D1 Storage Error Classification (5a-T3 / pigeon-dul) ────────────────────
 
   describe("D1 storage error classification (5a-T3 / pigeon-dul)", () => {
+    // Sends go through a machine on a Slack workspace (the shared key can post nowhere).
+    let sm: SlackMachine;
+    let sEnv: Env;
+    const machineHeaders = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${sm.key}` });
+
+    beforeEach(async () => {
+      sm = await mkSlackMachine();
+      sEnv = envWith([sm]);
+    });
+
     function createFailingDb(
       realDb: D1Database,
       sqlMatcher: (sql: string) => boolean,
@@ -8639,15 +7054,14 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
         (sql) => sql.includes("SELECT * FROM sessions WHERE session_id"),
         "D1 query timeout on session lookup",
       );
-      const testEnv = { ...env, DB: failingDb };
+      const testEnv = { ...sEnv, DB: failingDb };
 
       const res = await worker.fetch(
         new Request("https://worker/notifications/send", {
           method: "POST",
-          headers: authHeaders,
+          headers: machineHeaders(),
           body: JSON.stringify({
             sessionId: "sess-503-993104",
-            chatId: "8248645256",
             text: "hello world",
           }),
         }),
@@ -8690,16 +7104,15 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
         (sql) => sql.includes("SELECT * FROM messages WHERE notification_id"),
         "D1 query timeout on idempotency lookup",
       );
-      const testEnv = { ...env, DB: failingDb };
+      const testEnv = { ...sEnv, DB: failingDb };
 
       const res = await worker.fetch(
         new Request("https://worker/notifications/send", {
           method: "POST",
-          headers: authHeaders,
+          headers: machineHeaders(),
           body: JSON.stringify({
             sessionId: "sess-503-993105",
             notificationId: "notif-503-993105",
-            chatId: "8248645256",
             text: "hello world",
           }),
         }),
@@ -8742,15 +7155,14 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
         (sql) => sql.includes("UPDATE sessions SET updated_at"),
         "D1 error on touch session",
       );
-      const testEnv = { ...env, DB: failingDb };
+      const testEnv = { ...sEnv, DB: failingDb };
 
       const res = await worker.fetch(
         new Request("https://worker/notifications/send", {
           method: "POST",
-          headers: authHeaders,
+          headers: machineHeaders(),
           body: JSON.stringify({
             sessionId: "sess-503-993106",
-            chatId: "8248645256",
             text: "hello world",
           }),
         }),
@@ -8779,12 +7191,6 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
     it("POST /notifications/send fails at send.insertMessage site", async () => {
       fetchMock.activate();
       fetchMock.disableNetConnect();
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_id: 993107 } }), {
-          headers: { "Content-Type": "application/json" },
-        });
 
       const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -8797,20 +7203,23 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
         env,
       );
 
+      // A topic the post goes into, so the provider call is one chat.postMessage.
+      const { channelId } = await seedSlackTopic("sess-503-993107", sm.machineId, sm.ws);
+      slack("chat.postMessage", posted(channelId));
+
       const failingDb = createFailingDb(
         env.DB,
         (sql) => sql.includes("INSERT INTO messages"),
         "D1 error on insert message",
       );
-      const testEnv = { ...env, DB: failingDb };
+      const testEnv = { ...sEnv, DB: failingDb };
 
       const res = await worker.fetch(
         new Request("https://worker/notifications/send", {
           method: "POST",
-          headers: authHeaders,
+          headers: machineHeaders(),
           body: JSON.stringify({
             sessionId: "sess-503-993107",
-            chatId: "8248645256",
             text: "hello world",
           }),
         }),
@@ -8833,7 +7242,7 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
         }),
       );
 
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock.get("https://slack.com").cleanMocks();
       fetchMock.deactivate();
       spy.mockRestore();
     });
@@ -8951,132 +7360,72 @@ describe("per-call Telegram timing (pigeon-malt)", () => {
 // ─── Relocation alert (pigeon-t5bd) ──────────────────────────────────────
 
 describe("relocation alert (pigeon-t5bd)", () => {
-  const topicChatId = String(CHAT_ID_NUM);
-  // The alert destination must differ from the chat being notified, or every assertion about
-  // WHERE the alert went is a tautology -- in the default test env they are the same id.
-  const alertChatId = "555000111";
-  const testEnv = {
-    ...env,
-    TELEGRAM_TOPICS_ENABLED: "true",
-    ALLOWED_CHAT_IDS: `${alertChatId},${topicChatId}`,
-  } as Env;
+  let rm: SlackMachine;
+  let rEnv: Env;
+  let srv: ReturnType<typeof fakeSlack>;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    try {
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    } catch {}
+    rm = await mkSlackMachine();
+    rEnv = envWith([rm]);
+    srv = fakeSlack();
   });
 
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
     vi.restoreAllMocks();
   });
 
-  // Persisting matters for the negative tests. With a single-shot interceptor, a spurious
-  // alert would find no mock, undici would reject, alertRelocation would swallow the error,
-  // and "expect no alert" would pass for the wrong reason -- i.e. it would still pass if the
-  // guard were deleted. Persisting means a spurious second send is CAPTURED, so the count
-  // assertion can see it.
-  function interceptSend(handler: (body: any) => unknown, persist = false) {
-    const i = fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply((opts: any) => {
-        const body = JSON.parse(opts.body as string);
-        return {
-          statusCode: 200,
-          data: JSON.stringify(handler(body)),
-          responseOptions: { headers: { "Content-Type": "application/json" } },
-        };
-      });
-    if (persist) i.persist();
-  }
-
-  async function notify(sessionId: string) {
-    return handleSendNotification(
+  const notify = (sessionId: string, extra: Record<string, unknown> = {}) =>
+    handleSendNotification(
       env.DB,
-      testEnv,
-      new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "body",
-          title: "t",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      }),
+      rEnv,
+      postJson("/notifications/send", rm.key, { sessionId, text: "body", title: "t", dir: "pigeon", threaded: true, ...extra }),
     );
-  }
+  const alertPosts = () =>
+    slackOf("chat.postMessage").filter((c) => String(c.params.get("text")).includes("not its channel"));
 
   it("alerts when a permanent 4xx relocates the notification to General", async () => {
-    const sessionId = "ses_t5bd_send_failed";
-    await registerSession(sessionId, "devbox", "pigeon");
-    const now = Date.now();
-    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "x", now });
-    await finalize(env.DB, { sessionId, messageThreadId: 771, now });
-
-    const sent: any[] = [];
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: false, error_code: 400, description: "Bad Request: chat is not a forum" };
-    });
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7710 } };
-    });
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7711 } };
-    });
+    const sessionId = await seedSession(rm.machineId);
+    const topic = await seedSlackTopic(sessionId, rm.machineId, rm.ws);
+    const alerts = await seedAlerts(rm.ws);
+    const refused = { ok: false, error: "invalid_blocks" };
+    srv.script("chat.postMessage", refused, refused);
 
     const res = await notify(sessionId);
     expect(res.status).toBe(200);
 
-    const alert = sent.find((b) => String(b.text).includes("not its topic"));
+    const alert = alertPosts()[0];
     expect(alert).toBeDefined();
-    expect(alert.text).toContain(sessionId);
-    expect(alert.text).toContain("send_failed");
-    // The alert goes to the operator's own chat, never into the forum it is reporting on.
-    expect(String(alert.chat_id)).toBe(alertChatId);
-    expect(alert.message_thread_id).toBeUndefined();
-    // ...and the notification itself still went to the forum chat.
-    expect(String(sent[0].chat_id)).toBe(topicChatId);
+    expect(alert!.params.get("text")).toContain(sessionId);
+    expect(alert!.params.get("text")).toContain("send_failed");
+    // The alert goes to the workspace's #alerts, never into the channel it is reporting on...
+    expect(alert!.params.get("channel")).toBe(alerts);
+    // ...and the notification itself was first sent to the session's channel.
+    expect(slackOf("chat.postMessage")[0]!.params.get("channel")).toBe(topic.channelId);
   });
 
   it("alerts on poll_exhausted, the path the intended/actual columns CANNOT see", async () => {
-    const sessionId = "ses_t5bd_poll_exhausted";
-    await registerSession(sessionId, "devbox", "pigeon");
+    const sessionId = await seedSession(rm.machineId);
     // A live reservation held by someone else, never finalized: resolveTopic polls, gives up,
     // and returns messageThreadId null -> the notification goes to General with NO intended id.
     await reserve(env.DB, {
       sessionId,
-      machineId: "devbox",
-      chatId: topicChatId,
+      machineId: rm.machineId,
+      chatId: slackChatId(rm.ws),
       name: "x",
       now: Date.now(),
-    });
-
-    const sent: any[] = [];
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7720 } };
-    });
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7721 } };
     });
 
     const res = await notify(sessionId);
     expect(res.status).toBe(200);
 
-    const alert = sent.find((b) => String(b.text).includes("not its topic"));
+    const alert = alertPosts()[0];
     expect(alert).toBeDefined();
-    expect(alert.text).toContain("poll_exhausted");
+    expect(alert!.params.get("text")).toContain("poll_exhausted");
 
     // And prove the column pair is blind to it, which is why the alert cannot be built on them.
     const row = await env.DB.prepare(
@@ -9086,72 +7435,51 @@ describe("relocation alert (pigeon-t5bd)", () => {
   });
 
   it("does not alert for a normal threaded send", async () => {
-    const sessionId = "ses_t5bd_happy";
-    await registerSession(sessionId, "devbox", "pigeon");
-    const now = Date.now();
-    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "x", now });
-    await finalize(env.DB, { sessionId, messageThreadId: 773, now });
-
-    const sent: any[] = [];
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7730 } };
-    }, true);
+    const sessionId = await seedSession(rm.machineId);
+    await seedSlackTopic(sessionId, rm.machineId, rm.ws);
 
     expect((await notify(sessionId)).status).toBe(200);
-    expect(sent).toHaveLength(1);
-    expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
+    // One post: a spurious second send is captured by the persistent fake, so this can fail.
+    expect(slackOf("chat.postMessage")).toHaveLength(1);
+    expect(alertPosts()).toHaveLength(0);
   });
 
   it("does not alert when the caller deliberately asked for an unthreaded send", async () => {
-    const sessionId = "ses_t5bd_unthreaded";
-    await registerSession(sessionId, "devbox", "pigeon");
+    const sessionId = await seedSession(rm.machineId);
+    await seedAlerts(rm.ws);
 
-    const sent: any[] = [];
-    interceptSend((b) => {
-      sent.push(b);
-      return { ok: true, result: { message_id: 7740 } };
-    }, true);
-
-    const res = await handleSendNotification(
-      env.DB,
-      testEnv,
-      new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "quiet question",
-          threaded: false,
-        }),
-      }),
-    );
+    const res = await notify(sessionId, { text: "quiet question", threaded: false });
     expect(res.status).toBe(200);
-    expect(sent).toHaveLength(1);
-    expect(sent.find((b) => String(b.text).includes("not its topic"))).toBeUndefined();
+    expect(slackOf("chat.postMessage")).toHaveLength(1);
+    expect(alertPosts()).toHaveLength(0);
   });
 
   it("a failing alert never fails the notification it is reporting on", async () => {
-    const sessionId = "ses_t5bd_alert_throws";
-    await registerSession(sessionId, "devbox", "pigeon");
+    const sessionId = await seedSession(rm.machineId);
     await reserve(env.DB, {
       sessionId,
-      machineId: "devbox",
-      chatId: topicChatId,
+      machineId: rm.machineId,
+      chatId: slackChatId(rm.ws),
       name: "x",
       now: Date.now(),
     });
-
-    interceptSend(() => ({ ok: true, result: { message_id: 7750 } }));
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .replyWithError(new Error("alert transport died"));
+    await seedAlerts(rm.ws);
+    // The notification itself posts; the alert's transport dies.
+    srv.script("chat.postMessage", { ok: true, ts: "1.1", channel: "C" }, { throws: "alert transport died" });
 
     const res = await notify(sessionId);
     expect(res.status).toBe(200);
   });
+});
+
+// Telegram-only: the relocation alert's Telegram branch (a General thread, an allowlisted operator chat).
+describe("relocation alert, Telegram branch (pigeon-t5bd)", () => {
+  const topicChatId = String(CHAT_ID_NUM);
+  const testEnv = {
+    ...env,
+    TELEGRAM_TOPICS_ENABLED: "true",
+    ALLOWED_CHAT_IDS: `555000111,${topicChatId}`,
+  } as Env;
 
   it("says so loudly when there is nowhere to send the alert", async () => {
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -9217,49 +7545,59 @@ describe("unparseable 200 measurement (pigeon-jahv)", () => {
 // ─── Named topics (POST /topics/named) ─────────────────────────────────
 
 describe("named topics", () => {
-  const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-  const CHAT = String(CHAT_ID_NUM);
+  let nm: SlackMachine;
+  let nEnv: Env;
+  let srv: ReturnType<typeof fakeSlack>;
+  let CHAT = "";
   let seq = 0;
   const nextKey = () => `test:named-${Date.now()}-${++seq}`;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    fetchMock.get("https://api.telegram.org").cleanMocks();
+    nm = await mkSlackMachine();
+    nEnv = envWith([nm]);
+    CHAT = slackChatId(nm.ws);
+    srv = fakeSlack();
   });
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
   });
 
-  /** Record calls to one Telegram method, replying with `result` (or a fn of the body). */
-  function onTelegram(method: string, reply: (body: any) => { ok: boolean; [k: string]: unknown }) {
-    const calls: any[] = [];
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
-      .reply((opts: any) => {
-        const body = JSON.parse(opts.body as string);
-        calls.push(body);
-        return {
-          statusCode: 200,
-          data: JSON.stringify(reply(body)),
-          responseOptions: { headers: { "Content-Type": "application/json" } },
-        };
-      })
-      .persist();
-    return calls;
-  }
+  const jsonHeaders = (key: string | null) => ({
+    "Content-Type": "application/json",
+    ...(key === null ? {} : { Authorization: `Bearer ${key}` }),
+  });
 
-  function named(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+  /** Through the handler as the workspace's machine; the target is the machine's own workspace. */
+  function named(body: Record<string, unknown>, key: string | null = nm.key, e: Env = nEnv) {
     return handleNamedTopic(env.DB, e, new Request("https://worker/topics/named", {
       method: "POST",
-      headers,
+      headers: jsonHeaders(key),
       body: JSON.stringify(body),
     }));
   }
 
+  /** A stored named topic over a conversation Slack knows. */
+  async function seedNamed(key: string, opts: { reopenCheckedAt?: number | null } = {}) {
+    const channelId = `CN${stamp()}`.toUpperCase();
+    const thread = await seedChannel(nm.ws.teamId, channelId);
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, created_at, updated_at)
+       VALUES (?, ?, ?, 'n', ?, ?, ?)`,
+    ).bind(CHAT, key, thread, opts.reopenCheckedAt ?? null, now, now).run();
+    return { channelId, thread };
+  }
+  const handleOf = async (channelId: string) =>
+    (await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
+      .bind(nm.ws.teamId, channelId)
+      .first<{ handle: number }>())!.handle;
+
   test("requires auth", async () => {
-    const res = await named({ chatId: CHAT, key: nextKey(), name: "n" }, topicsEnv, { "Content-Type": "application/json" });
+    const res = await named({ key: nextKey(), name: "n" }, null);
     expect(res.status).toBe(401);
   });
 
@@ -9268,158 +7606,163 @@ describe("named topics", () => {
     expect(res.status).toBe(400);
   });
 
-  test("rejects a bad key, a disallowed chat, and topics-disabled (all fail-open signals)", async () => {
-    expect((await named({ chatId: CHAT, key: "has space", name: "n" })).status).toBe(400);
-    expect((await named({ chatId: CHAT, key: "x".repeat(65), name: "n" })).status).toBe(400);
-    expect((await named({ chatId: CHAT, key: "", name: "n" })).status).toBe(400);
-    expect((await named({ chatId: CHAT, key: nextKey(), name: "n", staleThreadId: "7" })).status).toBe(400);
-    expect((await named({ chatId: "-1009999", key: nextKey(), name: "n" })).status).toBe(403);
-    expect((await named({ chatId: CHAT, key: nextKey(), name: "n" }, env as Env)).status).toBe(409);
+  test("rejects a bad key, a reserved key, and a principal with no workspace (all fail-open signals)", async () => {
+    expect((await named({ key: "has space", name: "n" })).status).toBe(400);
+    expect((await named({ key: "x".repeat(65), name: "n" })).status).toBe(400);
+    expect((await named({ key: "", name: "n" })).status).toBe(400);
+    expect((await named({ key: nextKey(), name: "n", staleThreadId: "7" })).status).toBe(400);
+    expect((await named({ key: "_alerts", name: "n" })).status).toBe(400);
+    // The shared key is on no workspace, so it has nowhere to put a topic.
+    expect((await named({ chatId: CHAT, key: nextKey(), name: "n" }, "test-api-key")).status).toBe(403);
   });
 
   test("creates a topic for a new key, then reuses it without another create", async () => {
     const key = nextKey();
-    const creates = onTelegram("createForumTopic", (b) => ({ ok: true, result: { message_thread_id: 880001 + seq, name: b.name, icon_color: 0 } }));
 
-    const first = await named({ chatId: CHAT, key, name: "  Digest one  " });
+    const first = await named({ key, name: "  Digest one  " });
     expect(first.status).toBe(200);
     const a = (await first.json()) as any;
-    expect(a).toEqual({ chatId: CHAT, messageThreadId: 880001 + seq, created: true });
-    expect(creates).toHaveLength(1);
-    expect(creates[0].name).toBe("Digest one");
+    expect(srv.created).toHaveLength(1);
+    expect(a).toEqual({ chatId: CHAT, messageThreadId: await handleOf(srv.created[0]!.id), created: true });
+    expect(srv.of("conversations.setTopic")[0]!.params.get("topic")).toBe("Digest one");
 
-    const second = await named({ chatId: CHAT, key, name: "a different name is ignored" });
+    const second = await named({ key, name: "a different name is ignored" });
     expect((await second.json()) as any).toEqual({ chatId: CHAT, messageThreadId: a.messageThreadId, created: false });
-    expect(creates).toHaveLength(1);
+    expect(srv.created).toHaveLength(1);
   });
 
   test("falls back to the key as the name, and truncates to 128 chars", async () => {
-    const creates = onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: 881000 + seq, name: "x", icon_color: 0 } }));
     const k1 = nextKey();
-    await named({ chatId: CHAT, key: k1, name: "   " });
-    await named({ chatId: CHAT, key: nextKey(), name: "y".repeat(300) });
-    expect(creates[0].name).toBe(k1);
-    expect(creates[1].name).toHaveLength(128);
+    await named({ key: k1, name: "   " });
+    await named({ key: nextKey(), name: "y".repeat(300) });
+    const topics = srv.of("conversations.setTopic").map((c) => c.params.get("topic"));
+    expect(topics[0]).toBe(k1);
+    expect(topics[1]).toHaveLength(128);
   });
 
   test("create failure -> 502, nothing stored", async () => {
     const key = nextKey();
-    onTelegram("createForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: not enough rights to create a topic" }));
-    expect((await named({ chatId: CHAT, key, name: "n" })).status).toBe(502);
+    srv.script("conversations.create", { ok: false, error: "restricted_action" });
+    expect((await named({ key, name: "n" })).status).toBe(502);
     expect(await env.DB.prepare("SELECT * FROM named_topics WHERE topic_key = ?").bind(key).first()).toBeNull();
   });
 
   test("reopens an existing topic at most once per interval, and recreates one deleted out of band", async () => {
     const key = nextKey();
-    const now = Date.now();
-    const thread = 882000 + seq;
-    await env.DB.prepare(
-      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, created_at, updated_at)
-       VALUES (?, ?, ?, 'n', ?, ?, ?)`,
-    ).bind(CHAT, key, thread, now - 2 * 60 * 60 * 1000, now, now).run();
+    const { thread } = await seedNamed(key, { reopenCheckedAt: Date.now() - 2 * 60 * 60 * 1000 });
 
-    const reopens = onTelegram("reopenForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: TOPIC_NOT_MODIFIED" }));
-    const r1 = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
-    const r2 = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
+    // Already open: the reopen is "not archived", which is as good as done.
+    srv.script("conversations.unarchive", { ok: false, error: "not_archived" });
+    const r1 = (await (await named({ key, name: "n" })).json()) as any;
+    const r2 = (await (await named({ key, name: "n" })).json()) as any;
     expect(r1.messageThreadId).toBe(thread);
     expect(r2.messageThreadId).toBe(thread);
-    expect(reopens).toHaveLength(1);
+    expect(srv.of("conversations.unarchive")).toHaveLength(1);
 
     // Deleted out of band: the daemon reports the stale thread and gets a new topic.
-    const creates = onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread + 1, name: "n", icon_color: 0 } }));
-    const r3 = (await (await named({ chatId: CHAT, key, name: "n", staleThreadId: thread })).json()) as any;
-    expect(r3).toEqual({ chatId: CHAT, messageThreadId: thread + 1, created: true });
-    expect(creates).toHaveLength(1);
+    const r3 = (await (await named({ key, name: "n", staleThreadId: thread })).json()) as any;
+    expect(srv.created).toHaveLength(1);
+    expect(r3).toEqual({ chatId: CHAT, messageThreadId: await handleOf(srv.created[0]!.id), created: true });
+    expect(r3.messageThreadId).not.toBe(thread);
 
     // A stale report naming a thread that is no longer stored does not drop the new one.
-    const r4 = (await (await named({ chatId: CHAT, key, name: "n", staleThreadId: thread })).json()) as any;
-    expect(r4.messageThreadId).toBe(thread + 1);
-    expect(creates).toHaveLength(1);
+    const r4 = (await (await named({ key, name: "n", staleThreadId: thread })).json()) as any;
+    expect(r4.messageThreadId).toBe(r3.messageThreadId);
+    expect(srv.created).toHaveLength(1);
   });
 
   test("a reopen that reports thread-not-found recreates the topic", async () => {
     const key = nextKey();
-    const now = Date.now();
-    const thread = 883000 + seq;
-    await env.DB.prepare(
-      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, created_at, updated_at)
-       VALUES (?, ?, ?, 'n', NULL, ?, ?)`,
-    ).bind(CHAT, key, thread, now, now).run();
-    onTelegram("reopenForumTopic", () => ({ ok: false, error_code: 400, description: "Bad Request: message thread not found" }));
-    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread + 5, name: "n", icon_color: 0 } }));
-    const r = (await (await named({ chatId: CHAT, key, name: "n" })).json()) as any;
-    expect(r).toEqual({ chatId: CHAT, messageThreadId: thread + 5, created: true });
+    const { thread } = await seedNamed(key, { reopenCheckedAt: null });
+    srv.script("conversations.unarchive", { ok: false, error: "channel_not_found" });
+    const r = (await (await named({ key, name: "n" })).json()) as any;
+    expect(srv.created).toHaveLength(1);
+    expect(r).toEqual({ chatId: CHAT, messageThreadId: await handleOf(srv.created[0]!.id), created: true });
+    expect(r.messageThreadId).not.toBe(thread);
   });
 
   test("named topics are invisible to the orphan-closer and the reaper", async () => {
     const now = Date.now();
+    const thread = SLACK_HANDLE_MIN + 884000 + seq;
     await env.DB.prepare(
       `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
        VALUES (?, ?, ?, 'n', ?, ?)`,
-    ).bind(CHAT, nextKey(), 884000 + seq, now - 60 * 86400 * 1000, now - 60 * 86400 * 1000).run();
-    const closes = onTelegram("closeForumTopic", () => ({ ok: true, result: true }));
-    const deletes = onTelegram("deleteForumTopic", () => ({ ok: true, result: true }));
-    await closeOrphanedTopics(env.DB, { botToken: "t", now, orphanTtlMs: ORPHAN_TTL_MS });
-    await reapTopics(env.DB, { botToken: "t", now });
-    expect(closes.filter((c) => c.message_thread_id === 884000 + seq)).toHaveLength(0);
-    expect(deletes.filter((c) => c.message_thread_id === 884000 + seq)).toHaveLength(0);
+    ).bind(CHAT, nextKey(), thread, now - 60 * 86400 * 1000, now - 60 * 86400 * 1000).run();
+    const { client, calls } = fakeTransport();
+    await closeOrphanedTopics(env.DB, { botToken: "t", now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+    await reapTopics(env.DB, { botToken: "t", now, transport: client });
+    expect(calls.closeForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
+    expect(calls.deleteForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
   });
 
   test("a message typed in a named topic gets one rate-limited hint", async () => {
     const key = nextKey();
-    const now = Date.now();
-    const thread = 885000 + seq;
-    await env.DB.prepare(
-      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, created_at, updated_at)
-       VALUES (?, ?, ?, 'n', ?, ?)`,
-    ).bind(CHAT, key, thread, now, now).run();
-    const sends = onTelegram("sendMessage", () => ({ ok: true, result: { message_id: 1 } }));
+    const { channelId, thread } = await seedNamed(key);
 
     // The inbound side (what Slack's ingress calls for a message in a channel with no session).
-    expect(await maybeAnswerInNamedTopic(env.DB, topicsEnv, CHAT, thread)).toBe(true);
-    expect(await maybeAnswerInNamedTopic(env.DB, topicsEnv, CHAT, thread)).toBe(true);
+    expect(await maybeAnswerInNamedTopic(env.DB, nEnv, CHAT, thread)).toBe(true);
+    expect(await maybeAnswerInNamedTopic(env.DB, nEnv, CHAT, thread)).toBe(true);
 
+    const sends = slackOf("chat.postMessage");
     expect(sends).toHaveLength(1);
-    expect(sends[0]).toMatchObject({ chat_id: CHAT, message_thread_id: thread, text: NAMED_TOPIC_HINT_TEXT });
+    expect(sends[0]!.params.get("channel")).toBe(channelId);
+    expect(sends[0]!.params.get("text")).toContain(NAMED_TOPIC_HINT_TEXT);
+  });
+});
+
+// Telegram-only: the topics flag on the named-topic route.
+describe("named topics, Telegram-only", () => {
+  test("topics-disabled is a 409 (the flag is Telegram's)", async () => {
+    const res = await handleNamedTopic(env.DB, env as Env, new Request("https://worker/topics/named", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ chatId: String(CHAT_ID_NUM), key: "test:named-flag-off", name: "n" }),
+    }));
+    expect(res.status).toBe(409);
+  });
+
+  test("a chat outside the allowlist is 403", async () => {
+    const res = await handleNamedTopic(env.DB, { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env, new Request("https://worker/topics/named", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ chatId: "-1009999", key: "test:named-disallowed", name: "n" }),
+    }));
+    expect(res.status).toBe(403);
   });
 });
 
 // ─── Named topic binding (POST /topics/named/bind, unbind) ───────────────
 
 describe("named topic binding", () => {
-  const topicsEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-  const CHAT = String(CHAT_ID_NUM);
+  let bm: SlackMachine;
+  let bEnv: Env;
+  let srv: ReturnType<typeof fakeSlack>;
+  let CHAT = "";
   let seq = 0;
   const nextKey = () => `test:named-bind-${Date.now()}-${++seq}`;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    resetSlackCalls();
     fetchMock.activate();
     fetchMock.disableNetConnect();
-    fetchMock.get("https://api.telegram.org").cleanMocks();
+    bm = await mkSlackMachine();
+    bEnv = envWith([bm]);
+    CHAT = slackChatId(bm.ws);
+    srv = fakeSlack();
   });
   afterEach(() => {
+    fetchMock.get("https://slack.com").cleanMocks();
     fetchMock.deactivate();
   });
 
-  function onTelegram(method: string, reply: (body: any) => { ok: boolean; [k: string]: unknown }) {
-    const calls: any[] = [];
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
-      .reply((opts: any) => {
-        const body = JSON.parse(opts.body as string);
-        calls.push(body);
-        return {
-          statusCode: 200,
-          data: JSON.stringify(reply(body)),
-          responseOptions: { headers: { "Content-Type": "application/json" } },
-        };
-      })
-      .persist();
-    return calls;
-  }
+  const machineAuth = () => ({ "Content-Type": "application/json", Authorization: `Bearer ${bm.key}` });
+  /** The handle of the n-th conversation the fake Slack created. */
+  const createdHandle = async (n: number) =>
+    (await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = ?")
+      .bind(bm.ws.teamId, srv.created[n]!.id)
+      .first<{ handle: number }>())!.handle;
 
-  function bind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+  function bind(body: Record<string, unknown>, e: Env = bEnv, headers: Record<string, string> = machineAuth()) {
     return handleNamedTopicBind(env.DB, e, new Request("https://worker/topics/named/bind", {
       method: "POST",
       headers,
@@ -9427,7 +7770,7 @@ describe("named topic binding", () => {
     }));
   }
 
-  function unbind(body: Record<string, unknown>, e: Env = topicsEnv, headers = authHeaders) {
+  function unbind(body: Record<string, unknown>, e: Env = bEnv, headers: Record<string, string> = machineAuth()) {
     return handleNamedTopicUnbind(env.DB, e, new Request("https://worker/topics/named/unbind", {
       method: "POST",
       headers,
@@ -9445,7 +7788,7 @@ describe("named topic binding", () => {
   test("1. bind with no sessions row -> 409 session not registered, no binding row", async () => {
     const key = nextKey();
     const sessionId = `ses_no_session_${Date.now()}`;
-    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    const res = await bind({ key, name: "Topic", sessionId });
     expect(res.status).toBe(409);
     const body = await res.json() as any;
     expect(body.error).toBe("session not registered");
@@ -9457,12 +7800,11 @@ describe("named topic binding", () => {
     const key = nextKey();
     const sessionId = `ses_bind_ok_${Date.now()}`;
     await registerSessionRow(sessionId);
-    const threadId = 991001 + (++seq);
-    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: threadId, name: "Topic", icon_color: 0 } }));
 
-    const res = await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    const res = await bind({ key, name: "Topic", sessionId });
     expect(res.status).toBe(200);
     const body = await res.json() as any;
+    const threadId = await createdHandle(0);
     expect(body).toEqual({
       chatId: CHAT,
       messageThreadId: threadId,
@@ -9487,20 +7829,15 @@ describe("named topic binding", () => {
     const key2 = nextKey();
     const sessionId = `ses_rebind_${Date.now()}`;
     await registerSessionRow(sessionId);
-    const thread1 = 992001 + (++seq);
-    const thread2 = 992002 + (++seq);
-    let createCount = 0;
-    onTelegram("createForumTopic", () => ({
-      ok: true,
-      result: { message_thread_id: ++createCount === 1 ? thread1 : thread2, name: "Topic", icon_color: 0 },
-    }));
 
-    const res1 = await bind({ chatId: CHAT, key: key1, name: "Topic 1", sessionId });
+    const res1 = await bind({ key: key1, name: "Topic 1", sessionId });
     expect(res1.status).toBe(200);
+    const thread1 = await createdHandle(0);
     expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBe(sessionId);
 
-    const res2 = await bind({ chatId: CHAT, key: key2, name: "Topic 2", sessionId });
+    const res2 = await bind({ key: key2, name: "Topic 2", sessionId });
     expect(res2.status).toBe(200);
+    const thread2 = await createdHandle(1);
 
     expect(await getBoundSessionByThread(env.DB, CHAT, thread1)).toBeNull();
     expect(await getBoundSessionByThread(env.DB, CHAT, thread2)).toBe(sessionId);
@@ -9515,14 +7852,13 @@ describe("named topic binding", () => {
     const session2 = `ses_s2_${Date.now()}`;
     await registerSessionRow(session1);
     await registerSessionRow(session2);
-    const thread = 993001 + (++seq);
-    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
 
-    const res1 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session1 });
+    const res1 = await bind({ key, name: "Topic", sessionId: session1 });
     expect(res1.status).toBe(200);
+    const thread = await createdHandle(0);
     expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session1);
 
-    const res2 = await bind({ chatId: CHAT, key, name: "Topic", sessionId: session2 });
+    const res2 = await bind({ key, name: "Topic", sessionId: session2 });
     expect(res2.status).toBe(200);
     expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(session2);
 
@@ -9534,10 +7870,9 @@ describe("named topic binding", () => {
     const key = nextKey();
     const sessionId = `ses_unbind_${Date.now()}`;
     await registerSessionRow(sessionId);
-    const thread = 994001 + (++seq);
-    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
 
-    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    await bind({ key, name: "Topic", sessionId });
+    const thread = await createdHandle(0);
     expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
 
     const res1 = await unbind({ sessionId });
@@ -9555,10 +7890,9 @@ describe("named topic binding", () => {
     const key = nextKey();
     const sessionId = `ses_deleted_row_${Date.now()}`;
     await registerSessionRow(sessionId);
-    const thread = 995001 + (++seq);
-    onTelegram("createForumTopic", () => ({ ok: true, result: { message_thread_id: thread, name: "Topic", icon_color: 0 } }));
 
-    await bind({ chatId: CHAT, key, name: "Topic", sessionId });
+    await bind({ key, name: "Topic", sessionId });
+    const thread = await createdHandle(0);
     expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBe(sessionId);
 
     await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
@@ -9567,9 +7901,9 @@ describe("named topic binding", () => {
 
   test("7. auth: no bearer -> 401 on both routes", async () => {
     const noAuth = { "Content-Type": "application/json" };
-    const r1 = await bind({ chatId: CHAT, key: nextKey(), name: "n", sessionId: "ses_1" }, topicsEnv, noAuth);
+    const r1 = await bind({ key: nextKey(), name: "n", sessionId: "ses_1" }, bEnv, noAuth);
     expect(r1.status).toBe(401);
-    const r2 = await unbind({ sessionId: "ses_1" }, topicsEnv, noAuth);
+    const r2 = await unbind({ sessionId: "ses_1" }, bEnv, noAuth);
     expect(r2.status).toBe(401);
   });
 
@@ -9580,14 +7914,14 @@ describe("named topic binding", () => {
     expect(res2.status).toBe(400);
   });
 
-  test("bind input validation: bad key, bad sessionId, disallowed chat, topics disabled", async () => {
+  test("bind input validation: bad key, bad sessionId, and a principal with no workspace", async () => {
     const sessionId = "ses_valid";
     await registerSessionRow(sessionId);
-    expect((await bind({ chatId: CHAT, key: "bad key", name: "n", sessionId })).status).toBe(400);
-    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "" })).status).toBe(400);
-    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId: "x".repeat(129) })).status).toBe(400);
-    expect((await bind({ chatId: "-1009999", key: "valid_key", name: "n", sessionId })).status).toBe(403);
-    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId }, env as Env)).status).toBe(409);
+    expect((await bind({ key: "bad key", name: "n", sessionId })).status).toBe(400);
+    expect((await bind({ key: "valid_key", name: "n", sessionId: "" })).status).toBe(400);
+    expect((await bind({ key: "valid_key", name: "n", sessionId: "x".repeat(129) })).status).toBe(400);
+    // The shared key is on no workspace, so it has nowhere to put a topic.
+    expect((await bind({ chatId: CHAT, key: "valid_key", name: "n", sessionId }, bEnv, authHeaders)).status).toBe(403);
   });
 
   test("unbind input validation: missing or invalid sessionId", async () => {
@@ -9600,7 +7934,8 @@ describe("named topic binding", () => {
     let warnSpy: ReturnType<typeof vi.spyOn> | undefined;
     const now = Date.now();
     const sessionId = `ses_skew_${now}`;
-    const thread = 886000 + (++seq);
+    const namedChannel = `CSK${stamp()}`.toUpperCase();
+    const thread = await seedChannel(bm.ws.teamId, namedChannel);
     const key = nextKey();
 
     await registerSessionRow(sessionId);
@@ -9618,62 +7953,26 @@ describe("named topic binding", () => {
       expect(await getBindingForSession(env.DB, sessionId)).toBeNull();
       expect(await getBoundSessionByThread(env.DB, CHAT, thread)).toBeNull();
 
-      let sentPayload: any = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, { ok: true, result: { message_thread_id: 12345, name: "Topic" } }, {
-          headers: { "Content-Type": "application/json" },
-        });
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(200, { ok: true, result: true }, {
-          headers: { "Content-Type": "application/json" },
-        });
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sentPayload = JSON.parse(raw);
-          return { ok: true, result: { message_id: 1234 } };
-        });
-
       const notifRes = await handleSendNotification(
         env.DB,
-        topicsEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId: CHAT,
-            text: "notification during schema skew",
-            title: "Skew Title",
-            dir: "pigeon",
-            threaded: true,
-          }),
+        bEnv,
+        postJson("/notifications/send", bm.key, {
+          sessionId,
+          text: "notification during schema skew",
+          title: "Skew Title",
+          dir: "pigeon",
+          threaded: true,
         }),
       );
       expect(notifRes.status).toBe(200);
+      // The session got its own topic: a missing bindings table must not hide that it has none bound.
+      expect(srv.created).toHaveLength(1);
+      expect(slackOf("chat.postMessage")[0]!.params.get("channel")).toBe(srv.created[0]!.id);
 
-      let hintSent: any = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          hintSent = JSON.parse(raw);
-          return { ok: true, result: { message_id: 1235 } };
-        });
-
-      expect(await maybeAnswerInNamedTopic(env.DB, topicsEnv, CHAT, thread)).toBe(true);
-      expect(hintSent).toMatchObject({
-        chat_id: CHAT,
-        message_thread_id: thread,
-        text: NAMED_TOPIC_HINT_TEXT,
-      });
+      expect(await maybeAnswerInNamedTopic(env.DB, bEnv, CHAT, thread)).toBe(true);
+      const hint = slackOf("chat.postMessage")[1];
+      expect(hint!.params.get("channel")).toBe(namedChannel);
+      expect(hint!.params.get("text")).toContain(NAMED_TOPIC_HINT_TEXT);
 
       expect(warnSpy).toHaveBeenCalled();
     } finally {
@@ -9707,5 +8006,20 @@ describe("named topic binding", () => {
     } as unknown as D1Database;
     await expect(getBindingForSession(failing, "ses_x")).rejects.toThrow(/Network connection lost/);
     await expect(getBoundSessionByThread(failing, "1", 2)).rejects.toThrow(/Network connection lost/);
+  });
+});
+
+// Telegram-only: the topics flag and the allowlist on the bind route.
+describe("named topic binding, Telegram-only", () => {
+  const bindTg = (chatId: string, e: Env) =>
+    handleNamedTopicBind(env.DB, e, new Request("https://worker/topics/named/bind", {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ chatId, key: "valid_key", name: "n", sessionId: "ses_valid" }),
+    }));
+
+  test("a chat outside the allowlist is 403 and topics-disabled is 409", async () => {
+    expect((await bindTg("-1009999", { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env)).status).toBe(403);
+    expect((await bindTg(String(CHAT_ID_NUM), env as Env)).status).toBe(409);
   });
 });

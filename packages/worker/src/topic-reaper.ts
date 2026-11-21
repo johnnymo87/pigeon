@@ -59,8 +59,8 @@ export interface ReapTopicsOptions {
   reapTtlMs?: number;
   orphanTtlMs?: number;
   limit?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for ANY row's address, Slack included (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack row needs for its workspace secret. */
   env?: Env;
 }
@@ -75,8 +75,8 @@ export interface CloseOrphanedTopicsOptions {
   now?: number;
   orphanTtlMs?: number;
   limit?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for ANY row's address, Slack included (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack row needs for its workspace secret. */
   env?: Env;
 }
@@ -92,8 +92,8 @@ export interface RunTopicReaperOptions {
   orphanTtlMs?: number;
   reapCap?: number;
   orphanCap?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for ANY row's address, Slack included (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack row needs for its workspace secret. */
   env?: Env;
   /**
@@ -131,7 +131,7 @@ export async function reapTopics(
   }
 
   // Rows of every chat are mixed here, so the transport is picked per row, by its address.
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.transport, opts.env ? { env: opts.env, db } : undefined);
   let reaped = 0;
 
   for (const row of rows) {
@@ -185,7 +185,7 @@ export async function closeOrphanedTopics(
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.transport, opts.env ? { env: opts.env, db } : undefined);
   let closedOrphans = 0;
   // A 429 limits ONE provider, so it stops that transport's remaining rows and no others: Slack
   // being limited must not leave Telegram orphans open until tomorrow's tick, nor the reverse.
@@ -254,7 +254,7 @@ export async function runTopicReaper(
     // back to the 7d default — which is exactly the drift the shared constant exists to prevent.
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.reapCap,
-    tgClient: opts.tgClient,
+    transport: opts.transport,
     env: opts.env,
   });
 
@@ -277,7 +277,7 @@ export async function runTopicReaper(
     now: opts.now,
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.orphanCap,
-    tgClient: opts.tgClient,
+    transport: opts.transport,
     env: opts.env,
   });
 

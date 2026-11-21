@@ -52,8 +52,8 @@ export interface ResolveTopicOptions {
   ttlMs?: number;
   pollAttempts?: number;
   pollIntervalMs?: number;
-  /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for ANY address, Slack included (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack address needs for its workspace secret. */
   env?: Env;
   /**
@@ -125,7 +125,7 @@ export async function resolveTopic(
       row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
     const name = topicName(opts.dir || fallbackDir, title);
 
-    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
+    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
     try {
       const res = await tgClient.editForumTopic({
         chatId: opts.chatId,
@@ -262,7 +262,7 @@ export async function resolveTopic(
   }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
-      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
+      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
       // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
       // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
       // Removing this reopen call is tracked as roadmap item 6c.
@@ -335,7 +335,7 @@ export async function resolveTopic(
   const delay =
     opts.delayFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient, slackCtx);
+  const tg = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
 
   // Helper for creator flow (executed by initial reserve winner or steal winner)
   async function runCreatorFlow(): Promise<ResolveTopicResult> {

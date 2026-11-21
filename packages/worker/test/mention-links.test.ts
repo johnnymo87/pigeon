@@ -7,6 +7,22 @@ import {
   resolveMentionKeyboard,
   MAX_MENTION_LINKS,
 } from "../src/mention-links";
+import { handleSendNotification } from "../src/notifications";
+import { slackArchiveUrl } from "../src/slack";
+import { slackChatId, type SlackWorkspace } from "../src/chat/slack-config";
+import {
+  envWith,
+  mkSlackMachine,
+  postJson,
+  posted,
+  resetSlackCalls,
+  seedChannel,
+  seedAlerts,
+  seedSession,
+  slack,
+  slackCalls,
+  stamp,
+} from "./slack-harness";
 
 const CHAT_ID = "-1001234567890";
 const SELF_ID = "ses_aaaaaaaaaaaa1111111111111a";
@@ -80,8 +96,63 @@ describe("buttonLabel", () => {
   });
 });
 
-describe("resolveMentionKeyboard", () => {
+// ─── shared resolution logic, on Slack rows ────────────────────────────────
+
+describe("resolveMentionKeyboard (Slack rows)", () => {
+  let ws: SlackWorkspace;
+  let e: Env;
+  const channels = new Map<string, string>();
+
+  beforeAll(async () => {
+    const m = await mkSlackMachine({ teamId: `TMENT${stamp()}`.toUpperCase(), domain: "acme" });
+    ws = m.ws;
+    e = envWith([m]);
+  });
+
+  /** A topic row in this workspace, over a conversation Slack knows, unless `handle` is given. */
+  async function seedSlackRow(sessionId: string, name: string | null, handle?: number | null): Promise<void> {
+    let thread: number | null;
+    if (handle !== undefined) {
+      thread = handle;
+    } else {
+      const channelId = `CM${stamp()}`.toUpperCase();
+      thread = await seedChannel(ws.teamId, channelId);
+      channels.set(sessionId, channelId);
+    }
+    await seedTopic(sessionId, thread, name, slackChatId(ws));
+  }
+  const url = (sessionId: string) => slackArchiveUrl("acme", channels.get(sessionId)!);
+
   it("links a shortened id to the one topic it prefixes, labelled by title", async () => {
+    await seedSlackRow(WORKER_A, "Rework goose delivery · ~/projects/pigeon");
+    const kb = await resolveMentionKeyboard(env.DB, "worker ses_e71285de is stuck", SELF_ID, e);
+    expect(kb).toEqual({ inline_keyboard: [[{ text: "Rework goose delivery", url: url(WORKER_A) }]] });
+  });
+
+  it("links full ids and goose ids, in mention order", async () => {
+    await seedSlackRow(WORKER_A, "A");
+    await seedSlackRow(GOOSE, "G");
+    const kb = await resolveMentionKeyboard(env.DB, `${GOOSE} then ${WORKER_A}`, SELF_ID, e);
+    expect(kb?.inline_keyboard.map((r: Array<{ text: string }>) => r[0]!.text)).toEqual(["G", "A"]);
+  });
+
+  it("gives no button for an ambiguous prefix, a missing topic, a reserved row, or a conversation Slack does not know", async () => {
+    await seedSlackRow(WORKER_A, "A");
+    await seedSlackRow("ses_e71285de0000aaaaaaaaaaaaaa", "A2");
+    await seedSlackRow(WORKER_B, "reserved", null);
+    await seedSlackRow("ses_e6000000000000000000000000", "unknown", 2 ** 40 + 987654321);
+    const kb = await resolveMentionKeyboard(
+      env.DB,
+      "ses_e71285de ses_e7000000 ses_e6000000 ses_ffffffff",
+      SELF_ID,
+      e,
+    );
+    expect(kb).toBeUndefined();
+  });
+});
+
+describe("resolveMentionKeyboard", () => {
+  it("[Telegram t.me] links a shortened id to the one topic it prefixes, labelled by title", async () => {
     await seedTopic(WORKER_A, 77, "Rework goose delivery · ~/projects/pigeon");
     const kb = await resolveMentionKeyboard(env.DB, "worker ses_e71285de is stuck", SELF_ID);
     expect(kb).toEqual({
@@ -89,14 +160,14 @@ describe("resolveMentionKeyboard", () => {
     });
   });
 
-  it("links full ids and goose ids, in mention order", async () => {
+  it("[Telegram t.me] links full ids and goose ids, in mention order", async () => {
     await seedTopic(WORKER_A, 77, "A");
     await seedTopic(GOOSE, 78, "G");
     const kb = await resolveMentionKeyboard(env.DB, `${GOOSE} then ${WORKER_A}`, SELF_ID);
     expect(kb?.inline_keyboard.map((r: Array<{ text: string }>) => r[0]!.text)).toEqual(["G", "A"]);
   });
 
-  it("gives no button for an ambiguous prefix, a missing topic, a reserved row, or a non-supergroup chat", async () => {
+  it("[Telegram t.me] gives no button for an ambiguous prefix, a missing topic, a reserved row, or a non-supergroup chat", async () => {
     await seedTopic(WORKER_A, 77, "A");
     await seedTopic("ses_e71285de0000aaaaaaaaaaaaaa", 79, "A2");
     await seedTopic(WORKER_B, null, "reserved");
@@ -133,7 +204,62 @@ describe("resolveMentionKeyboard", () => {
   });
 });
 
-describe("POST /notifications/send adds mention links", () => {
+describe("POST /notifications/send adds mention links (Slack)", () => {
+  let m: Awaited<ReturnType<typeof mkSlackMachine>>;
+  let e: Env;
+  let sender: string;
+  let workerUrl: string;
+
+  beforeEach(async () => {
+    fetchMock.activate();
+    fetchMock.disableNetConnect();
+    resetSlackCalls();
+    m = await mkSlackMachine({ domain: "acme" });
+    e = envWith([m]);
+    sender = await seedSession(m.machineId, "coord");
+    await seedAlerts(m.ws);
+    const channelId = `CMW${stamp()}`.toUpperCase();
+    const handle = await seedChannel(m.ws.teamId, channelId);
+    await seedTopic(WORKER_A, handle, "Rework goose delivery · ~/projects/pigeon", slackChatId(m.ws));
+    workerUrl = slackArchiveUrl("acme", channelId);
+  });
+
+  afterEach(() => {
+    fetchMock.deactivate();
+  });
+
+  const send = (body: Record<string, unknown>) =>
+    handleSendNotification(
+      env.DB,
+      e,
+      postJson("/notifications/send", m.key, { sessionId: sender, threaded: false, ...body }),
+    );
+
+  const buttons = () => {
+    const blocks = JSON.parse(slackCalls[0]!.params.get("blocks") ?? "[]") as Array<{
+      type: string;
+      elements?: Array<Record<string, unknown>>;
+    }>;
+    return blocks.filter((b) => b.type === "actions").flatMap((b) => b.elements ?? []);
+  };
+
+  it("attaches a url button when the text mentions a session with a topic", async () => {
+    slack("chat.postMessage", posted("CALERTS1"));
+    const res = await send({ text: "ses_e71285de finished", replyMarkup: { inline_keyboard: [] } });
+    expect(res.status).toBe(200);
+    expect(buttons()).toMatchObject([{ type: "button", url: workerUrl, text: { text: "Rework goose delivery" } }]);
+  });
+
+  it("leaves a caller's own keyboard alone", async () => {
+    const own = { inline_keyboard: [[{ text: "Yes", callback_data: "cmd:tok:v1:q0" }]] };
+    slack("chat.postMessage", posted("CALERTS1"));
+    await send({ text: "ses_e71285de?", replyMarkup: own });
+    expect(buttons()).toMatchObject([{ type: "button", value: "cmd:tok:v1:q0" }]);
+    expect(buttons().some((b) => "url" in b)).toBe(false);
+  });
+});
+
+describe("POST /notifications/send adds mention links (Telegram)", () => {
   const authHeaders = {
     "Content-Type": "application/json",
     Authorization: "Bearer test-api-key",
@@ -179,22 +305,6 @@ describe("POST /notifications/send adds mention links", () => {
       body: JSON.stringify({ sessionId: SENDER, chatId: ALLOWED_CHAT, threaded: false, ...body }),
     });
   }
-
-  it("attaches a url button when the text mentions a session with a topic", async () => {
-    const sent = captureSends([{ status: 200, body: { ok: true, result: { message_id: 501 } } }]);
-    const res = await send({ text: "ses_e71285de finished", replyMarkup: { inline_keyboard: [] } });
-    expect(res.status).toBe(200);
-    expect(sent[0].reply_markup).toEqual({
-      inline_keyboard: [[{ text: "Rework goose delivery", url: "https://t.me/c/1234567890/77" }]],
-    });
-  });
-
-  it("leaves a caller's own keyboard alone", async () => {
-    const own = { inline_keyboard: [[{ text: "Yes", callback_data: "cmd:tok:v1:q0" }]] };
-    const sent = captureSends([{ status: 200, body: { ok: true, result: { message_id: 502 } } }]);
-    await send({ text: "ses_e71285de?", replyMarkup: own });
-    expect(sent[0].reply_markup).toEqual(own);
-  });
 
   it("resends once without the buttons when Telegram rejects them with a 400", async () => {
     const sent = captureSends([

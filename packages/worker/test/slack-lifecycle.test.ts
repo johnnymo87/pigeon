@@ -15,6 +15,7 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import { sha256Hex } from "../src/credentials";
 import { hasSlackWorkspaceSecret, slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
 import { createTelegramClient } from "../src/telegram";
+import { isSlackChatId, transportForChat } from "../src/chat";
 import { SLACK_POST_SWEEP_CAP, SLACK_POST_TTL_MS, sweepSlackPosts } from "../src/chat/slack-posts";
 import { slackArchiveUrl } from "../src/slack";
 import { resolveMentionKeyboard } from "../src/mention-links";
@@ -334,6 +335,20 @@ describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () 
     return sessionId;
   }
 
+  /**
+   * The injected transport now stands in for EVERY address, so a mixed run routes Slack rows back
+   * to the real Slack transport and keeps the Telegram fake for the numeric ones.
+   */
+  function mixed(tg: ReturnType<typeof tgFake>, e: Env) {
+    return {
+      ...tg.client,
+      closeForumTopic: (o: { chatId: string | number; messageThreadId: number }) =>
+        isSlackChatId(o.chatId)
+          ? transportForChat(String(o.chatId), "unused", undefined, { env: e, db: env.DB }).closeForumTopic(o)
+          : tg.client.closeForumTopic(o),
+    };
+  }
+
   const states = async (ids: string[]) => Promise.all(ids.map(async (id) => (await getBySession(env.DB, id))?.state));
 
   function tgFake(answers: Array<"ok" | "limited">) {
@@ -368,7 +383,7 @@ describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () 
       now: NOW,
       limit: 50,
       env: envFor([m]),
-      tgClient: tg.client,
+      transport: mixed(tg, envFor([m])),
     });
 
     expect(res.rateLimited).toBe(true);
@@ -392,7 +407,7 @@ describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () 
       now: NOW,
       limit: 50,
       env: envFor([m]),
-      tgClient: tg.client,
+      transport: mixed(tg, envFor([m])),
     });
 
     expect(res.rateLimited).toBe(true);
@@ -406,7 +421,7 @@ describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () 
     const m = await mkMachine();
     const tgIds = [await seedOrphan(m.machineId, { tg: TG_CHAT }), await seedOrphan(m.machineId, { tg: TG_CHAT })];
     const tg = tgFake(["limited", "ok"]);
-    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, tgClient: tg.client });
+    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, transport: tg.client });
     expect(res).toEqual({ closedOrphans: 0, rateLimited: true });
     expect(tg.closes).toHaveLength(1);
     expect(await states(tgIds)).toEqual(["open", "open"]);
@@ -416,7 +431,7 @@ describe("closeOrphanedTopics: a 429 stops only the transport that sent it", () 
     const m = await mkMachine();
     await seedOrphan(m.machineId, { tg: TG_CHAT });
     const tg = tgFake(["ok"]);
-    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, tgClient: tg.client });
+    const res = await closeOrphanedTopics(env.DB, { botToken: "unused", now: NOW, limit: 50, transport: tg.client });
     expect(res).toEqual({ closedOrphans: 1, rateLimited: false });
   });
 });
