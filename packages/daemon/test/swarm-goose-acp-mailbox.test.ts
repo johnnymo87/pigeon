@@ -391,7 +391,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe(
-      "goose session 20260918_1 has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. `honk telegram 20260918_1 --force`) before using swarm",
+      "goose session 20260918_1 has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. `honk pigeon 20260918_1 --force`) before using swarm",
     );
 
     // Existing row left untouched (endpoint and lastSeen unchanged, pullSources not modified)
@@ -483,7 +483,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(mailboxRes.notify).toBe(false);
     expect(s.sessions.get(mailboxRes.session_id)?.pullSources).toEqual(["chat-reply", "swarm"]);
 
-    // Now honk telegram registers the session via POST /goose/sessions
+    // Now honk pigeon registers the session via POST /goose/sessions
     const sessionsRes = await app(
       new Request("http://localhost/goose/sessions", {
         method: "POST",

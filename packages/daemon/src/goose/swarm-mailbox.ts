@@ -96,7 +96,7 @@ export function ensureGooseSwarmMailbox(
   ) {
     return {
       ok: false,
-      error: `goose session ${input.backendSessionId} has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. \`honk telegram ${input.backendSessionId} --force\`) before using swarm`,
+      error: `goose session ${input.backendSessionId} has a legacy pigeon row (its pigeon id is goose's id); re-register it with POST /goose/sessions (e.g. \`honk pigeon ${input.backendSessionId} --force\`) before using swarm`,
       statusCode: 409,
     };
   }
