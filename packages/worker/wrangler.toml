@@ -16,11 +16,12 @@ bucket_name = "pigeon-media"
 crons = ["0 * * * *"]
 
 [vars]
-# Removed with Telegram (pigeon-4ogz.13): ALLOWED_CHAT_IDS, TELEGRAM_TOPICS_ENABLED,
-# TELEGRAM_RICH_MESSAGES, TELEGRAM_BOT_TOKEN (and the webhook secret, bot username and allowed user
-# ids). keep_vars = true keeps whatever is deployed, so the deployed values are inert leftovers:
-# delete them one by one in the Cloudflare dashboard. Do NOT flip keep_vars off, it would wipe the
-# dashboard-set SLACK_* vars.
+# keep_vars = true keeps any plain var that is deployed but no longer listed here. To REMOVE one
+# (as pigeon-4ogz.26 did for the Telegram vars): copy this file with keep_vars = false, run
+# `wrangler versions upload -c <copy>`, check `wrangler versions view <id> --json` lists every
+# secret (versions upload keeps secrets), then `wrangler versions deploy <id>@100%`. NEVER run
+# `wrangler deploy` with keep_vars = false: wrangler then drops the SECRETS too (SLACK_WORKSPACE_*,
+# CCR_API_KEY), which takes every machine off the chat.
 # Retire the shared CCR_API_KEY for these machines (pigeon-k0qn.8): it can no longer poll, ack,
 # register or unregister as them, which only their own per-machine keys may do. Other routes
 # still accept it. To un-retire a machine, EDIT this list and redeploy; never delete the line,
