@@ -45,7 +45,7 @@ function harness(over: Partial<GooseLaunchInput> = {}) {
       },
     }),
     onSessionStart: async (sessionId, notify) => { started.push({ sessionId, notify }); },
-    sendTelegramReply: async (_chat, text) => { replies.push(text); },
+    sendChatReply: async (_chat, text) => { replies.push(text); },
     mintPigeonId: () => "gse_fixed",
     mintTimeoutMs: 5_000,
     ...over,

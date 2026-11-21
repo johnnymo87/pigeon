@@ -10,7 +10,7 @@ describe("ingestInterruptCommand", () => {
       opencodeClient: {
         abortSession: vi.fn().mockResolvedValue(undefined),
       } as any,
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -21,7 +21,7 @@ describe("ingestInterruptCommand", () => {
     await ingestInterruptCommand(input);
 
     expect(input.opencodeClient.abortSession).toHaveBeenCalledWith("sess-abc");
-    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(chatId).toBe("12345");
     expect(text).toContain("interrupted");
     expect(text).toContain("sess-abc");
@@ -42,7 +42,7 @@ describe("ingestInterruptCommand", () => {
 
     await ingestInterruptCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "12345",
       expect.stringContaining("Failed to interrupt"),
     );
@@ -54,7 +54,7 @@ describe("ingestInterruptCommand", () => {
       opencodeClient: {
         abortSession: vi.fn(async () => { callOrder.push("abort"); }),
       } as any,
-      sendTelegramReply: vi.fn(async () => { callOrder.push("reply"); }),
+      sendChatReply: vi.fn(async () => { callOrder.push("reply"); }),
     });
 
     await ingestInterruptCommand(input);

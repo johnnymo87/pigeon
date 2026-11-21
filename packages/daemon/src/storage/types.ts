@@ -1,3 +1,4 @@
+// "telegram-reply" is the persisted/wire name of the human-reply source (kept, pigeon-4ogz.14).
 export const DEFAULT_PULL_SOURCES: readonly string[] = ["telegram-reply"];
 /**
  * `swarm-remote` (pigeon-k0qn.6): also accept swarm messages relayed from another machine.
@@ -21,7 +22,7 @@ export interface SessionRecord {
    * scroll", which is the pre-feature behaviour of landing at the bottom.
    *
    * Written only by /mirror, so it is really "last turn authored in the TUI":
-   * Telegram replies arrive as daemon-injected prompts and are excluded.
+   * Chat replies arrive as daemon-injected prompts and are excluded.
    */
   lastHumanMsgId: string | null;
   notify: boolean;
@@ -60,7 +61,7 @@ export interface SessionRecord {
    * Effective value: if the underlying `pull_sources` column is NULL,
    * defaults to `["telegram-reply"]`.
    *
-   * Gates ONLY swarm banking. Telegram-reply banking stays active
+   * Gates ONLY swarm banking. chat-reply (`telegram-reply` source) banking stays active
    * regardless of whether it is listed here.
    */
   pullSources: string[];

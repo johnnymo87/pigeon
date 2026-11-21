@@ -36,7 +36,7 @@ export function parseSlackWebhookUrl(value: string | undefined): string | undefi
 }
 
 /**
- * A failed webhook post. Deliberately NOT a `TelegramSendError`: the `/alert` ladder retries a
+ * A failed webhook post. Deliberately NOT a `ChatSendError`: the `/alert` ladder retries a
  * worker-relayed 400 without its buttons or topic, which changes nothing for a webhook that
  * ignores both.
  */

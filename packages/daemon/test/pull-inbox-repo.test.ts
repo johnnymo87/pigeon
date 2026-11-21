@@ -298,7 +298,7 @@ describe("PullInboxRepository", () => {
       { msgId: "s1", sessionId: "ses_pull", source: "swarm", payload: "sw1" },
       1_000,
     );
-    // Telegram-reply message banked later
+    // chat-reply message banked later
     s.pullInbox.bank(
       { msgId: "t1", sessionId: "ses_pull", source: "telegram-reply", payload: "tg1" },
       2_000,
@@ -373,7 +373,7 @@ describe("PullInboxRepository", () => {
     const claimedWithoutSwarm = s.pullInbox.claim("ses_pull", 2_000, 50, { includeSwarm: false });
     expect(claimedWithoutSwarm.map((r) => r.msgId)).toEqual(["t1"]);
 
-    // Ack the claimed telegram row
+    // Ack the claimed chat row
     s.pullInbox.ack("ses_pull", ["t1"], 2_000);
 
     // Subsequent claim with includeSwarm: true (or default) claims the held swarm rows

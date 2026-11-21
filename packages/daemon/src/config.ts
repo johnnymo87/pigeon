@@ -59,7 +59,7 @@ export interface DaemonConfig {
   /** Matches the serve's `GOOSE_SERVER__SECRET_KEY`. Absent is valid only for a serve run unauthenticated. */
   gooseAcpToken?: string;
   /**
-   * Telegram user ids allowed to bank a message for a pull-mode session
+   * Chat user id allowed to bank a message for a pull-mode session
    * (`PIGEON_PULL_ALLOWED_USER_IDS`, comma separated). EMPTY MEANS NOBODY: a pull
    * session's banked text is input to a client that is not watched while it
    * runs, so the default is closed. The worker's own chat allowlist admits every

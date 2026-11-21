@@ -39,7 +39,7 @@ export interface WatchdogClient {
    * becomes prose.
    *
    * Removing it would also buy nothing structurally: the concrete
-   * `OpencodeClient` keeps the method regardless (the Telegram `/interrupt`
+   * `OpencodeClient` keeps the method regardless (the chat `/interrupt`
    * command calls it via `worker/interrupt-ingest.ts`), so re-adding it here
    * is one line. Capability-absence that is trivially recoverable is
    * decoration; the mutation-tested assertion is the real guard.
@@ -1688,7 +1688,7 @@ export class DeliveryWatchdog {
         const blockedAge = now - (row.handedOffAt ?? now);
         // The `as of` stamp is not decoration. Every duration in this text is
         // measured at OBSERVATION time, but the alert now rides the durable
-        // queue: the drainer retries with backoff and, through a long Telegram
+        // queue: the drainer retries with backoff and, through a long the chat
         // outage, this can reach a human hours after the fact. Without the
         // stamp "unverified for 17 minutes" silently becomes a claim about the
         // present, and a reader would size the problem wrongly.

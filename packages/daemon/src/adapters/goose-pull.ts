@@ -24,7 +24,7 @@ export function isPullBackend(session: Pick<SessionRecord, "backendKind"> | null
 export interface GoosePullAdapterDeps {
   storage: StorageDb;
   /**
-   * Telegram user ids whose messages may be banked. Must be non-empty:
+   * Chat user id whose messages may be banked. Must be non-empty:
    * `selectAdapter` returns no adapter at all for a pull session when it is
    * empty, so the human gets the ordinary "not reachable" reply.
    */
@@ -49,7 +49,7 @@ export const IN_REPLY_TO_MAX_CHARS = 500;
  * name and its own state, so nothing downstream is told a delivery happened.
  *
  * The success path returns `meta.banked`, which `command-ingest` turns into a
- * user-visible notice. That is not decoration: Telegram has already toasted
+ * user-visible notice. That is not decoration: the chat has already toasted
  * "Command sent", and for this backend that is false by as much as days.
  */
 export class GoosePullAdapter implements CommandDeliveryAdapter {
@@ -86,7 +86,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
     if (!senderId || !this.allowedSenderIds.has(senderId)) {
       return {
         ok: false,
-        error: "this session only accepts messages from its owner's Telegram account",
+        error: "this session only accepts messages from its owner's chat account",
       };
     }
     // The allowlist proves who SENT a message, not who wrote it.
@@ -139,7 +139,7 @@ export class GoosePullAdapter implements CommandDeliveryAdapter {
   ): CommandDeliveryResult {
     // Belt and braces behind selectAdapter. Aside from swarm banking via
     // bank-or-insert.ts for opted-in sessions, this adapter is the writer to
-    // the bank for human Telegram replies, and a bank keyed on a session id
+    // the bank for human chat replies, and a bank keyed on a session id
     // that no drain will ever ask for is mail that is written, never read,
     // and never noticed.
     if (!isPullBackend(session)) {

@@ -57,7 +57,7 @@ export interface EndpointDriftNotifier {
 
 export type ReconcilerLogger = (msg: string, fields?: Record<string, unknown>) => void;
 
-/** Per-slot alert cooldown, so a pathological re-hijack loop cannot spam Telegram. */
+/** Per-slot alert cooldown, so a pathological re-hijack loop cannot spam the chat. */
 export const DEFAULT_ALERT_COOLDOWN_MS = 10 * 60 * 1000;
 
 /**
@@ -136,7 +136,7 @@ export class ServeEndpointReconciler {
 
   /**
    * One reconcile pass. The repair is synchronous and happens FIRST; alerting is
-   * best-effort afterwards, so a Telegram outage can never block or undo it.
+   * best-effort afterwards, so a chat outage can never block or undo it.
    */
   async tick(): Promise<EndpointDrift[]> {
     const drifts = reconcileServeEndpoints(this.serves, this.endpoints);
@@ -159,7 +159,7 @@ export class ServeEndpointReconciler {
     const pending: EndpointDrift[] = [];
 
     for (const drift of drifts) {
-      // Logged unconditionally — the cooldown throttles Telegram, never the record.
+      // Logged unconditionally — the cooldown throttles the chat, never the record.
       this.log("serve endpoint drift repaired", {
         serveId: drift.serveId,
         found: drift.found,

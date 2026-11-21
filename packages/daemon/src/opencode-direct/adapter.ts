@@ -65,7 +65,7 @@ function buildExecuteEnvelope(input: OpencodeDirectExecuteInput, now: () => numb
     commandId: input.commandId,
     sessionId: input.sessionId,
     command: input.command,
-    source: input.source ?? OpencodeDirectSource.TelegramReply,
+    source: input.source ?? OpencodeDirectSource.ChatReply,
     issuedAt: now(),
     ...(input.deadlineMs !== undefined ? { deadlineMs: input.deadlineMs } : {}),
     metadata: {

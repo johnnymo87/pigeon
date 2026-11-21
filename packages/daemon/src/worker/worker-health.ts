@@ -47,7 +47,7 @@
  */
 
 import type { WorkerResult } from "./poller";
-import { getErrorClass, getTelegramErrorCode } from "./delivery-policy";
+import { getErrorClass, getErrorCode } from "./delivery-policy";
 
 export type WorkerEndpoint = "register" | "send";
 
@@ -261,7 +261,7 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     // A Slack verdict on one message or one conversation (pigeon-4ogz.5) is not the worker
     // failing. `upstream` (a dead token, Slack down) and `rate_limited` still count. Every
     // provider failure the worker relays carries a class, so the former `details.error_code`
-    // 400 carve-out (Telegram) is gone (pigeon-4ogz.13).
+    // 400 carve-out (a Telegram-era rule) is gone (pigeon-4ogz.13).
     const errorClass = getErrorClass(result.body);
     if (errorClass === "rejected_format" || errorClass === "conversation_gone") {
       return "neutral";
@@ -386,7 +386,7 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
           this.log?.("worker 5xx not counted toward the alarm", {
             endpoint,
             status: result.status,
-            telegramErrorCode: getTelegramErrorCode(result.body),
+            errorCode: getErrorCode(result.body),
           });
         }
         return;
@@ -495,9 +495,9 @@ function describeFailure(result: WorkerResult): string {
     return result.error;
   }
   if (result.kind === "http_error" || result.kind === "app_rejection") {
-    const code = getTelegramErrorCode(result.body);
+    const code = getErrorCode(result.body);
     return code !== undefined
-      ? `status=${result.status} telegram_error_code=${code}`
+      ? `status=${result.status} error_code=${code}`
       : `status=${result.status}`;
   }
   return "unknown";

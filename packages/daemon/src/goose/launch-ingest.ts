@@ -1,4 +1,4 @@
-import { TgMessageBuilder, type TgEntity } from "../telegram-message.js";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message.js";
 import { expandShorthand, resolveHome, tagLaunchedSession } from "../worker/launch-ingest.js";
 import type { OcTagsRunner } from "../worker/oc-tags.js";
 import { registerGooseSession, type GooseSessionStore } from "./register-session.js";
@@ -40,7 +40,7 @@ import type { SessionRecord } from "../storage/types.js";
  *
  * WHY THE PROMPT GOES THROUGH THE RUNNER rather than the minting client: the
  * runner owns the turn, routes `session/update` frames to the transcript, and
- * reports the stop to Telegram. Prompting on the throwaway client would run a
+ * reports the stop to the chat. Prompting on the throwaway client would run a
  * real turn that nobody was listening to.
  */
 
@@ -73,9 +73,9 @@ export interface GooseLaunchInput {
    * MUST NOT THROW. It is called from inside this module's own failure
    * handling, so a throw here would escape and redeliver the launch -- the one
    * thing the whole module is arranged to prevent. The production sender
-   * swallows send failures; see createTelegramReplySender.
+   * swallows send failures; see createChatReplySender.
    */
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
   now?: () => number;
   /** Bound on the two mint calls. See the file header. */
   mintTimeoutMs?: number;
@@ -159,7 +159,7 @@ function refusalFor(reach: Reachability, endpoint: string): string | null {
 }
 
 export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise<void> {
-  const { chatId, machineId, acpUrl, sendTelegramReply } = input;
+  const { chatId, machineId, acpUrl, sendChatReply } = input;
   const directory = resolveHome(expandShorthand(input.directory));
   const machineLabel = machineId ? ` on ${machineId}` : "";
   const token = input.acpToken ?? "";
@@ -169,7 +169,7 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
   const probe = input.reachability ?? classifyReachability;
   const refusal = refusalFor(await probe(acpUrl, token), acpUrl);
   if (refusal) {
-    await sendTelegramReply(chatId, refusal);
+    await sendChatReply(chatId, refusal);
     return;
   }
 
@@ -199,7 +199,7 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
     try { client.close(); } catch { /* closing a dead socket is not a failure */ }
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`[goose-launch] commandId=${input.commandId} could not start a session:`, err);
-    await sendTelegramReply(chatId, `Could not start a goose session${machineLabel}: ${message}`);
+    await sendChatReply(chatId, `Could not start a goose session${machineLabel}: ${message}`);
     return;
   }
   // The session exists from here on. Everything below reports; nothing throws.
@@ -285,7 +285,7 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
 
   // Sending is OUTSIDE the try on purpose. Inside, a send that threw would be
   // caught and relabelled as a launch failure -- reporting the wrong cause for
-  // a session that had actually started fine. `sendTelegramReply` is documented
+  // a session that had actually started fine. `sendChatReply` is documented
   // as non-throwing; this makes the module correct even if that is ever untrue.
   try {
     if (failure !== undefined) {
@@ -294,11 +294,11 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
       // and leave it orphaned.
       const idPart = sessionId ? ` (session ${sessionId}, goose id ${backendSessionId})` : ` (goose id ${backendSessionId})`;
       const tagPart = tagLine ? `\n\u{1F3F7} ${tagLine}` : "";
-      await sendTelegramReply(chatId, `The goose session was created${machineLabel}${idPart}, but ${failure}${tagPart}`);
+      await sendChatReply(chatId, `The goose session was created${machineLabel}${idPart}, but ${failure}${tagPart}`);
       return;
     }
 
-    const builder = new TgMessageBuilder()
+    const builder = new ChatMessageBuilder()
       .append(`goose session started${machineLabel}:\n\u{1F194} `)
       .appendCode(sessionId!)
       .append("\n\u{1F4C2} ")
@@ -314,7 +314,7 @@ export async function ingestGooseLaunchCommand(input: GooseLaunchInput): Promise
       // The runner reports the turn instead.
       .append("\n\nYou'll get a message when the turn ends.")
       .build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
   } catch (err) {
     // Last resort. The session exists and is registered either way; losing the
     // confirmation is survivable, redelivering the launch is not.

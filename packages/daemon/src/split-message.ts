@@ -1,5 +1,5 @@
 /**
- * Split a Telegram notification into multiple TgMessages that each fit within maxLen.
+ * Split a chat notification into multiple ChatMessages that each fit within maxLen.
  *
  * Each chunk is formatted as: header + "\n\n" + bodyChunk + "\n\n" + footer, except that an empty
  * header or footer contributes no separator — an empty footer (as the prompt mirror uses) would
@@ -22,18 +22,18 @@
  * Entities are offset-adjusted to reflect their positions in the combined message.
  * Body entities that span a split boundary are clipped to the chunk end.
  */
-import type { TgMessage, TgEntity } from "./telegram-message";
-import { concatMessages } from "./telegram-message";
+import type { ChatMessage, ChatEntity } from "./chat-message";
+import { concatMessages } from "./chat-message";
 
-const SEP: TgMessage = { text: "\n\n", entities: [] };
+const SEP: ChatMessage = { text: "\n\n", entities: [] };
 const MIN_BODY_BUDGET = 200;
 
-export function splitTelegramMessage(
-  header: TgMessage,
-  body: TgMessage,
-  footer: TgMessage,
+export function splitChatMessage(
+  header: ChatMessage,
+  body: ChatMessage,
+  footer: ChatMessage,
   maxLen = 4096,
-): TgMessage[] {
+): ChatMessage[] {
   // Scale minBodyBudget with maxLen so small maxLen test cases (e.g. maxLen = 26 where overhead = 16 leaves maxBody = 10)
   // are not broken by a floor of 13 (maxLen / 2). Using maxLen / 4 gives minBodyBudget = 6 for maxLen = 26, leaving 10 >= 6
   // without triggering unwanted header truncation. For standard maxLen = 4096, minBodyBudget evaluates to 200.
@@ -41,7 +41,7 @@ export function splitTelegramMessage(
   let currentHeader = header;
   let currentFooter = footer;
   // An empty header or footer contributes no separator, so it must not be charged one either.
-  const overheadFor = (h: TgMessage, f: TgMessage): number =>
+  const overheadFor = (h: ChatMessage, f: ChatMessage): number =>
     h.text.length +
     f.text.length +
     SEP.text.length * ((h.text.length > 0 ? 1 : 0) + (f.text.length > 0 ? 1 : 0));
@@ -84,8 +84,8 @@ export function splitTelegramMessage(
 
   // Join only the non-empty components, separating each pair with SEP. An empty footer (as the
   // prompt mirror uses) would otherwise leave a trailing blank line on every message.
-  const joinParts = (...parts: TgMessage[]): TgMessage => {
-    const kept: TgMessage[] = [];
+  const joinParts = (...parts: ChatMessage[]): ChatMessage => {
+    const kept: ChatMessage[] = [];
     for (const part of parts) {
       if (part.text.length === 0) continue;
       if (kept.length > 0) kept.push(SEP);
@@ -94,7 +94,7 @@ export function splitTelegramMessage(
     return concatMessages(kept);
   };
 
-  let result: TgMessage[];
+  let result: ChatMessage[];
 
   if (body.text.length === 0) {
     result = [joinParts(currentHeader, currentFooter)];
@@ -113,7 +113,7 @@ export function splitTelegramMessage(
   // through it rather than only the over-long ones. Until pigeon-pre9 the strip happened only
   // by accident: an empty footer still contributed a "\n\n", which pushed short malformed input
   // over maxLen and triggered the clamp. With that separator correctly gone, a one-chunk body
-  // ending in a lone high surrogate would otherwise reach Telegram unsanitised.
+  // ending in a lone high surrogate would otherwise reach the chat unsanitised.
   return result.map((msg) => sliceBodyMessage(msg, 0, Math.min(msg.text.length, maxLen)));
 }
 
@@ -196,13 +196,13 @@ function splitBodyText(text: string, maxBody: number): TextRange[] {
 }
 
 /**
- * Slice a TgMessage to the character range [start, end), adjusting entity offsets.
+ * Slice a ChatMessage to the character range [start, end), adjusting entity offsets.
  * Entities that start before end and finish after end are clipped to end.
  * Entities that start at or after end are dropped.
  *
  * Guarantees that neither start nor end splits a UTF-16 surrogate pair.
  */
-function sliceBodyMessage(body: TgMessage, start: number, end: number): TgMessage {
+function sliceBodyMessage(body: ChatMessage, start: number, end: number): ChatMessage {
   // Prevent splitting surrogate pairs at end or leaving a trailing unpaired high surrogate
   if (end > start) {
     const c = body.text.charCodeAt(end - 1);
@@ -210,14 +210,14 @@ function sliceBodyMessage(body: TgMessage, start: number, end: number): TgMessag
   }
   // Prevent splitting surrogate pairs at start. Note: unreachable when called from splitBodyText
   // (which only hands start = 0 or a valid high-surrogate boundary), but retained as defensive programming
-  // for general TgMessage slicing.
+  // for general ChatMessage slicing.
   if (start > 0 && start < end) {
     const c = body.text.charCodeAt(start);
     if (c >= 0xdc00 && c <= 0xdfff) start++;
   }
 
   const text = body.text.slice(start, end);
-  const entities: TgEntity[] = [];
+  const entities: ChatEntity[] = [];
 
   for (const e of body.entities) {
     const entityEnd = e.offset + e.length;

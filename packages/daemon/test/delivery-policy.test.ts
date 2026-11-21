@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   classifyDeliveryFailure,
-  getTelegramErrorCode,
-  getTelegramErrorDescription,
+  getErrorCode,
+  getErrorDescription,
   isTransportFailure,
   type DeliveryAction,
   type DeliveryPolicyContext,
@@ -329,33 +329,33 @@ describe("isTransportFailure", () => {
   });
 });
 
-describe("getTelegramErrorCode and getTelegramErrorDescription", () => {
+describe("getErrorCode and getErrorDescription", () => {
   it("extracts error_code and description when present in details", () => {
     const body = {
       error: "Telegram API error",
       details: { ok: false, error_code: 400, description: "Bad Request: message is too long" },
     };
-    expect(getTelegramErrorCode(body)).toBe(400);
-    expect(getTelegramErrorDescription(body)).toBe("Bad Request: message is too long");
+    expect(getErrorCode(body)).toBe(400);
+    expect(getErrorDescription(body)).toBe("Bad Request: message is too long");
   });
 
   it("returns undefined for malformed or missing body/details", () => {
-    expect(getTelegramErrorCode(undefined)).toBeUndefined();
-    expect(getTelegramErrorDescription(undefined)).toBeUndefined();
+    expect(getErrorCode(undefined)).toBeUndefined();
+    expect(getErrorDescription(undefined)).toBeUndefined();
 
-    expect(getTelegramErrorCode("not object")).toBeUndefined();
-    expect(getTelegramErrorDescription("not object")).toBeUndefined();
+    expect(getErrorCode("not object")).toBeUndefined();
+    expect(getErrorDescription("not object")).toBeUndefined();
 
-    expect(getTelegramErrorCode({})).toBeUndefined();
-    expect(getTelegramErrorDescription({})).toBeUndefined();
+    expect(getErrorCode({})).toBeUndefined();
+    expect(getErrorDescription({})).toBeUndefined();
 
-    expect(getTelegramErrorCode({ details: null })).toBeUndefined();
-    expect(getTelegramErrorDescription({ details: null })).toBeUndefined();
+    expect(getErrorCode({ details: null })).toBeUndefined();
+    expect(getErrorDescription({ details: null })).toBeUndefined();
 
-    expect(getTelegramErrorCode({ details: "string details" })).toBeUndefined();
-    expect(getTelegramErrorDescription({ details: "string details" })).toBeUndefined();
+    expect(getErrorCode({ details: "string details" })).toBeUndefined();
+    expect(getErrorDescription({ details: "string details" })).toBeUndefined();
 
-    expect(getTelegramErrorCode({ details: { error_code: "400" } })).toBeUndefined();
-    expect(getTelegramErrorDescription({ details: { description: 123 } })).toBeUndefined();
+    expect(getErrorCode({ details: { error_code: "400" } })).toBeUndefined();
+    expect(getErrorDescription({ details: { description: 123 } })).toBeUndefined();
   });
 });

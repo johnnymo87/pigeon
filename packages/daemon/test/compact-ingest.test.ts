@@ -12,7 +12,7 @@ describe("ingestCompactCommand", () => {
         getSessionMessagesPage: vi.fn(pagesFrom(async () => [])),
         summarize: vi.fn().mockResolvedValue(undefined),
       },
-      sendTelegramReply: vi.fn().mockResolvedValue(undefined),
+      sendChatReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
     };
   }
@@ -74,7 +74,7 @@ describe("ingestCompactCommand", () => {
     await ingestCompactCommand(input);
 
     expect(input.opencodeClient.summarize).not.toHaveBeenCalled();
-    const [chatId, text, entities] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
+    const [chatId, text, entities] = (input.sendChatReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string, unknown[]];
     expect(chatId).toBe("99999");
     expect(text).toContain("No user messages found");
     expect(text).toContain("sess-xyz");
@@ -99,7 +99,7 @@ describe("ingestCompactCommand", () => {
 
     await ingestCompactCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "99999",
       expect.stringContaining("summarize server error"),
     );
@@ -116,7 +116,7 @@ describe("ingestCompactCommand", () => {
 
     await ingestCompactCommand(input);
 
-    expect(input.sendTelegramReply).toHaveBeenCalledWith(
+    expect(input.sendChatReply).toHaveBeenCalledWith(
       "99999",
       expect.stringContaining("devbox"),
     );
@@ -136,7 +136,7 @@ describe("ingestCompactCommand paging (pigeon-hfsj)", () => {
       sessionId: "s",
       chatId: "1",
       opencodeClient: { getSessionMessagesPage: page, summarize },
-      sendTelegramReply: vi.fn(),
+      sendChatReply: vi.fn(),
     });
     expect(page).toHaveBeenCalledTimes(3);
     expect(summarize).toHaveBeenCalledWith("s", "p", "m");
@@ -159,7 +159,7 @@ describe("ingestCompactCommand model fallback (pigeon-hfsj)", () => {
       sessionId: "s",
       chatId: "1",
       opencodeClient: { getSessionMessagesPage: page, summarize },
-      sendTelegramReply: vi.fn(),
+      sendChatReply: vi.fn(),
     });
     expect(page).toHaveBeenCalledTimes(5);
     expect(summarize).toHaveBeenCalledWith("s", "p", "newest");

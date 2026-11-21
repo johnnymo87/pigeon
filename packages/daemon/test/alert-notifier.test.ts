@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError } from "../src/notification-service";
+import { PLAIN_ALERT_TIMEOUT_MS, ChatSendError } from "../src/notification-service";
 import {
   createAlertNotifier,
   describeAlertDelivery,
@@ -103,32 +103,32 @@ describe("AlertNotifier.sendPlainAlert", () => {
     expect(f.calls[0]!.body).toEqual({ chatId: "slack:T1", text: "x", messageThreadId: 7, urlButtons: replyMarkup.inline_keyboard });
   });
 
-  it("a 400 relayed by the worker (wire name `telegram`) throws TelegramSendError(400) with the description and does NOT go direct", async () => {
+  it("a 400 relayed by the worker (wire name `telegram`) throws ChatSendError(400) with the description and does NOT go direct", async () => {
     const f = makeFetch({
       worker: () => json({ ok: false, telegram: { status: 400, description: "Bad Request: message thread not found" } }),
       direct: directOk,
     });
     const err = await build(f.fetch, { storage })!.sendPlainAlert!("x", "info").catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(TelegramSendError);
-    expect((err as TelegramSendError).status).toBe(400);
-    expect((err as TelegramSendError).description).toBe("Bad Request: message thread not found");
+    expect(err).toBeInstanceOf(ChatSendError);
+    expect((err as ChatSendError).status).toBe(400);
+    expect((err as ChatSendError).description).toBe("Bad Request: message thread not found");
     expect(f.calls.map((c) => c.leg)).toEqual(["worker"]);
     expect(healthAlerts()).toHaveLength(0);
   });
 
-  it("a 429 relayed by the worker throws TelegramSendError(429) and does NOT go direct", async () => {
+  it("a 429 relayed by the worker throws ChatSendError(429) and does NOT go direct", async () => {
     const f = makeFetch({
       worker: () => json({ ok: false, telegram: { status: 429, retryAfter: 5, description: "Too Many Requests" } }),
       direct: directOk,
     });
     const err = await build(f.fetch)!.sendPlainAlert!("x", "info").catch((e: unknown) => e);
-    expect((err as TelegramSendError).status).toBe(429);
+    expect((err as ChatSendError).status).toBe(429);
     expect(f.calls.map((c) => c.leg)).toEqual(["worker"]);
   });
 
   for (const [name, handler, reasonPart] of [
     ["worker 404 (route not deployed)", () => new Response("not found", { status: 404 }), "HTTP 404"],
-    ["worker 502 relaying a 401 (wire name `telegram`)", () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502), "Telegram 401"],
+    ["worker 502 relaying a 401 (wire name `telegram`)", () => json({ error: "telegram_error", telegram: { status: 401, description: "Unauthorized" } }, 502), "chat 401"],
     ["worker 502 with an errorClass", () => json({ error: "telegram_error", telegram: { status: 502 }, errorClass: "upstream" }, 502), "Slack upstream"],
     ["worker 200 with a non-JSON body", () => new Response("<html>", { status: 200 }), "non-JSON"],
     ["worker 403 chat_not_allowed", () => json({ error: "chat_not_allowed" }, 403), "chat_not_allowed"],
@@ -146,14 +146,14 @@ describe("AlertNotifier.sendPlainAlert", () => {
     });
   }
 
-  it("a direct-leg 400 throws SlackWebhookError, never TelegramSendError, so the /alert ladder does not retry it", async () => {
+  it("a direct-leg 400 throws SlackWebhookError, never ChatSendError, so the /alert ladder does not retry it", async () => {
     const f = makeFetch({
       worker: () => new Response("", { status: 404 }),
       direct: () => new Response("invalid_payload", { status: 400 }),
     });
     const err = await build(f.fetch)!.sendPlainAlert!("x", "info", { messageThreadId: 3 }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SlackWebhookError);
-    expect(err).not.toBeInstanceOf(TelegramSendError);
+    expect(err).not.toBeInstanceOf(ChatSendError);
     // The webhook posts to #alerts only: a thread is ignored.
     expect(f.calls[1]!.body).not.toHaveProperty("message_thread_id");
   });
@@ -357,7 +357,7 @@ describe("POST /alert ladder against the real composed notifier", () => {
     });
     const app = createApp(storage, { nowFn: () => 1000, notifier: build(f.fetch, { storage }) });
     expect((await post(app, { text: "hello" })).status).toBe(204);
-    expect(String(f.calls.find((c) => c.leg === "direct")!.body.text)).toMatch(/^hello · sent direct; worker: HTTP 502 \(Telegram 401/);
+    expect(String(f.calls.find((c) => c.leg === "direct")!.body.text)).toMatch(/^hello · sent direct; worker: HTTP 502 \(chat 401/);
   });
 
   it("worker 200 non-JSON: direct, 204", async () => {

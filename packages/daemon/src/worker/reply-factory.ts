@@ -1,24 +1,24 @@
-import type { TgEntity } from "../telegram-message";
+import type { ChatEntity } from "../chat-message";
 
-export type SendTelegramMessageFn = (
+export type SendChatMessageFn = (
   chatId: string,
   text: string,
-  opts: { entities?: TgEntity[]; messageThreadId: number | undefined },
+  opts: { entities?: ChatEntity[]; messageThreadId: number | undefined },
 ) => Promise<void>;
 
 /**
- * Creates a sendTelegramReply callback that automatically binds messageThreadId
+ * Creates a sendChatReply callback that automatically binds messageThreadId
  * from a polled command message.
  *
  * Binding at the wiring layer (index.ts) is what keeps ingest modules ignorant
- * of Telegram forum topics while ensuring command replies land in the correct topic.
+ * of channel while ensuring command replies land in the correct topic.
  */
-export function createTelegramReplySender(
-  sendTelegramMessage: SendTelegramMessageFn,
+export function createChatReplySender(
+  sendChatMessage: SendChatMessageFn,
   msg: { messageThreadId?: number | null },
-): (chatId: string, text: string, entities?: TgEntity[]) => Promise<void> {
-  return (chatId: string, text: string, entities?: TgEntity[]) =>
-    sendTelegramMessage(chatId, text, {
+): (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void> {
+  return (chatId: string, text: string, entities?: ChatEntity[]) =>
+    sendChatMessage(chatId, text, {
       entities,
       messageThreadId: msg.messageThreadId ?? undefined,
     });

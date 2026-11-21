@@ -1,5 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 
 export interface McpListCommandInput {
   commandId: string;
@@ -8,7 +8,7 @@ export interface McpListCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus">;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 export interface McpEnableCommandInput {
@@ -19,7 +19,7 @@ export interface McpEnableCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpStatus" | "mcpConnect" | "mcpDisconnect">;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 export interface McpDisableCommandInput {
@@ -30,7 +30,7 @@ export interface McpDisableCommandInput {
   directory?: string;
   machineId?: string;
   opencodeClient: Pick<OpencodeClient, "mcpDisconnect">;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 const STATUS_EMOJI: Record<string, string> = {
@@ -46,13 +46,13 @@ function statusEmoji(status: string): string {
 }
 
 export async function ingestMcpListCommand(input: McpListCommandInput): Promise<void> {
-  const { sessionId, chatId, directory, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, directory, opencodeClient, sendChatReply } = input;
 
   try {
     const servers = await opencodeClient.mcpStatus(directory);
     const entries = Object.entries(servers);
 
-    const b = new TgMessageBuilder()
+    const b = new ChatMessageBuilder()
       .append("🔌 ")
       .appendBold("MCP Servers:")
       .append("\n🆔 ")
@@ -79,27 +79,27 @@ export async function ingestMcpListCommand(input: McpListCommandInput): Promise<
     b.appendCode("/mcp disable <server>");
 
     const msg = b.build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to list MCP servers: ${message}`);
+    await sendChatReply(chatId, `Failed to list MCP servers: ${message}`);
   }
 }
 
 export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Promise<void> {
-  const { sessionId, chatId, serverName, directory, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, serverName, directory, opencodeClient, sendChatReply } = input;
 
   try {
     const servers = await opencodeClient.mcpStatus(directory);
 
     if (!(serverName in servers)) {
       const available = Object.keys(servers).join(", ");
-      const notFound = new TgMessageBuilder()
+      const notFound = new ChatMessageBuilder()
         .append("MCP server ")
         .appendCode(serverName)
         .append(` not found. Available: ${available}`)
         .build();
-      await sendTelegramReply(chatId, notFound.text, notFound.entities);
+      await sendChatReply(chatId, notFound.text, notFound.entities);
       return;
     }
 
@@ -107,53 +107,53 @@ export async function ingestMcpEnableCommand(input: McpEnableCommandInput): Prom
     if (serverInfo && serverInfo.status === "connected") {
       await opencodeClient.mcpDisconnect(serverName, directory);
       await opencodeClient.mcpConnect(serverName, directory);
-      const msg = new TgMessageBuilder()
+      const msg = new ChatMessageBuilder()
         .append("🔌 ")
         .appendCode(serverName)
         .append(" reconnected ✅")
         .build();
-      await sendTelegramReply(chatId, msg.text, msg.entities);
+      await sendChatReply(chatId, msg.text, msg.entities);
     } else {
       await opencodeClient.mcpConnect(serverName, directory);
-      const msg = new TgMessageBuilder()
+      const msg = new ChatMessageBuilder()
         .append("🔌 ")
         .appendCode(serverName)
         .append(" connected ✅")
         .build();
-      await sendTelegramReply(chatId, msg.text, msg.entities);
+      await sendChatReply(chatId, msg.text, msg.entities);
     }
 
     console.log(`[mcp-ingest] enable commandId=${input.commandId} server=${serverName} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const errMsg = new TgMessageBuilder()
+    const errMsg = new ChatMessageBuilder()
       .append("Failed to enable ")
       .appendCode(serverName)
       .append(`: ${message}`)
       .build();
-    await sendTelegramReply(chatId, errMsg.text, errMsg.entities);
+    await sendChatReply(chatId, errMsg.text, errMsg.entities);
   }
 }
 
 export async function ingestMcpDisableCommand(input: McpDisableCommandInput): Promise<void> {
-  const { sessionId, chatId, serverName, directory, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, serverName, directory, opencodeClient, sendChatReply } = input;
 
   try {
     await opencodeClient.mcpDisconnect(serverName, directory);
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("🔌 ")
       .appendCode(serverName)
       .append(" disconnected")
       .build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
     console.log(`[mcp-ingest] disable commandId=${input.commandId} server=${serverName} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const errMsg = new TgMessageBuilder()
+    const errMsg = new ChatMessageBuilder()
       .append("Failed to disable ")
       .appendCode(serverName)
       .append(`: ${message}`)
       .build();
-    await sendTelegramReply(chatId, errMsg.text, errMsg.entities);
+    await sendChatReply(chatId, errMsg.text, errMsg.entities);
   }
 }

@@ -26,7 +26,7 @@ export type RoutableEvidence = Pick<SessionRecord, "backendKind" | "nvimSocket" 
  * and the damage lands on OTHER sessions, which is what makes it hard to
  * attribute. Guarding goose alone (the previous rule) left every other
  * registrant exposed: a session registered with no backend at all -- a scripted
- * job that only wants a Telegram topic -- placed a lease on the first Telegram
+ * job that only wants a channel -- placed a lease on the first chat
  * reply to its topic, and so did a session carrying a backend kind this daemon
  * has no adapter for. A deny-list has to be updated for each new registrant; an
  * allow-list fails safe.
@@ -50,7 +50,7 @@ export type RoutableEvidence = Pick<SessionRecord, "backendKind" | "nvimSocket" 
  * `surface`, and its control commands have their own answers.
  *
  * Everything else is refused. The callers already cope with `undefined`: a
- * Telegram reply falls through to the no-adapter path and the human is told the
+ * chat reply falls through to the no-adapter path and the human is told the
  * session is not reachable, which is true.
  */
 export function isOpencodeRoutable(session: RoutableEvidence | undefined): boolean {

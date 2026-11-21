@@ -1,6 +1,6 @@
 /**
  * OutboxSender — background loop that reads queued outbox entries and delivers
- * them to the worker (Telegram) via sendNotification.
+ * them to the worker (the chat) via sendNotification.
  *
  * Runs on a 5s interval alongside the Poller. Implements retry with backoff
  * and terminal failure on max attempts or max age.
@@ -20,8 +20,8 @@ import {
 } from "../outbound-media";
 import {
   classifyDeliveryFailure,
-  getTelegramErrorCode,
-  getTelegramErrorDescription,
+  getErrorCode,
+  getErrorDescription,
   isTransportFailure,
 } from "./delivery-policy";
 import type { DeliveryPolicyContext } from "./delivery-policy";
@@ -114,7 +114,7 @@ export const SWARM_LOCAL_SESSION_GRACE_MS = 60_000;
  * per-sibling holds.
  *
  * Latency: fallback occurs on the first attempt at or after 150s from the initial hold, plus
- * however long the Telegram call itself takes (e.g. a 57s hang).
+ * however long the chat call itself takes (e.g. a 57s hang).
  *
  * It must exceed the worker's RESERVATION_TTL_MS (120s, packages/worker/src/topic-manager.ts)
  * because a reservation stranded by a dead request yields poll_exhausted until it is stealable at 120s.
@@ -177,9 +177,10 @@ export const MAX_PAUSE_MS = 5 * 60 * 1000;
 
 /**
  * Proactive rate governor limit: max sendNotification calls within 60 seconds.
- * Telegram supergroups cap bot messages at ~20/min shared globally across all producers
- * (outbox stop/question notifications, wizard edits, webhook acks, media, topic management).
- * Setting this to 12 leaves ~8 messages/min headroom for other producers.
+ * Chat rate limits are shared globally across all producers (outbox stop/question
+ * notifications, wizard edits, command acks, media, channel management). The figure was sized
+ * against the ~20/min cap of the Telegram era: setting this to 12 leaves ~8 messages/min headroom
+ * for other producers, and is kept conservative.
  */
 export const OUTBOX_RATE_LIMIT = 12;
 export const OUTBOX_RATE_WINDOW_MS = 60_000;
@@ -240,7 +241,7 @@ export function chunkNotificationId(
  * One seam, named rather than hidden: because the append shares markSent's
  * transaction, an append that throws (disk full, I/O error) now rolls the 'sent'
  * transition back too, and the caller's catch schedules a retry -- re-sending a
- * message Telegram has already displayed. This ENLARGES a pre-existing seam rather
+ * message the chat has already displayed. This ENLARGES a pre-existing seam rather
  * than creating one (a throwing markSent always did this), and the direction is
  * consistent with the outbox's at-least-once contract, so it is accepted here.
  */
@@ -293,11 +294,11 @@ export function commitDelivery(
 export const RICH_FAILURES_BEFORE_PLAIN = 2;
 
 /**
- * The worker's answer when Telegram itself failed the send (`502 {error: "Telegram API
- * error"}`), as opposed to a topic hold, a rate limit or the worker being unreachable, none
+ * The worker's answer when the provider itself failed the send (`502 {error: "Telegram API
+ * error"}`, the worker's wire text, kept), as opposed to a topic hold, a rate limit or the worker being unreachable, none
  * of which say anything about the rich message.
  */
-function isTelegramSendFailure(result: unknown): boolean {
+function isChatSendFailure(result: unknown): boolean {
   const r = result as { kind?: unknown; status?: unknown; body?: unknown };
   return (
     r.kind === "http_error" &&
@@ -359,7 +360,7 @@ function uploadedMediaOf(payload: string): UploadedMedia[] {
 export class OutboxSender {
   private readonly storage: StorageDb;
   private readonly sendNotification: SendNotificationFn;
-  /** Telegram send failures of an entry's rich attempt, by notificationId (pigeon-p909). */
+  /** Chat send failures of an entry's rich attempt, by notificationId (pigeon-p909). */
   private readonly richFailures = new Map<string, number>();
   /** Ticks with a transient media upload failure, by notificationId (pigeon-4ogz.23). */
   private readonly mediaFailures = new Map<string, number>();
@@ -768,7 +769,7 @@ export class OutboxSender {
 
         // Defence in depth: an outbox entry whose session is a goose-acp row with
         // notify: false is dropped terminally (notify_false_goose) before any send
-        // or re-register, so no future producer can create a topic for a --no-telegram session.
+        // or re-register, so no future producer can create a topic for a --no-chat session.
         const sessionRow = this.storage.sessions.get(entry.sessionId);
         if (sessionRow && sessionRow.backendKind === GOOSE_BACKEND_KIND && !sessionRow.notify) {
           this.markTerminal(entry, now, "notify_false_goose");
@@ -849,8 +850,8 @@ export class OutboxSender {
         const mediaCount = mediaCountOf(entry.payload);
 
         // The pre-entry governor check counts ENTRIES; a multi-chunk entry can therefore
-        // overshoot the window (11 used + an 11-chunk stop = 22 sends against Telegram's
-        // ~20/min group cap), and a resulting 429 pauses the WHOLE outbox for minutes.
+        // overshoot the window (11 used + an 11-chunk stop = 22 sends against the ~20/min
+        // cap this governor was sized to), and a resulting 429 pauses the WHOLE outbox for minutes.
         // Turn-batched stops made multi-chunk entries common, so check chunks too.
         //
         // `this.sendTimestamps.length > 0` mirrors the sub-budget's oversized-entry escape:
@@ -1015,8 +1016,8 @@ export class OutboxSender {
                 });
               }
 
-              if (i === 0 && rich && isTelegramSendFailure(result)) {
-                // A rich send that keeps failing upstream (a Telegram 5xx or an unparseable
+              if (i === 0 && rich && isChatSendFailure(result)) {
+                // A rich send that keeps failing upstream (a chat 5xx or an unparseable
                 // answer, which the worker deliberately does NOT treat as a rejection) would
                 // otherwise retry rich until the entry expires and the answer is lost: a 5xx
                 // counts no attempt, so only the 24h age cap ends it. One retry covers a
@@ -1201,15 +1202,15 @@ export class OutboxSender {
 
                 const backoff = getBackoff(entry.retryCount);
                 // Strip entities retry is caused by malformed entity formatting (per-message payload error).
-                // It MUST count as an attempt even though the worker returned HTTP 502 (Telegram 400).
+                // It MUST count as an attempt even though the worker returned HTTP 502 (the chat 400).
                 this.storage.outbox.markRetry(entry.notificationId, now, backoff, formatWorkerError(result), true);
                 this.log("outbox entry stripped entities, scheduling retry", {
                   notificationId: entry.notificationId,
                   sessionId: entry.sessionId,
                   attempts: entry.attempts + 1,
                   nextRetryIn: backoff,
-                  telegramErrorCode: getTelegramErrorCode("body" in result ? result.body : undefined),
-                  telegramErrorDescription: getTelegramErrorDescription("body" in result ? result.body : undefined),
+                  errorCode: getErrorCode("body" in result ? result.body : undefined),
+                  errorDescription: getErrorDescription("body" in result ? result.body : undefined),
                 });
                 break;
               }
@@ -1242,7 +1243,7 @@ export class OutboxSender {
               const richOutcome = richOutcomeOf(result);
               if (richOutcome === "sent") break;
               if (richOutcome === "fallback") {
-                // The worker already warned with Telegram's error; this is the daemon-side half,
+                // The worker already warned with the chat's error; this is the daemon-side half,
                 // so the fallback is visible in the daemon journal too.
                 this.log("outbox rich send fell back to plain", {
                   notificationId: entry.notificationId,

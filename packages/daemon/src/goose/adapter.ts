@@ -12,7 +12,7 @@
  *   `failurePolicy: "surface"` -- opts out of the string-classifying failure
  *   machinery. That machinery reads "fetch failed"/"econnrefused" as proof the
  *   opencode plugin has died and DELETES the session row, its routing assignment
- *   and its Telegram topic. Those strings mean nothing of the kind coming from a
+ *   and its channel. Those strings mean nothing of the kind coming from a
  *   goose socket, and a blip must not cost the human their session mapping. The
  *   test suite pins this field, because forgetting it fails silently and
  *   destructively.
@@ -44,7 +44,7 @@ export interface GooseAcpAdapterOptions {
   /** Resolves (creating if needed) the long-lived runner for this session. */
   runnerFor: (session: SessionRecord) => GooseSessionRunner;
   /**
-   * Telegram user ids allowed to prompt a goose session: the owner's
+   * Chat user id allowed to prompt a goose session: the owner's
    * (`PIGEON_PULL_ALLOWED_USER_IDS`, the same set goose-pull uses). When it is
    * non-empty, only those senders get through. When it is empty, a session
    * bound to a topic refuses everyone (that is the case the list exists for),
@@ -84,7 +84,7 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
       if (!senderId || !allowed.has(senderId)) {
         return {
           ok: false,
-          error: "this session only accepts messages from its owner's Telegram account",
+          error: "this session only accepts messages from its owner's chat account",
         };
       }
     } else if (session.boundTopicKey) {
@@ -105,7 +105,7 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
     }
 
     // A session bound to its topic (a stall-watch coordinator) gets no goose
-    // commands from Telegram: one stray /clear would wipe its conversation
+    // commands from the chat: one stray /clear would wipe its conversation
     // (555.22, see builtin-commands.ts). Unbound goose sessions are unchanged.
     if (session.boundTopicKey) {
       const gooseCommand = gooseCommandIn(command);
@@ -175,10 +175,10 @@ export class GooseAcpAdapter implements CommandDeliveryAdapter {
 }
 
 /**
- * The prompt text for a Telegram message, carrying what it replied to
+ * The prompt text for a chat message, carrying what it replied to
  * (eng-agent-platform-555.21).
  *
- * A swipe-reply in Telegram says "this, about THAT", and the THAT is otherwise
+ * A swipe-reply in the chat says "this, about THAT", and the THAT is otherwise
  * lost: goose sees only the human's words, so "yes, do it" answers whichever
  * question the model last asked rather than the one the human picked. The
  * worker forwards the bot message's text (and the part of it the human

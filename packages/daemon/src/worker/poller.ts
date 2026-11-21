@@ -208,13 +208,13 @@ export interface ExecuteMessage {
   media?: { key: string; mime: string; filename: string; size: number };
   metadata?: {
     questionRequestId?: string;
-    /** Telegram user id of the sender. Absent from older workers and button taps. */
+    /** Chat user id of the sender. Absent from older workers and button taps. */
     senderId?: string;
-    /** True when the Telegram message was forwarded from someone else. */
+    /** True when the chat message was forwarded from someone else. */
     forwarded?: boolean;
     /** Up to 500 chars of the bot's own message the human swipe-replied to. */
     inReplyTo?: string;
-    /** Up to 500 chars of Telegram's partial quote when the human highlighted a span. */
+    /** Up to 500 chars of the chat's partial quote when the human highlighted a span. */
     inReplyToQuote?: string;
   };
 }
@@ -451,7 +451,7 @@ export interface PollerDeps {
    * row, and again only after a successful poll has reset the count (pigeon-k0qn.8). A
    * rotated credential that the worker does not know, or one registered to a different
    * machine, otherwise fails every 5s with nothing but a warn line: on an idle machine
-   * nobody would notice that Telegram commands had stopped arriving.
+   * nobody would notice that chat commands had stopped arriving.
    */
   onPollAuthRejected?: (status: number, consecutive: number) => void;
   /** Bound on `unregisterSession`'s worker call. Defaults to {@link UNREGISTER_TIMEOUT_MS}. */
@@ -480,7 +480,7 @@ export type WorkerIdentity =
 
 /**
  * A non-2xx from the worker's `POST /topics/rename`. Keeps the status and the worker's error
- * code apart so a caller can tell a retryable failure (503 storage, 502 Telegram) from a
+ * code apart so a caller can tell a retryable failure (503 storage, 502 the chat) from a
  * terminal one (403 machine_mismatch, 404 unknown_session, 409 bound_session).
  */
 export class TopicRenameError extends Error {

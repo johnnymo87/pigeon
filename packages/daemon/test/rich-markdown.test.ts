@@ -6,11 +6,11 @@ import {
   hasPipeTable,
   maxTableColumns,
   sanitizeBodyMarkdown,
-  tgMessageToMarkdown,
+  chatMessageToMarkdown,
 } from "../src/rich-markdown";
-import { TgMessageBuilder, type TgMessage } from "../src/telegram-message";
+import { ChatMessageBuilder, type ChatMessage } from "../src/chat-message";
 
-const plain = (text: string): TgMessage => ({ text, entities: [] });
+const plain = (text: string): ChatMessage => ({ text, entities: [] });
 const TABLE = "| a | b |\n|---|:-:|\n| 1 | 2 |";
 
 describe("hasPipeTable", () => {
@@ -82,7 +82,7 @@ describe("sanitizeBodyMarkdown (Slack: plain GFM, layout fixes only)", () => {
     expect(sanitizeBodyMarkdown("```\nx\n# not a heading\n```")).toBe("```\nx\n# not a heading\n```");
   });
 
-  it("applies none of Telegram's escapes or spacers", () => {
+  it("applies none of the chat's escapes or spacers", () => {
     const text = "costs $5 and $10 == a || b <T> &amp; ![x](y)";
     expect(sanitizeBodyMarkdown(text)).toBe(text);
     expect(sanitizeBodyMarkdown("para one\n\npara two")).toBe("para one\n\npara two");
@@ -142,41 +142,41 @@ describe("sanitizeBodyMarkdown (Slack: plain GFM, layout fixes only)", () => {
   });
 });
 
-describe("tgMessageToMarkdown", () => {
+describe("chatMessageToMarkdown", () => {
   it("escapes markdown-significant characters in plain text, and only those", () => {
-    expect(tgMessageToMarkdown(plain("✅ fix_the *thing* [x] $5 a|b <c> R&D"))).toBe(
+    expect(chatMessageToMarkdown(plain("✅ fix_the *thing* [x] $5 a|b <c> R&D"))).toBe(
       "✅ fix\\_the \\*thing\\* \\[x\\] $5 a\\|b <c> R&D",
     );
   });
 
   it("renders code entities as code spans (Slack has no copy button)", () => {
-    const msg = new TgMessageBuilder().append("📂 ").appendCode("projects/my_repo").build();
-    expect(tgMessageToMarkdown(msg)).toBe("📂 `projects/my_repo`");
+    const msg = new ChatMessageBuilder().append("📂 ").appendCode("projects/my_repo").build();
+    expect(chatMessageToMarkdown(msg)).toBe("📂 `projects/my_repo`");
   });
 
   it("uses a longer fence for code that contains backticks", () => {
-    const msg = new TgMessageBuilder().appendCode("a`b".repeat(100)).build();
-    expect(tgMessageToMarkdown(msg)).toBe("``" + "a`b".repeat(100) + "``");
+    const msg = new ChatMessageBuilder().appendCode("a`b".repeat(100)).build();
+    expect(chatMessageToMarkdown(msg)).toBe("``" + "a`b".repeat(100) + "``");
   });
 
   it("pads code that starts or ends with a backtick", () => {
-    const msg = new TgMessageBuilder().appendCode("`a".repeat(200)).build();
-    expect(tgMessageToMarkdown(msg)).toBe("`` " + "`a".repeat(200) + " ``");
+    const msg = new ChatMessageBuilder().appendCode("`a".repeat(200)).build();
+    expect(chatMessageToMarkdown(msg)).toBe("`` " + "`a".repeat(200) + " ``");
   });
 
   it("renders bold, italic and pre", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .appendBold("B_")
       .append(" ")
       .appendItalic("I")
       .newline()
       .appendPre("x = 1")
       .build();
-    expect(tgMessageToMarkdown(msg)).toBe("**B\\_** _I_  \n```\nx = 1\n```");
+    expect(chatMessageToMarkdown(msg)).toBe("**B\\_** _I_  \n```\nx = 1\n```");
   });
 
   it("turns newlines in plain text into hard breaks", () => {
-    const footer = new TgMessageBuilder()
+    const footer = new ChatMessageBuilder()
       .append("📂 ")
       .appendCode("a/b")
       .append(" · 🖥 cloudbox")
@@ -184,12 +184,12 @@ describe("tgMessageToMarkdown", () => {
       .append("🆔 ")
       .appendCode("ses_123")
       .build();
-    expect(tgMessageToMarkdown(footer)).toBe("📂 `a/b` · 🖥 cloudbox  \n🆔 `ses_123`");
+    expect(chatMessageToMarkdown(footer)).toBe("📂 `a/b` · 🖥 cloudbox  \n🆔 `ses_123`");
   });
 
   it("returns null for overlapping entities", () => {
     expect(
-      tgMessageToMarkdown({
+      chatMessageToMarkdown({
         text: "abcdef",
         entities: [
           { offset: 0, length: 4, type: "bold" },
@@ -202,7 +202,7 @@ describe("tgMessageToMarkdown", () => {
 
 describe("buildRichMarkdown (always the Slack dialect)", () => {
   const header = plain("✅ my_session");
-  const footer = new TgMessageBuilder().append("🆔 ").appendCode("ses_1").build();
+  const footer = new ChatMessageBuilder().append("🆔 ").appendCode("ses_1").build();
 
   it("returns null when the body has no table", () => {
     expect(buildRichMarkdown(header, plain("just **prose**"), footer)).toBeNull();
@@ -274,7 +274,7 @@ describe("buildRichMarkdown (always the Slack dialect)", () => {
   });
 
   it("returns null when the header cannot be converted", () => {
-    const bad: TgMessage = {
+    const bad: ChatMessage = {
       text: "abcdef",
       entities: [
         { offset: 0, length: 4, type: "bold" },

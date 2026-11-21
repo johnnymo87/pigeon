@@ -8,9 +8,9 @@ import { Poller, type PollerCallbacks } from "../src/worker/poller";
 import { DirectSlackAlarm, parseSlackWebhookUrl, renderSlackAlarmText, SlackWebhookError } from "../src/direct-slack-alarm";
 import { launchCapability } from "../src/launch-capability";
 import { buildRichMarkdown } from "../src/rich-markdown";
-import type { TgMessage } from "../src/telegram-message";
+import type { ChatMessage } from "../src/chat-message";
 
-const msg = (text: string, entities: TgMessage["entities"] = []): TgMessage => ({ text, entities });
+const msg = (text: string, entities: ChatMessage["entities"] = []): ChatMessage => ({ text, entities });
 import { classifyDeliveryFailure, getErrorClass } from "../src/worker/delivery-policy";
 import { classifyWorkerHealthSample } from "../src/worker/worker-health";
 import { WorkerMessageClient } from "../src/worker/worker-message-client";
@@ -18,7 +18,7 @@ import { createAlertNotifier } from "../src/alert-notifier";
 import { OutboxSender } from "../src/worker/outbox-sender";
 import { buildAlertKeyboard } from "../src/alert-links";
 import { loadConfig } from "../src/config";
-import { TelegramSendError } from "../src/notification-service";
+import { ChatSendError } from "../src/notification-service";
 
 const HOOK = "https://hooks.slack.com/services/T0/B0/xyz";
 /** Slack conversation handles start here (worker `SLACK_HANDLE_MIN`, 2^40). */
@@ -108,11 +108,11 @@ describe("DirectSlackAlarm", () => {
     expect(calls.map((c) => c.body.text)).toEqual(["❌ x", "⚠️ y", "<@U1> ❌ z", "❌ w"]);
   });
 
-  it("throws SlackWebhookError on a non-2xx, never TelegramSendError", async () => {
+  it("throws SlackWebhookError on a non-2xx, never ChatSendError", async () => {
     const { fetchFn } = hook(() => new Response("invalid_payload", { status: 400 }));
     const err = await new DirectSlackAlarm(HOOK, { fetchFn }).sendPlainAlert("x", "info").catch((e) => e);
     expect(err).toBeInstanceOf(SlackWebhookError);
-    expect(err).not.toBeInstanceOf(TelegramSendError);
+    expect(err).not.toBeInstanceOf(ChatSendError);
     expect(String(err.message)).toContain("invalid_payload");
     expect(String(err.message)).not.toContain("hooks.slack.com");
   });
@@ -131,7 +131,7 @@ describe("launchCapability", () => {
     remoteLaunchClient: true,
     slackAlarmWebhook: true,
   };
-  it("needs only the opencode client, the worker client and the Slack webhook: no Telegram input", () => {
+  it("needs only the opencode client, the worker client and the Slack webhook: no chat input", () => {
     expect(launchCapability(base)).toEqual({ capable: true, missing: [] });
     expect(launchCapability({ ...base, slackAlarmWebhook: false })).toEqual({
       capable: false,
@@ -233,7 +233,7 @@ describe("errorClass", () => {
       new WorkerMessageClient({ workerUrl: "https://w", apiKey: "k", fetchFn: (async () => Response.json(body, { status })) as unknown as typeof fetch });
     expect(await client({ ok: false, telegram: { status: 400, description: "thread not found: is_archived" }, errorClass: "conversation_gone" })
       .sendMessage({ chatId: "c", text: "t" }, { timeoutMs: 1000 }))
-      .toEqual({ kind: "telegram_rejected", status: 400, description: "thread not found: is_archived", errorClass: "conversation_gone" });
+      .toEqual({ kind: "chat_rejected", status: 400, description: "thread not found: is_archived", errorClass: "conversation_gone" });
     const failed = await client({ ok: false, error: "telegram_error", telegram: { status: 502 }, errorClass: "upstream" }, 502)
       .sendMessage({ chatId: "c", text: "t" }, { timeoutMs: 1000 });
     expect(failed).toMatchObject({ kind: "worker_failed", key: "http502:upstream" });
@@ -266,7 +266,7 @@ describe("alert notifier on Slack", () => {
 });
 
 describe("/topics/lookup url", () => {
-  it("uses the worker's url, and builds none itself: null, absent or a numeric Telegram row gets no button", () => {
+  it("uses the worker's url, and builds none itself: null, absent or a numeric chat row gets no button", () => {
     const kb = buildAlertKeyboard(
       [
         { label: "slack", sessionId: "a" },
@@ -293,7 +293,7 @@ describe("/alert named topic chatId", () => {
       notifier: {
         sendPlainAlert: async (_t, _s, o) => {
           sent.push(o);
-          if (sent.length === 1) throw new TelegramSendError(400, "x", "slack rejected the message: invalid_blocks", "rejected_format");
+          if (sent.length === 1) throw new ChatSendError(400, "x", "slack rejected the message: invalid_blocks", "rejected_format");
         },
       },
       resolveNamedTopic: async () => ({ messageThreadId: SLACK_HANDLE_MIN + 9, created: true, chatId: "slack:T1" }),
@@ -317,7 +317,7 @@ describe("/alert named topic chatId", () => {
       notifier: {
         sendPlainAlert: async (_t, _s, o) => {
           sent.push(o);
-          if (sent.length === 1) throw new TelegramSendError(400, "x", "slack: is_archived", "conversation_gone");
+          if (sent.length === 1) throw new ChatSendError(400, "x", "slack: is_archived", "conversation_gone");
         },
       },
       resolveNamedTopic: async (req) => {

@@ -246,6 +246,7 @@ interface Turn {
   swarmSettled?: boolean;
 }
 
+// "telegram" (a human chat turn) is persisted in goose inflight rows, so the value is kept.
 export type GooseTurnOrigin = "telegram" | "swarm";
 
 export function resolveTurnOrigin(commandId: string, origin?: GooseTurnOrigin): GooseTurnOrigin {
@@ -353,7 +354,7 @@ async function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise
 
 /**
  * goose's name for a session it has not named yet (acp/server/new_session.rs).
- * Never reported: Telegram topic names are write-once, so a topic upgraded to
+ * Never reported: channel names are write-once, so a topic upgraded to
  * this would keep it for the life of the session.
  */
 const GOOSE_PLACEHOLDER_TITLE = "New Chat";
@@ -1823,7 +1824,7 @@ export class GooseSessionRunner {
           message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
         } else if (message === "") {
           // A turn that ends with no assistant text is a real outcome (a pure tool
-          // run, a refusal). Saying so beats an empty Telegram message, which the
+          // run, a refusal). Saying so beats an empty chat message, which the
           // human cannot distinguish from a bug in this code.
           message = `goose finished the turn with no message (stopReason: ${stopReason ?? "unknown"}).`;
         }

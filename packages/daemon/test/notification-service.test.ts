@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  formatTelegramNotification,
+  formatChatNotification,
   formatQuestionNotification,
   formatQuestionWizardStep,
   formatSwarmNotification,
@@ -45,9 +45,9 @@ describe("displayName", () => {
   });
 });
 
-describe("formatTelegramNotification", () => {
-  it("formats body as TgMessage with no inline buttons", () => {
-    const result = formatTelegramNotification({
+describe("formatChatNotification", () => {
+  it("formats body as ChatMessage with no inline buttons", () => {
+    const result = formatChatNotification({
       event: "Stop",
       label: "my_[label]*",
       summary: "Done",
@@ -56,7 +56,7 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-abc123",
     });
 
-    // Returns header, body, footer as TgMessage objects
+    // Returns header, body, footer as ChatMessage objects
     expect(result.header).toBeDefined();
     expect(result.body).toBeDefined();
     expect(result.footer).toBeDefined();
@@ -86,7 +86,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("renders the oc-tags tag on the cwd line when the session has one", () => {
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "l",
       summary: "Done",
@@ -102,7 +102,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("caps an absurdly long tag rather than letting it eat the message", () => {
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "l",
       summary: "Done",
@@ -116,7 +116,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("omits the tag line entirely when there is no tag", () => {
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "l",
       summary: "Done",
@@ -139,7 +139,7 @@ describe("formatTelegramNotification", () => {
     ];
 
     for (const { event, expectedEmoji } of cases) {
-      const result = formatTelegramNotification({
+      const result = formatChatNotification({
         event,
         label: "test-label",
         summary: "Done",
@@ -160,7 +160,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("produces visibly different headers for Stop and Error events", () => {
-    const stopResult = formatTelegramNotification({
+    const stopResult = formatChatNotification({
       event: "Stop",
       label: "my-label",
       summary: "Done",
@@ -169,7 +169,7 @@ describe("formatTelegramNotification", () => {
       sessionId: "sess-123",
     });
 
-    const errorResult = formatTelegramNotification({
+    const errorResult = formatChatNotification({
       event: "Error",
       label: "my-label",
       summary: "Failed",
@@ -184,7 +184,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("produces ⏳ emoji header for Queued event", () => {
-    const queuedResult = formatTelegramNotification({
+    const queuedResult = formatChatNotification({
       event: "Queued",
       label: "my-label",
       summary: "Queued",
@@ -197,7 +197,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("produces 🔐 emoji header for Permission event", () => {
-    const permissionResult = formatTelegramNotification({
+    const permissionResult = formatChatNotification({
       event: "Permission",
       label: "my-label",
       summary: "Permission",
@@ -210,7 +210,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("includes machine ID in footer when provided", () => {
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "test",
       summary: "Done",
@@ -226,7 +226,7 @@ describe("formatTelegramNotification", () => {
   });
 
   it("omits machine ID from footer when not provided", () => {
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "test",
       summary: "Done",
@@ -242,7 +242,7 @@ describe("formatTelegramNotification", () => {
 
   it("returns separate header, body, footer for callers to split themselves", () => {
     const longSummary = Array.from({ length: 200 }, (_, i) => `Paragraph ${i} content here.`).join("\n\n");
-    const result = formatTelegramNotification({
+    const result = formatChatNotification({
       event: "Stop",
       label: "test",
       summary: longSummary,

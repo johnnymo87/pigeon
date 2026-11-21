@@ -8,7 +8,7 @@ import type { PluginInput } from "@opencode-ai/plugin"
  * `isRegistered=false` forever, so every subsequent `session.idle` silently
  * skipped `notifyStop`. The daemon had actually recorded the session, so
  * nothing looked wrong from the outside -- the user just stopped receiving
- * Telegram notifications for that session until the serve restarted.
+ * the chat notifications for that session until the serve restarted.
  */
 describe("registration retry after a failed registration", () => {
   let registerSessionSpy: any

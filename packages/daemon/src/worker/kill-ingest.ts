@@ -1,5 +1,5 @@
 import { OpencodeHttpError, type OpencodeClient } from "../opencode-client";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 import type { KillMessage } from "./poller";
 
 export interface KillCommandInput {
@@ -8,7 +8,7 @@ export interface KillCommandInput {
   chatId: string;
   machineId?: string;
   opencodeClient: OpencodeClient;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
   /**
    * Tears down pigeon's side of a session opencode has just deleted: the daemon's sessions row,
    * its routing, and the worker registration with an immediate topic close (pigeon-4ogz.20).
@@ -23,7 +23,7 @@ export interface KillCommandInput {
 }
 
 export async function ingestKillCommand(input: KillCommandInput): Promise<void> {
-  const { commandId, sessionId, chatId, machineId, opencodeClient, sendTelegramReply, onTerminated } = input;
+  const { commandId, sessionId, chatId, machineId, opencodeClient, sendChatReply, onTerminated } = input;
   const machineLabel = machineId ? ` on ${machineId}` : "";
 
   // Abort first. DELETE alone does not stop a busy session's prompt loop, and its next event
@@ -50,18 +50,18 @@ export async function ingestKillCommand(input: KillCommandInput): Promise<void> 
     } else {
       const message = error instanceof Error ? error.message : String(error);
       console.error(`[kill-ingest] failed to terminate session sessionId=${sessionId}: ${message}`);
-      await sendTelegramReply(chatId, `Failed to kill session${machineLabel}: ${message}`);
+      await sendChatReply(chatId, `Failed to kill session${machineLabel}: ${message}`);
       return;
     }
   }
 
   console.log(`[kill-ingest] session ${alreadyGone ? "already gone" : "terminated"} sessionId=${sessionId}`);
   try {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append(alreadyGone ? `Session already gone${machineLabel}; closed pigeon's side.\n🆔 ` : `Session terminated${machineLabel}.\n🆔 `)
       .appendCode(sessionId)
       .build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[kill-ingest] terminated reply failed sessionId=${sessionId}: ${message}`);

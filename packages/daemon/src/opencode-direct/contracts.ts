@@ -8,9 +8,10 @@ export const OpencodeDirectMessageType = {
   QuestionReplyResult: "pigeon.question.reply.result",
 } as const;
 
+// The string values are persisted/wire values and keep their Telegram-era spelling (pigeon-4ogz.14).
 export const OpencodeDirectSource = {
-  TelegramReply: "telegram-reply",
-  TelegramCallback: "telegram-callback",
+  ChatReply: "telegram-reply",
+  ChatCallback: "telegram-callback",
   Manual: "manual",
 } as const;
 

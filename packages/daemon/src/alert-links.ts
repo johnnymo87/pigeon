@@ -20,8 +20,8 @@
 export const MAX_ALERT_LINKS = 8;
 
 /**
- * Button labels longer than this are truncated with an ellipsis. Telegram does not
- * document a hard limit on inline button text, but clients cut long labels anyway;
+ * Button labels longer than this are truncated with an ellipsis. Slack does not
+ * document a hard limit on button text, but clients cut long labels anyway;
  * 64 code points is a conservative bound that keeps a button readable on a phone.
  */
 export const MAX_BUTTON_LABEL_CHARS = 64;
@@ -40,7 +40,7 @@ export interface TopicInfo {
   state: "open" | "closed";
   /**
    * The conversation's link, from the worker (pigeon-4ogz.5): `null` when the worker could not
-   * build one. Absent means no link: the daemon builds none itself (the Telegram `t.me` builder
+   * build one. Absent means no link: the daemon builds none itself (the old Telegram `t.me` builder
    * was deleted, pigeon-4ogz.13), so a row with no `url` string gets no button.
    */
   url?: string | null;

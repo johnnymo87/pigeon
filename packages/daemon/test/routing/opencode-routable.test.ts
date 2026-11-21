@@ -31,7 +31,7 @@ describe("isOpencodeRoutable", () => {
   });
 
   it("does not route a registered session that declared no backend", () => {
-    // The shape of an external registrant that only wants a Telegram topic
+    // The shape of an external registrant that only wants a channel
     // (for example a scripted job posting /session-start + /stop). Routing it
     // would place an opencode lease for a session no opencode serve has.
     expect(isOpencodeRoutable(rec({}))).toBe(false);

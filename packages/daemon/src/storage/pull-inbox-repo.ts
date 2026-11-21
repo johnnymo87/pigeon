@@ -1,12 +1,13 @@
 import type BetterSqlite3 from "better-sqlite3";
 
 /**
- * Where a banked message came from: plain Telegram replies (via goose-pull
+ * Where a banked message came from: plain chat replies (via goose-pull
  * adapter) and swarm messages (via bank-or-insert.ts for opted-in sessions).
  * Question cards are not offered to pull sessions (a pending question captures
  * every plain message to its session, and nothing drains a question for a pull
  * client).
  */
+// "telegram-reply" is the persisted name of the human-reply source (kept, pigeon-4ogz.14).
 export type PullInboxSource = "telegram-reply" | "swarm";
 
 export interface PullInboxRecord {
@@ -14,7 +15,7 @@ export interface PullInboxRecord {
   sessionId: string;
   source: PullInboxSource;
   payload: string;
-  /** Telegram user id of the sender, as checked against the adapter's allowlist. */
+  /** Chat user id of the sender, as checked against the adapter's allowlist. */
   senderId: string | null;
   /**
    * Up to 500 characters of the BOT message the human swipe-replied to, or null.
@@ -352,7 +353,7 @@ export class PullInboxRepository {
    * The return value is not a convenience. A row expiring unread is the human's
    * message being dropped, and the usual notifier cannot cover it:
    * `notifySenderOfFailure` returns early for any sender that is not `^ses_`,
-   * which a Telegram-originated message never is. Deleting inside the same
+   * which a chat-originated message never is. Deleting inside the same
    * transaction that reports is what makes the report exactly-once -- the row is
    * the dedupe token.
    *

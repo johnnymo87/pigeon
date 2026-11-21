@@ -48,7 +48,7 @@ export class DirectChannelAdapter implements CommandDeliveryAdapter {
         command,
         endpoint,
         authToken,
-        source: OpencodeDirectSource.TelegramReply,
+        source: OpencodeDirectSource.ChatReply,
         // Single attempt here: retrying the (non-idempotent) execute path is the
         // job of command-ingest's deadline-aware, classification-aware budget
         // loop, which retries *ambiguous* timeouts through the now-idempotent

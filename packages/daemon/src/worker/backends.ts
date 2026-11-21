@@ -8,7 +8,7 @@
  * instant; daemons are per-machine, updated by a manual `git pull` plus a
  * restart, and have been measured five days behind. So "new worker, old
  * daemon" is the LIKELY skew, and a `backend` field alone would be IGNORED by
- * an old daemon, which would then launch an opencode session while Telegram
+ * an old daemon, which would then launch an opencode session while the chat
  * said the goose one had started. The header lets the worker refuse instead,
  * without knowing anything about which daemons exist.
  *
@@ -88,7 +88,7 @@ export const DEFAULT_BACKEND = "opencode";
  * fires. It exists because the gate sits on the far side of a boundary with no
  * shared schema and is itself subject to version skew -- an OLD worker has no
  * gate at all -- and because the failure it prevents is silent: launching the
- * wrong backend, or nothing, while Telegram reports success.
+ * wrong backend, or nothing, while the chat reports success.
  *
  * It lives beside `advertisedBackends` and over the SAME capability type on
  * purpose. Advertising and enforcing are the two halves of one claim, and

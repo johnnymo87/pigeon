@@ -54,7 +54,7 @@ describe("GooseAcpAdapter delivery contract", () => {
   it("declares failurePolicy surface", () => {
     // NOT decoration. Without this the goose adapter inherits the path that
     // reads a socket blip as a dead opencode plugin and DELETES the session row,
-    // its routing assignment and its Telegram topic. Forgetting it fails
+    // its routing assignment and its channel. Forgetting it fails
     // silently and destructively, which is why it is pinned here and again at
     // the selectAdapter level.
     const { adapter } = makeAdapter({ kind: "ok" });

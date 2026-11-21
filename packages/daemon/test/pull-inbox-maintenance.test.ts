@@ -38,7 +38,7 @@ describe("pull inbox maintenance", () => {
 
   // A row expiring unread IS the human's message being dropped.
   // notifySenderOfFailure cannot cover it -- notify-sender.ts returns early for
-  // any sender that is not ^ses_, and a Telegram-originated message never is --
+  // any sender that is not ^ses_, and a chat-originated message never is --
   // so if this sweep is quiet, nothing anywhere ever says the message died.
   it("alerts when a banked message expires unread, and names it", () => {
     const s = newDb();

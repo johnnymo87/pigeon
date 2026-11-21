@@ -15,10 +15,10 @@ export interface DeliveryPolicyContext {
 }
 
 /**
- * Safely extracts Telegram details.error_code from worker response body.
+ * Safely extracts the chat details.error_code from worker response body.
  * Body may be undefined, a string, or an object without details.
  */
-export function getTelegramErrorCode(body: unknown): number | undefined {
+export function getErrorCode(body: unknown): number | undefined {
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const details = (body as { details?: unknown }).details;
     if (details && typeof details === "object" && !Array.isArray(details)) {
@@ -32,10 +32,10 @@ export function getTelegramErrorCode(body: unknown): number | undefined {
 }
 
 /**
- * Safely extracts Telegram details.description from worker response body.
+ * Safely extracts the chat details.description from worker response body.
  * Body may be undefined, a string, or an object without details.
  */
-export function getTelegramErrorDescription(body: unknown): string | undefined {
+export function getErrorDescription(body: unknown): string | undefined {
   if (body && typeof body === "object" && !Array.isArray(body)) {
     const details = (body as { details?: unknown }).details;
     if (details && typeof details === "object" && !Array.isArray(details)) {
@@ -95,12 +95,12 @@ export function isTransportFailure(result: WorkerResult): boolean {
  * Rules precedence order:
  * 1. transport_error -> retry
  * 2. 404 -> reregister (if local session exists and not yet tried) or terminal
- * 3. 403 -> retry, never terminal (a 403 never reaches Telegram; see the arm for why)
+ * 3. 403 -> retry, never terminal (a 403 never reaches the chat; see the arm for why)
  * 4. 400 -> terminal
  * 5. positive finite retryAfter on remaining !ok -> pause
  * 6. 502 + payloadHasEntities + `errorClass: "rejected_format"` -> strip_entities (any other
  *    class is not a payload problem). The former fallback on `details.error_code === 400` is
- *    gone with Telegram: every provider failure the worker relays carries a class.
+ *    gone with Telegram, pigeon-4ogz.13: every provider failure the worker relays carries a class.
  * 7. anything else -> retry
  *
  * Note on ok:true results:
@@ -143,18 +143,17 @@ export function classifyDeliveryFailure(
   // Bead pigeon-bzf asked for 403 to be terminal alongside 400 and 404. That is rejected, with
   // evidence. Making it terminal has no upside and one large downside.
   //
-  // No upside: the reason to kill a doomed entry early is the shared Telegram budget - roughly 20
-  // messages per minute per group, spent by every session at once, so a wasted call costs somebody
-  // else's notification. A 403 does not spend it. The worker rejects the chat id at
-  // notifications.ts:202, BEFORE resolveTopic (:230) and before createTelegramClient (:248), so a
-  // retried 403 never reaches Telegram at all. It costs one cheap worker request. (Same is true of
-  // 400 at :188 and 404 at :197 - those are terminal for a different reason: they are genuinely
-  // deterministic, so retrying cannot ever succeed.)
+  // No upside: the reason to kill a doomed entry early is the shared chat send budget, spent by every
+  // session at once, so a wasted call costs somebody else's notification. A 403 does not spend it.
+  // The worker rejects the chat id before it resolves a channel or calls the provider, so a retried
+  // 403 never reaches the chat at all. It costs one cheap worker request. (Same is true of 400 and
+  // 404 - those are terminal for a different reason: they are genuinely deterministic, so
+  // retrying cannot ever succeed.)
   //
   // Large downside: a 403 is NOT deterministic. It is a property of WORKER CONFIG (ALLOWED_CHAT_IDS)
   // and changes the moment the config does. Terminal converts a recoverable misconfiguration into
   // permanent loss of everything queued at that instant. This is live right now: production
-  // deliberately keeps two chat ids allowed during the Telegram forum migration precisely because
+  // deliberately keeps two chat ids allowed during a chat migration precisely because
   // narrowing that list produces 403s.
   //
   // An earlier draft compromised with "terminal at attempts >= 2". Adversarial review killed it on
@@ -166,7 +165,7 @@ export function classifyDeliveryFailure(
   // seconds. Retrying under the normal budget restores the real window and needs no extra state.
   //
   // Do not "optimise" this back into a terminal arm without first showing that a 403 reaches
-  // Telegram. It does not.
+  // the chat. It does not.
   //
   // This returns explicitly rather than falling through to rule 7, so that a 403 can never reach
   // rule 5 and PAUSE the entire outbox. The worker does not attach retryAfter to a 403 today, but

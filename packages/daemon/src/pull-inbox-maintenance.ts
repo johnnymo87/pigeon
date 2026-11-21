@@ -9,7 +9,7 @@ import {
 /** How long an acked row is kept before reaping. Forensics only; nothing reads it. */
 export const PULL_ACKED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Enough of the message to recognise it in an alert, without pasting an essay into Telegram. */
+/** Enough of the message to recognise it in an alert, without pasting an essay into the chat. */
 const EXCERPT_CHARS = 200;
 
 export interface PullInboxMaintenanceDeps {
@@ -32,7 +32,7 @@ function excerpt(text: string): string {
  * BOTH ARE FAILURES OF SPEECH, NOT OF STORAGE. The message is gone either way;
  * the only question is whether anyone is told, and the ordinary notifier cannot
  * tell them: `notifySenderOfFailure` returns early for any sender that is not
- * `^ses_...`, which a Telegram-originated message never is. So this is the only
+ * `^ses_...`, which a chat-originated message never is. So this is the only
  * place either fact can be said, and a silent sweep here would recreate exactly
  * the silent drop the whole pull design exists to avoid.
  *

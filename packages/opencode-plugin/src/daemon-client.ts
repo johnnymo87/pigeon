@@ -274,7 +274,7 @@ export type StopOutcome = "success" | "retry" | "unregistered" | "terminal"
  *
  * Deploy skew matters here in one direction only. Against an OLD daemon our id is
  * ignored and a fresh one is minted per request, so retrying a POST that timed out
- * *after* being processed posts to Telegram twice. A duplicate in every topic is worse
+ * *after* being processed posts to the chat twice. A duplicate in every topic is worse
  * than the status quo, so until a response echoes the exact id we sent, an ambiguous
  * timeout stays terminal -- which is precisely today's behaviour, no worse.
  *

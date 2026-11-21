@@ -4,7 +4,7 @@ import { openStorageDb, type StorageDb } from "../src/storage/database";
 
 /**
  * A stop whose body contains a pipe table carries `rich: {markdown}` in its outbox payload, so
- * the outbox can ask the worker for one Telegram rich message (pigeon-p909). Everything else
+ * the outbox can ask the worker for one chat rich message (pigeon-p909). Everything else
  * stays exactly as it was: no `rich` field at all.
  */
 describe("POST /stop rich payload", () => {

@@ -45,7 +45,7 @@ const plugin: Plugin = async (ctx) => {
       // Deliberately the STRICT predicate, not `isMainSession`. A session whose
       // parentage could not be established is treated as main everywhere else so it
       // keeps notifying, but it must not mirror: if it turns out to be a subagent,
-      // the mirror posts a full task brief into a Telegram topic (`pigeon-kq6h`).
+      // the mirror posts a full task brief into a channel (`pigeon-kq6h`).
       isMainSession: (sessionId) => sessionManager.isConfirmedMain(sessionId),
       getDiscoveryPromise: (sessionId) => sessionManager.getDiscoveryPromise(sessionId),
       log,

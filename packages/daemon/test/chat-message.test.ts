@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { TgMessageBuilder, concatMessages, type TgMessage, type TgEntity } from "../src/telegram-message";
+import { ChatMessageBuilder, concatMessages, type ChatMessage, type ChatEntity } from "../src/chat-message";
 
-describe("TgMessageBuilder", () => {
+describe("ChatMessageBuilder", () => {
   it("builds plain text with no entities", () => {
-    const msg = new TgMessageBuilder().append("hello").build();
+    const msg = new ChatMessageBuilder().append("hello").build();
     expect(msg.text).toBe("hello");
     expect(msg.entities).toHaveLength(0);
   });
 
   it("tracks offset for bold entity", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("Hello ")
       .appendBold("world")
       .build();
@@ -18,7 +18,7 @@ describe("TgMessageBuilder", () => {
   });
 
   it("tracks offset for code entity", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("Session: ")
       .appendCode("sess-abc123")
       .build();
@@ -27,7 +27,7 @@ describe("TgMessageBuilder", () => {
   });
 
   it("tracks offset for italic entity", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("Note: ")
       .appendItalic("swipe to reply")
       .build();
@@ -36,7 +36,7 @@ describe("TgMessageBuilder", () => {
   });
 
   it("handles multiple entities with correct cumulative offsets", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .appendBold("Stop")
       .append(": ")
       .appendCode("my-project")
@@ -52,7 +52,7 @@ describe("TgMessageBuilder", () => {
   });
 
   it("handles newline convenience method", () => {
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("line1")
       .newline()
       .append("line2")
@@ -64,7 +64,7 @@ describe("TgMessageBuilder", () => {
 
   it("handles emoji correctly (UTF-16 surrogate pairs)", () => {
     // 🤖 is U+1F916, encoded as 2 UTF-16 code units
-    const msg = new TgMessageBuilder()
+    const msg = new ChatMessageBuilder()
       .append("🤖 ")
       .appendBold("Stop")
       .build();
@@ -74,7 +74,7 @@ describe("TgMessageBuilder", () => {
   });
 
   it("builds empty message", () => {
-    const msg = new TgMessageBuilder().build();
+    const msg = new ChatMessageBuilder().build();
     expect(msg.text).toBe("");
     expect(msg.entities).toHaveLength(0);
   });
@@ -82,11 +82,11 @@ describe("TgMessageBuilder", () => {
 
 describe("concatMessages", () => {
   it("concatenates text and adjusts entity offsets", () => {
-    const a: TgMessage = {
+    const a: ChatMessage = {
       text: "Hello ",
       entities: [{ offset: 0, length: 5, type: "bold" }],
     };
-    const b: TgMessage = {
+    const b: ChatMessage = {
       text: "world",
       entities: [{ offset: 0, length: 5, type: "italic" }],
     };
@@ -99,9 +99,9 @@ describe("concatMessages", () => {
   });
 
   it("handles empty messages in the array", () => {
-    const a: TgMessage = { text: "hi", entities: [] };
-    const b: TgMessage = { text: "", entities: [] };
-    const c: TgMessage = {
+    const a: ChatMessage = { text: "hi", entities: [] };
+    const b: ChatMessage = { text: "", entities: [] };
+    const c: ChatMessage = {
       text: "there",
       entities: [{ offset: 0, length: 5, type: "code" }],
     };

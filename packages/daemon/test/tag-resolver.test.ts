@@ -206,7 +206,7 @@ describe("SessionTagResolver", () => {
     // /launch --tag and opencode-launch both tag AFTER creating and prompting
     // the session, so the warm-up at session start races that window. Caching
     // its negative would hide the tag from the session's FIRST notification —
-    // the one read right after Telegram said the tag was applied.
+    // the one read right after the chat said the tag was applied.
     const calls: string[][] = [];
     const resolver = new SessionTagResolver({
       runner: makeRunner([ok("auto:pigeon\tauto\tses_a\n"), ok("billing\tmanual\tses_a\n")], calls),

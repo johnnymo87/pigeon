@@ -12,9 +12,9 @@
  * Everything here is pure, and every "this cannot be sent rich" answer is `null`, which the
  * caller treats as "send plain, as before".
  */
-import type { TgMessage } from "./telegram-message";
+import type { ChatMessage } from "./chat-message";
 
-/** The widest table a rich message is offered with (a conservative bound, kept from Telegram's limit). */
+/** The widest table a rich message is offered with (a conservative bound, kept from the former Telegram limit). */
 export const RICH_MAX_COLUMNS = 20;
 
 /**
@@ -206,7 +206,7 @@ function codeBlock(content: string): string {
  * segments are escaped; entities become their markdown form. Returns null on overlapping
  * entities, which pigeon never builds, so the caller falls back to plain.
  */
-export function tgMessageToMarkdown(msg: TgMessage): string | null {
+export function chatMessageToMarkdown(msg: ChatMessage): string | null {
   const entities = [...msg.entities].sort((a, b) => a.offset - b.offset);
   let out = "";
   let pos = 0;
@@ -263,16 +263,16 @@ export interface BuildRichOptions {
  * empty parts skipped.
  */
 export function buildRichMarkdown(
-  header: TgMessage,
-  body: TgMessage,
-  footer: TgMessage,
+  header: ChatMessage,
+  body: ChatMessage,
+  footer: ChatMessage,
   options: BuildRichOptions = {},
 ): string | null {
   if ((options.requireTable ?? true) && !hasPipeTable(body.text)) return null;
   if (maxTableColumns(body.text) > RICH_MAX_COLUMNS) return null;
 
-  const head = tgMessageToMarkdown(header);
-  const foot = tgMessageToMarkdown(footer);
+  const head = chatMessageToMarkdown(header);
+  const foot = chatMessageToMarkdown(footer);
   if (head === null || foot === null) return null;
 
   const parts = [head, sanitizeBodyMarkdown(body.text), foot].filter((p) => p.length > 0);

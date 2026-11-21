@@ -7,7 +7,7 @@ import { initSessionEventsSchema } from "../src/storage/session-events-schema";
 import { initSchema } from "../src/storage/schema";
 import { commitDelivery } from "../src/worker/outbox-sender";
 import { excerptOf } from "../src/text";
-import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "../src/swarm/telegram-notice";
+import { enqueueSwarmChatNotice, enqueueSwarmCancelNotice } from "../src/swarm/chat-notice";
 import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
 
 /**
@@ -129,7 +129,7 @@ describe("phase 1b: /mirror records the anchor", () => {
   // surely as a typed one.
   //
   // Measured consequence of the old rule: opencode-launch records its own launch
-  // prompt as injected, Telegram replies are recorded by sendPrompt, and swarm
+  // prompt as injected, the chat replies are recorded by sendPrompt, and swarm
   // messages carry an envelope -- so for a headless worker EVERY turn it ever
   // receives was excluded, and it could never be jumped to. 155 of 239 sessions
   // with unread had no anchor at all.
@@ -221,8 +221,8 @@ describe("phase 1b: /mirror records the anchor", () => {
   });
 
   // Pins the write's position ABOVE shouldEmitAncillaryFor: badge state and
-  // Telegram delivery policy are unrelated concerns.
-  it("records for a quiet session that will not mirror to Telegram", async () => {
+  // the chat delivery policy are unrelated concerns.
+  it("records for a quiet session that will not mirror to the chat", async () => {
     const app = newApp();
     addSession("s1");
     storage!.sessionOrigins.record(
@@ -410,7 +410,7 @@ describe("phase 1b: routes capture anchor and excerpt", () => {
 
   // THE precedence test. app.ts renders `message || summary || "Task completed"`,
   // so an excerpt built from `summary ?? message` would disagree with the very
-  // Telegram message the drill-down refers to.
+  // the chat message the drill-down refers to.
   it("stop excerpt prefers message over summary when BOTH are set", async () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 1_000 });
@@ -496,7 +496,7 @@ describe("phase 1b: swarm and question sites", () => {
     storage = openStorageDb(":memory:");
     storage.sessions.upsert({ sessionId: "s1", notify: true }, 1_000);
     storage.sessions.setLastHumanMsgId("s1", "msg_01mine", 1_000);
-    enqueueSwarmTelegramNotice(storage, swarmRecord(), 1_000);
+    enqueueSwarmChatNotice(storage, swarmRecord(), 1_000);
     const r = row("w:msg_1001");
     expect(r?.a).toBe("msg_01mine");
     expect(r?.e).toBe("Hello receiver!");
@@ -511,7 +511,7 @@ describe("phase 1b: swarm and question sites", () => {
     storage.sessions.setLastHumanMsgId("s1", "msg_01mine", 1_000);
     // A cancel notice is only emitted if the ORIGINAL was posted -- absence of
     // the original is the one correct reason to stay silent.
-    enqueueSwarmTelegramNotice(storage, swarmRecord({ payload: "SECRET RETRACTED TEXT" }), 1_000);
+    enqueueSwarmChatNotice(storage, swarmRecord({ payload: "SECRET RETRACTED TEXT" }), 1_000);
     enqueueSwarmCancelNotice(storage, swarmRecord({ payload: "SECRET RETRACTED TEXT" }), 1_000);
     const r = row("wc:msg_1001");
     expect(r?.a).toBe("msg_01mine");

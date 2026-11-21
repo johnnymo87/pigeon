@@ -331,7 +331,7 @@ describe("GooseSessionRunner Inflight Lifecycle", () => {
   it("terminal path 3: postStop throws in finishTurn → row is KEPT", async () => {
     const inflight = new FakeInflightStore();
     const client = new FakeClient();
-    const postStop = vi.fn().mockRejectedValue(new Error("telegram 500 / sqlite busy"));
+    const postStop = vi.fn().mockRejectedValue(new Error("chat 500 / sqlite busy"));
 
     const runner = new GooseSessionRunner({
       session: makeSession(),

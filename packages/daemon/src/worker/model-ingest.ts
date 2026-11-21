@@ -1,5 +1,5 @@
 import type { OpencodeClient } from "../opencode-client";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 
 const DEFAULT_ALLOWED_PROVIDERS = ["anthropic", "openai"];
 
@@ -10,7 +10,7 @@ export interface ModelListCommandInput {
   machineId?: string;
   allowedProviders?: string[];
   opencodeClient: Pick<OpencodeClient, "listProviders">;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 export interface ModelSetCommandInput {
@@ -26,11 +26,11 @@ export interface ModelSetCommandInput {
       setModelOverride: (sessionId: string, model: string) => void;
     };
   };
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
 }
 
 export async function ingestModelListCommand(input: ModelListCommandInput): Promise<void> {
-  const { sessionId, chatId, opencodeClient, sendTelegramReply } = input;
+  const { sessionId, chatId, opencodeClient, sendChatReply } = input;
 
   try {
     const result = await opencodeClient.listProviders();
@@ -38,7 +38,7 @@ export async function ingestModelListCommand(input: ModelListCommandInput): Prom
     const allowedSet = new Set(input.allowedProviders ?? DEFAULT_ALLOWED_PROVIDERS);
     const allowedProviders = result.all.filter((p) => allowedSet.has(p.id));
 
-    const b = new TgMessageBuilder()
+    const b = new ChatMessageBuilder()
       .append("🤖 ")
       .appendBold("Available models:")
       .append("\n🆔 ")
@@ -57,15 +57,15 @@ export async function ingestModelListCommand(input: ModelListCommandInput): Prom
     b.append("Reply: ").appendCode("/model <code>");
 
     const msg = b.build();
-    await sendTelegramReply(chatId, msg.text, msg.entities);
+    await sendChatReply(chatId, msg.text, msg.entities);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to list models: ${message}`);
+    await sendChatReply(chatId, `Failed to list models: ${message}`);
   }
 }
 
 export async function ingestModelSetCommand(input: ModelSetCommandInput): Promise<void> {
-  const { sessionId, chatId, model, opencodeClient, storage, sendTelegramReply } = input;
+  const { sessionId, chatId, model, opencodeClient, storage, sendChatReply } = input;
 
   try {
     const result = await opencodeClient.listProviders();
@@ -78,7 +78,7 @@ export async function ingestModelSetCommand(input: ModelSetCommandInput): Promis
     const modelExists = provider && modelID in provider.models;
 
     if (!modelExists) {
-      const notFound = new TgMessageBuilder()
+      const notFound = new ChatMessageBuilder()
         .append("Model ")
         .appendCode(model)
         .append(" not found. Use ")
@@ -86,21 +86,21 @@ export async function ingestModelSetCommand(input: ModelSetCommandInput): Promis
         .append(" to see available models.\n🆔 ")
         .appendCode(sessionId)
         .build();
-      await sendTelegramReply(chatId, notFound.text, notFound.entities);
+      await sendChatReply(chatId, notFound.text, notFound.entities);
       return;
     }
 
     storage.sessions.setModelOverride(sessionId, model);
-    const confirmation = new TgMessageBuilder()
+    const confirmation = new ChatMessageBuilder()
       .append("🤖 Model set to ")
       .appendCode(model)
       .append("\n🆔 ")
       .appendCode(sessionId)
       .build();
-    await sendTelegramReply(chatId, confirmation.text, confirmation.entities);
+    await sendChatReply(chatId, confirmation.text, confirmation.entities);
     console.log(`[model-ingest] set commandId=${input.commandId} model=${model} session=${sessionId}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await sendTelegramReply(chatId, `Failed to set model: ${message}`);
+    await sendChatReply(chatId, `Failed to set model: ${message}`);
   }
 }

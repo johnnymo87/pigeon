@@ -42,7 +42,7 @@ export function isWakeKind(kind: string): boolean {
  *
  * Named for its original use — suppressing the requeue/abort recovery ladder,
  * which is invalid against idle targets — but it now gates a second, related
- * decision: whether a terminal failure inlines the payload into a Telegram
+ * decision: whether a terminal failure inlines the payload into a chat
  * alert. Both follow from the same fact about this population, that NOBODY IS
  * LISTENING IN-BAND. That is why recovery-by-redelivery is pointless for them,
  * and why notifying the sender is pointless too (for a self-wake the sender is

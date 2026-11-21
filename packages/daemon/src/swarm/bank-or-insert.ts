@@ -2,7 +2,7 @@ import type { StorageDb } from "../storage/database";
 import type { Priority } from "../storage/swarm-repo";
 import { isPullBackend } from "../adapters/goose-pull";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
-import { enqueueSwarmTelegramNotice } from "./telegram-notice";
+import { enqueueSwarmChatNotice } from "./chat-notice";
 import { isGoosePushRow } from "./coordinators";
 
 export interface BankOrInsertInput {
@@ -17,7 +17,7 @@ export interface BankOrInsertInput {
   deliverAt?: number | null;
   expiresAt?: number | null;
   ref?: string | null;
-  /** Telegram notice name for a sender with no local row (a relayed message). */
+  /** Chat notice name for a sender with no local row (a relayed message). */
   remoteSenderName?: string | null;
   /** Pull-inbox TTL override (a relayed message must expire while the worker still has it). */
   pullTtlMs?: number;
@@ -75,7 +75,7 @@ export function bankOrInsertSwarmMessage(
 
   // Any goose session pigeon can reach is pushed, like an opencode session: the
   // coordinators (notify on) and honk chat sessions known only from a swarm-tool
-  // call (notify off, so their turns are not mirrored to Telegram). Only a goose
+  // call (notify off, so their turns are not mirrored to the chat). Only a goose
   // row with no endpoint falls back to the pull mailbox.
   const isGoosePush = isGoosePushRow(targetSession);
 
@@ -138,9 +138,9 @@ export function bankOrInsertSwarmMessage(
       now,
     );
 
-    // Enqueue recipient Telegram notice only when the bank was fresh (not an idempotent repeat).
+    // Enqueue recipient chat notice only when the bank was fresh (not an idempotent repeat).
     if (fresh) {
-      enqueueSwarmTelegramNotice(
+      enqueueSwarmChatNotice(
         storage,
         {
           msgId: input.msgId,
@@ -185,7 +185,7 @@ export function bankOrInsertSwarmMessage(
   if (inserted) {
     const record = storage.swarm.getByMsgId(input.msgId);
     if (record) {
-      enqueueSwarmTelegramNotice(storage, { ...record, remoteSenderName: input.remoteSenderName ?? null }, now);
+      enqueueSwarmChatNotice(storage, { ...record, remoteSenderName: input.remoteSenderName ?? null }, now);
     }
   }
 

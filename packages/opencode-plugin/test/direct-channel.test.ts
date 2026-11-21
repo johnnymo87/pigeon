@@ -68,7 +68,7 @@ describe("direct channel server", () => {
       commandId: "cmd-1",
       sessionId: "sess-1",
       command: "echo ok",
-      source: OpencodeDirectSource.TelegramReply,
+      source: OpencodeDirectSource.ChatReply,
       issuedAt: Date.now(),
     }
 
@@ -109,7 +109,7 @@ describe("direct channel server", () => {
       commandId: "cmd-2",
       sessionId: "sess-2",
       command: "echo fail",
-      source: OpencodeDirectSource.TelegramCallback,
+      source: OpencodeDirectSource.ChatCallback,
       issuedAt: Date.now(),
     }
 
@@ -145,7 +145,7 @@ describe("direct channel server", () => {
       commandId: "cmd-dup",
       sessionId: "sess-dup",
       command: "fix the bug",
-      source: OpencodeDirectSource.TelegramReply,
+      source: OpencodeDirectSource.ChatReply,
       issuedAt: Date.now(),
     }
 
@@ -196,7 +196,7 @@ describe("direct channel server", () => {
       commandId: "cmd-media",
       sessionId: "sess-media",
       command: "caption text",
-      source: OpencodeDirectSource.TelegramReply,
+      source: OpencodeDirectSource.ChatReply,
       issuedAt: Date.now(),
       media,
     }

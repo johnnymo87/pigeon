@@ -222,7 +222,7 @@ describe("POST /swarm/send", () => {
     expect(stored!.payload).toBe("first");
   });
 
-  it("enqueues a Telegram notice to the receiver when a send is accepted", async () => {
+  it("enqueues a chat notice to the receiver when a send is accepted", async () => {
     const { app, storage: s } = newApp();
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -232,7 +232,7 @@ describe("POST /swarm/send", () => {
           from: "ses_a",
           to: "ses_b",
           kind: "chat",
-          payload: "hello telegram",
+          payload: "hello chat",
         }),
       }),
     );
@@ -308,7 +308,7 @@ describe("POST /swarm/send", () => {
     // NOT in swarm_messages
     expect(s.swarm.getByMsgId(body.msg_id)).toBeNull();
 
-    // Telegram notice in outbox
+    // Chat notice in outbox
     expect(s.outbox.getByNotificationId(`w:${body.msg_id}`)).not.toBeNull();
   });
 
@@ -969,7 +969,7 @@ describe("POST /swarm/schedule", () => {
     return { app: createApp(storage, { nowFn: () => now, ...opts }), storage };
   }
 
-  it("enqueues a Telegram notice to the receiver when a schedule is accepted", async () => {
+  it("enqueues a chat notice to the receiver when a schedule is accepted", async () => {
     const { app, storage: s } = newApp();
     const res = await app(
       new Request("http://localhost/swarm/schedule", {

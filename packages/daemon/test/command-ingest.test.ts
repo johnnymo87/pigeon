@@ -735,7 +735,7 @@ describe("ingestWorkerCommand", () => {
       }, 1_000);
       storage.assignments.upsert({ sessionId: "sess-gone", directoryKey: null, desiredServeId: "serve-0", ownerGeneration: 1, state: "dormant", lastPlacedAt: 1_000, updatedAt: 1_000 });
 
-      const tgCalls: Array<{ chatId: string; text: string }> = [];
+      const chatCalls: Array<{ chatId: string; text: string }> = [];
 
       await ingestWorkerCommand(
         storage,
@@ -751,7 +751,7 @@ describe("ingestWorkerCommand", () => {
             async getSession() { return null; },
             async sendPrompt() { throw new Error("should not be called"); },
           },
-          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
           spawn: mockSpawn,
         },
       );
@@ -761,9 +761,9 @@ describe("ingestWorkerCommand", () => {
       expect(storage.assignments.get("sess-gone")).toBeNull();
 
       // User notified
-      expect(tgCalls).toHaveLength(1);
-      expect(tgCalls[0]!.chatId).toBe("9");
-      expect(tgCalls[0]!.text).toMatch(/no longer exists|gone/i);
+      expect(chatCalls).toHaveLength(1);
+      expect(chatCalls[0]!.chatId).toBe("9");
+      expect(chatCalls[0]!.text).toMatch(/no longer exists|gone/i);
 
       // Command acked
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -782,7 +782,7 @@ describe("ingestWorkerCommand", () => {
         backendAuthToken: "tok",
       }, 1_000);
 
-      const tgCalls: Array<{ chatId: string; text: string }> = [];
+      const chatCalls: Array<{ chatId: string; text: string }> = [];
 
       await ingestWorkerCommand(
         storage,
@@ -798,7 +798,7 @@ describe("ingestWorkerCommand", () => {
             async getSession() { throw new Error("ECONNREFUSED"); },
             async sendPrompt() { throw new Error("should not be called"); },
           },
-          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
           spawn: mockSpawn,
         },
       );
@@ -810,8 +810,8 @@ describe("ingestWorkerCommand", () => {
       expect(row!.backendEndpoint).toBe("http://127.0.0.1:7777/pigeon/direct/execute");
 
       // User notified
-      expect(tgCalls).toHaveLength(1);
-      expect(tgCalls[0]!.text).toMatch(/unreachable|opencode-serve/i);
+      expect(chatCalls).toHaveLength(1);
+      expect(chatCalls[0]!.text).toMatch(/unreachable|opencode-serve/i);
 
       // Command acked
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -830,7 +830,7 @@ describe("ingestWorkerCommand", () => {
         backendAuthToken: "tok",
       }, 1_000);
 
-      const tgCalls: Array<{ chatId: string; text: string }> = [];
+      const chatCalls: Array<{ chatId: string; text: string }> = [];
 
       await ingestWorkerCommand(
         storage,
@@ -846,7 +846,7 @@ describe("ingestWorkerCommand", () => {
             async getSession() { return { id: "sess-deliv-fail", directory: "/tmp" }; },
             async sendPrompt() { throw new Error("opencode-serve 500"); },
           },
-          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
           spawn: mockSpawn,
         },
       );
@@ -854,8 +854,8 @@ describe("ingestWorkerCommand", () => {
       // Session kept
       expect(storage.sessions.get("sess-deliv-fail")).not.toBeNull();
       // User notified with error
-      expect(tgCalls).toHaveLength(1);
-      expect(tgCalls[0]!.text).toMatch(/opencode-serve 500|delivery failed/i);
+      expect(chatCalls).toHaveLength(1);
+      expect(chatCalls[0]!.text).toMatch(/opencode-serve 500|delivery failed/i);
       // Command acked
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
       storage.db.close();
@@ -880,7 +880,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         backendAuthToken: "tok",
       }, 1_000);
 
-      const tgCalls: Array<{ chatId: string; text: string }> = [];
+      const chatCalls: Array<{ chatId: string; text: string }> = [];
 
       await ingestWorkerCommand(
         storage,
@@ -898,13 +898,13 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
             async getSession() { throw new Error("should not be called"); },
             async sendPrompt() { throw new Error("should not be called"); },
           },
-          sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+          sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
           spawn: mockSpawn,
         },
       );
 
-      // No Telegram notification (silent defensive no-op)
-      expect(tgCalls).toHaveLength(0);
+      // No the chat notification (silent defensive no-op)
+      expect(chatCalls).toHaveLength(0);
       // Command acked
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -1292,7 +1292,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
             async sendPrompt(_sid, _dir, prompt) { sendPromptCalls.push(prompt); },
           },
           spawn: mockSpawn,
-          sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+          sendChatReply: async (_chatId: string, text: string) => { replies.push(text); },
           deliveryBudgetMs: 40_000,
           sleep: async () => {},
         },
@@ -1457,7 +1457,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       let capturedReply: QuestionReplyInput | null = null;
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1478,8 +1478,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: true as const };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
@@ -1487,10 +1487,10 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       // Must NOT deliver question reply to the live row
       expect(capturedReply).toBeNull();
       // Must drop command and reply to user explaining question was superseded and echoing text
-      expect(sentTelegramText).not.toBeNull();
-      expect(sentTelegramText!).toContain("replaced by a newer one");
+      expect(sentChatText).not.toBeNull();
+      expect(sentChatText!).toContain("replaced by a newer one");
       // Typed text is echoed back so the user does not have to retype it.
-      expect(sentTelegramText!).toContain("Use MongoDB");
+      expect(sentChatText!).toContain("Use MongoDB");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
@@ -1519,7 +1519,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now);
 
       let capturedReply: QuestionReplyInput | null = null;
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1539,18 +1539,18 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: true as const };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
 
       expect(capturedReply).toBeNull();
-      expect(sentTelegramText).not.toBeNull();
-      expect(sentTelegramText!).toContain("replaced by a newer one");
+      expect(sentChatText).not.toBeNull();
+      expect(sentChatText!).toContain("replaced by a newer one");
       // The user pressed a button; "q0" is an internal wire token they never
       // typed, so quoting it back would be gibberish.
-      expect(sentTelegramText!).not.toContain("q0");
+      expect(sentChatText!).not.toContain("q0");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
@@ -1636,7 +1636,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         }],
       }, now - 5 * 3600 * 1000);
 
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       // opencode no longer knows this question: a terminal (non-transient) failure.
       await ingestWorkerCommand(
@@ -1656,8 +1656,8 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: false as const, error: "OpenCode question reply failed: 404 question not found" };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
@@ -1666,10 +1666,10 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       // resurrection ignores expires_at, so the row would never age out — and
       // trap every future swipe-reply to this card against a dead question.
       expect(storage.pendingQuestions.getBySessionIdIncludingExpired("sess-res-gone")).toBeNull();
-      expect(sentTelegramText).not.toBeNull();
+      expect(sentChatText).not.toBeNull();
       // Must not repeat the live-row advice, which cannot work here.
-      expect(sentTelegramText!).not.toContain("Tap the option again, or reply with text, to retry");
-      expect(sentTelegramText!).toContain("no longer open");
+      expect(sentChatText!).not.toContain("Tap the option again, or reply with text, to retry");
+      expect(sentChatText!).toContain("no longer open");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
@@ -1697,7 +1697,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
         }],
       }, now);
 
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1715,15 +1715,15 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: false as const, error: "OpenCode question reply failed: 500 boom" };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
 
       // Unchanged pre-existing behavior: the row survives so a second tap retries.
       expect(storage.pendingQuestions.getBySessionId("sess-live-keep")).not.toBeNull();
-      expect(sentTelegramText!).toContain("Tap the option again");
+      expect(sentChatText!).toContain("Tap the option again");
 
       storage.db.close();
     });
@@ -1806,7 +1806,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       }, now - 5 * 3600 * 1000);
 
       let deliverQuestionReplyCalled = false;
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1826,15 +1826,15 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: true as const };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
 
       expect(deliverQuestionReplyCalled).toBe(false);
-      expect(sentTelegramText).not.toBeNull();
-      expect(sentTelegramText!).toContain("no longer answerable");
+      expect(sentChatText).not.toBeNull();
+      expect(sentChatText!).toContain("no longer answerable");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
@@ -1855,7 +1855,7 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
       // No pending question in storage (deleted after first successful press)
       let deliverCommandCalled = false;
       let deliverQuestionReplyCalled = false;
-      let sentTelegramText: string | null = null;
+      let sentChatText: string | null = null;
 
       await ingestWorkerCommand(
         storage,
@@ -1878,16 +1878,16 @@ it("acks but does not notify when reviveAndDeliver returns sessionMissing", asyn
               return { ok: true as const };
             },
           }),
-          sendTelegramReply: async (_chatId, text) => {
-            sentTelegramText = text;
+          sendChatReply: async (_chatId, text) => {
+            sentChatText = text;
           },
         },
       );
 
       expect(deliverQuestionReplyCalled).toBe(false);
       expect(deliverCommandCalled).toBe(false);
-      expect(sentTelegramText).not.toBeNull();
-      expect(sentTelegramText!).toContain("no longer answerable");
+      expect(sentChatText).not.toBeNull();
+      expect(sentChatText!).toContain("no longer answerable");
       expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
       storage.db.close();
@@ -2423,7 +2423,7 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
   it("replies and marks done when the plugin terminally rejects the command", async () => {
     const storage = openStorageDb(":memory:");
     liveSession(storage, "sess-reject");
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2435,14 +2435,14 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
             return { ok: false, error: "INVALID_PAYLOAD" };
           },
         }),
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("42");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("42");
     // Minimum-scope wording: surface the machine-readable reject reason verbatim.
-    expect(tgCalls[0]!.text).toContain("INVALID_PAYLOAD");
+    expect(chatCalls[0]!.text).toContain("INVALID_PAYLOAD");
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
@@ -2453,7 +2453,7 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
     // and must not produce an "undefined" reply or a leaked row.
     const storage = openStorageDb(":memory:");
     liveSession(storage, "sess-noerr");
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2465,12 +2465,12 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
             return { ok: false };
           },
         }),
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.text).not.toContain("undefined");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.text).not.toContain("undefined");
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
@@ -2481,17 +2481,17 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
     // has since reaped. Was silent, despite the revive path (:508) replying for
     // the very same "session is gone" condition.
     const storage = openStorageDb(":memory:");
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
       makeMsg({ commandId: "cmd-nosess", sessionId: "sess-absent", command: "hi", chatId: "44" }),
-      { sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); } },
+      { sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); } },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("44");
-    expect(tgCalls[0]!.text).toMatch(/session/i);
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("44");
+    expect(chatCalls[0]!.text).toMatch(/session/i);
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
@@ -2506,16 +2506,16 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
       backendKind: "opencode-plugin-direct",
       backendProtocolVersion: 1,
     }, 1_000);
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
       makeMsg({ commandId: "cmd-noadapter", sessionId: "sess-noadapter", command: "hi", chatId: "45" }),
-      { sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); } },
+      { sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); } },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("45");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("45");
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
@@ -2524,7 +2524,7 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
   it("replies and marks done when a dead session is removed with no opencodeClient", async () => {
     const storage = openStorageDb(":memory:");
     liveSession(storage, "sess-dead");
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2537,20 +2537,20 @@ describe("ingestWorkerCommand — silent drop sites (W2)", () => {
           },
         }),
         // no opencodeClient -> legacy "delete dead session" branch
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
     expect(storage.sessions.get("sess-dead")).toBeNull();
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("46");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("46");
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
   });
 
-  it("does not throw when no sendTelegramReply is wired", async () => {
-    // sendTelegramReply is optional; the drop path must stay best-effort.
+  it("does not throw when no sendChatReply is wired", async () => {
+    // sendChatReply is optional; the drop path must stay best-effort.
     const storage = openStorageDb(":memory:");
     liveSession(storage, "sess-noreply");
 
@@ -2603,7 +2603,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     const wizFailRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wizfail")!;
     storage.pendingQuestions.advanceStep(wizFailRecord, ["A"]);
 
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
     const editCalls: unknown[] = [];
 
     await ingestWorkerCommand(
@@ -2616,13 +2616,13 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
           async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
         }),
         editNotification: async (...args: unknown[]) => { editCalls.push(args); return { ok: true }; },
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("70");
-    expect(tgCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("70");
+    expect(chatCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
     // Row preserved with its accumulated answers, so the user can retry.
     const row = storage.pendingQuestions.getBySessionId("sess-w2b-wizfail");
     expect(row).not.toBeNull();
@@ -2659,7 +2659,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
         },
       }),
       editNotification: async () => ({ ok: true }),
-      sendTelegramReply: async () => {},
+      sendChatReply: async () => {},
     });
 
     // First press fails terminally.
@@ -2679,7 +2679,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
       sessionId: "sess-w2b-single", requestId: "req-3", questions: [twoQuestions[0]!], token: "tok-3",
     }, now);
 
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2690,12 +2690,12 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
           async deliverCommand() { return { ok: false, error: "should not be called" }; },
           async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
         }),
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.text).toContain("QUESTION_NOT_FOUND");
     expect(storage.pendingQuestions.getBySessionId("sess-w2b-single")).not.toBeNull();
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -2715,7 +2715,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     const wizNoAdapterRecord = storage.pendingQuestions.getBySessionId("sess-w2b-wiznoadapter")!;
     storage.pendingQuestions.advanceStep(wizNoAdapterRecord, ["A"]);
 
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2725,12 +2725,12 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
           name: "mock-no-qr",
           async deliverCommand() { return { ok: true as const }; },
         }),
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
-    expect(tgCalls[0]!.chatId).toBe("73");
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]!.chatId).toBe("73");
     expect(storage.pendingQuestions.getBySessionId("sess-w2b-wiznoadapter")).toBeNull();
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -2743,7 +2743,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
       sessionId: "sess-w2b-singlenoadapter", requestId: "req-5", questions: [twoQuestions[0]!], token: "tok-5",
     }, now);
 
-    const tgCalls: Array<{ chatId: string; text: string }> = [];
+    const chatCalls: Array<{ chatId: string; text: string }> = [];
 
     await ingestWorkerCommand(
       storage,
@@ -2753,11 +2753,11 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
           name: "mock-no-qr",
           async deliverCommand() { return { ok: true as const }; },
         }),
-        sendTelegramReply: async (chatId, text) => { tgCalls.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { chatCalls.push({ chatId, text }); },
       },
     );
 
-    expect(tgCalls).toHaveLength(1);
+    expect(chatCalls).toHaveLength(1);
     expect(storage.pendingQuestions.getBySessionId("sess-w2b-singlenoadapter")).toBeNull();
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
@@ -2789,7 +2789,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
           editCalls.push({ notificationId, text, replyMarkup });
           return { ok: true };
         },
-        sendTelegramReply: async () => {},
+        sendChatReply: async () => {},
       },
     );
 
@@ -2814,7 +2814,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
         name: "mock-no-qr",
         async deliverCommand(_s: unknown, text: string) { deliveredCommands.push(text); return { ok: true as const }; },
       }),
-      sendTelegramReply: async () => {},
+      sendChatReply: async () => {},
     });
 
     await ingestWorkerCommand(storage, makeMsg({ commandId: "cmd-w2b-6a", sessionId: "sess-w2b-unhijack", command: "first", chatId: "75" }), opts());
@@ -2826,7 +2826,7 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
     storage.db.close();
   });
 
-  it("does not throw when no sendTelegramReply is wired on the question path", async () => {
+  it("does not throw when no sendChatReply is wired on the question path", async () => {
     const { storage, now } = questionSession("sess-w2b-nosender");
     storage.pendingQuestions.store({
       sessionId: "sess-w2b-nosender", requestId: "req-7", questions: [twoQuestions[0]!], token: "tok-7",
@@ -2849,13 +2849,13 @@ describe("ingestWorkerCommand — question-reply path silent drops (W2b)", () =>
   });
 });
 
-describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b part B)", () => {
+describe("ingestWorkerCommand — revive branches guard their chat send (W2b part B)", () => {
   // These three branches predate dropCommand and hand-rolled it with an
-  // UNGUARDED `await options.sendTelegramReply?.(...)`. That is latent rather
+  // UNGUARDED `await options.sendChatReply?.(...)`. That is latent rather
   // than live today only because the production sender (index.ts) catches
   // internally and never throws. If it ever did, serveUnreachable would be an
   // infinite retry loop: it does NOT delete the session, so the command would
-  // come back every poll, gated only on Telegram continuing to fail.
+  // come back every poll, gated only on the chat continuing to fail.
   const mockSpawn = (() => ({ on: () => {}, unref: () => {} })) as unknown as ReviveAndDeliverDeps["spawn"];
 
   function deadSession(sessionId: string) {
@@ -2871,7 +2871,7 @@ describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b
     return storage;
   }
 
-  const throwingSender = async () => { throw new Error("telegram is down"); };
+  const throwingSender = async () => { throw new Error("chat is down"); };
   const connError = () => ({
     name: "mock-direct",
     async deliverCommand() { return { ok: false, error: "fetch failed: ECONNREFUSED" }; },
@@ -2890,7 +2890,7 @@ describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b
           async sendPrompt() {},
         },
         spawn: mockSpawn,
-        sendTelegramReply: throwingSender,
+        sendChatReply: throwingSender,
       },
     )).resolves.toBeUndefined();
 
@@ -2915,7 +2915,7 @@ describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b
           async sendPrompt() {},
         },
         spawn: mockSpawn,
-        sendTelegramReply: throwingSender,
+        sendChatReply: throwingSender,
       },
     )).resolves.toBeUndefined();
 
@@ -2938,7 +2938,7 @@ describe("ingestWorkerCommand — revive branches guard their Telegram send (W2b
           async sendPrompt() { throw new Error("prompt exploded"); },
         },
         spawn: mockSpawn,
-        sendTelegramReply: throwingSender,
+        sendChatReply: throwingSender,
       },
     )).resolves.toBeUndefined();
 
@@ -3004,7 +3004,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ ok: false }),
-        sendTelegramReply: async (chatId, text) => { replies.push({ chatId, text }); },
+        sendChatReply: async (chatId, text) => { replies.push({ chatId, text }); },
       },
     );
 
@@ -3037,7 +3037,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ error: "Message not found for notificationId" }) as never,
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3058,7 +3058,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       makeMsg({ commandId: "cmd-w2c-9", sessionId: "sess-w2c-9", command: "v1:q0", chatId: "1" }),
       {
         createAdapter: adapter,
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3075,7 +3075,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ ok: false }),
-        sendTelegramReply: async () => {},
+        sendChatReply: async () => {},
       },
     );
 
@@ -3101,7 +3101,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => { throw new Error("network down"); },
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     )).resolves.toBeUndefined();
 
@@ -3132,7 +3132,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
           async deliverCommand() { return { ok: false as const, error: "should not be called" }; },
         }),
         editNotification: async () => { throw new Error("network down"); },
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     )).resolves.toBeUndefined();
 
@@ -3153,7 +3153,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ ok: true }),
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3172,7 +3172,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       makeMsg({ commandId: "cmd-w2c-5", sessionId: "sess-w2c-5", command: "v0:q1", chatId: "1" }),
       {
         createAdapter: adapter,
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3189,7 +3189,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ ok: false }),
-        sendTelegramReply: async () => { throw new Error("telegram down"); },
+        sendChatReply: async () => { throw new Error("chat down"); },
       },
     )).resolves.toBeUndefined();
 
@@ -3210,7 +3210,7 @@ describe("ingestWorkerCommand — wizard edit-failure soft-lock (W2c)", () => {
       {
         createAdapter: adapter,
         editNotification: async () => ({ ok: false }),
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3281,7 +3281,7 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
             return { ok: true as const };
           },
         }),
-        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        sendChatReply: async (_chatId, text) => { replies.push(text); },
       },
     );
 
@@ -3317,7 +3317,7 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
           async deliverQuestionReply() { return { ok: true as const }; },
         }),
         editNotification: async (...args: unknown[]) => { editCalls.push(args); return { ok: true }; },
-        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        sendChatReply: async (_chatId, text) => { replies.push(text); },
       },
     );
 
@@ -3355,7 +3355,7 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
             return { ok: true as const };
           },
         }),
-        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        sendChatReply: async (_chatId, text) => { replies.push(text); },
       },
     );
 
@@ -3390,7 +3390,7 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
             return { ok: true as const };
           },
         }),
-        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        sendChatReply: async (_chatId, text) => { replies.push(text); },
       },
     );
 
@@ -3426,7 +3426,7 @@ describe("ingestWorkerCommand — media + empty-command hygiene (W3/W4)", () => 
             return { ok: true as const };
           },
         }),
-        sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+        sendChatReply: async (_chatId, text) => { replies.push(text); },
       },
     );
 
@@ -3588,7 +3588,7 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
           async deliverCommand() { return { ok: true as const }; },
           async deliverQuestionReply() { return { ok: false as const, error: "request timed out" }; },
         }),
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     )).rejects.toThrow();
 
@@ -3614,7 +3614,7 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
           async deliverCommand() { return { ok: true as const }; },
           async deliverQuestionReply() { return { ok: false as const, error: "QUESTION_NOT_FOUND" }; },
         }),
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3646,7 +3646,7 @@ describe("ingestWorkerCommand — media warning fires only on a delivered answer
           async deliverCommand() { return { ok: true as const }; },
           async deliverQuestionReply() { return { ok: true as const }; },
         }),
-        sendTelegramReply: async (_c, text) => { replies.push(text); },
+        sendChatReply: async (_c, text) => { replies.push(text); },
       },
     );
 
@@ -3756,7 +3756,7 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     expect(storage.pendingQuestions.getBySessionId("sess-w2e-1")!.version).toBe(0);
 
     let capturedReply: QuestionReplyInput | null = null;
-    let sentTelegramText: string | null = null;
+    let sentChatText: string | null = null;
 
     await ingestWorkerCommand(
       storage,
@@ -3773,25 +3773,25 @@ describe("W2e: option-token shape must match the pending question's arity", () =
             return { ok: true as const };
           },
         }),
-        sendTelegramReply: async (_chatId, text) => { sentTelegramText = text; },
+        sendChatReply: async (_chatId, text) => { sentChatText = text; },
       },
     );
 
     // MUST NOT answer "Yes, deploy" to a question the user never read
     expect(capturedReply).toBeNull();
     // and MUST NOT be silent about it
-    expect(sentTelegramText).not.toBeNull();
+    expect(sentChatText).not.toBeNull();
     // Exact equality, not a substring: a substring assertion cannot see a bogus
     // echo tail appended to the message (a mutant that passed `""` to the
     // formatter survived a `toContain` check).
-    expect(sentTelegramText).toBe(
+    expect(sentChatText).toBe(
       "That option doesn't belong to the question that's open now, so it wasn't recorded. Use the buttons on the latest question above.",
     );
     // the raw token is not echoed back as if it were the user's words
-    expect(sentTelegramText!).not.toContain("v0:q0");
+    expect(sentChatText!).not.toContain("v0:q0");
     // and it must NOT claim the question was replaced -- for a shape mismatch
     // that is not necessarily true
-    expect(sentTelegramText!).not.toContain("replaced by a newer one");
+    expect(sentChatText!).not.toContain("replaced by a newer one");
     // pending row survives, so the real keyboard still works
     expect(storage.pendingQuestions.getBySessionId("sess-w2e-1")).not.toBeNull();
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
@@ -3811,7 +3811,7 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     }, now);
 
     let capturedReply: QuestionReplyInput | null = null;
-    let sentTelegramText: string | null = null;
+    let sentChatText: string | null = null;
     let editCalled = false;
 
     await ingestWorkerCommand(
@@ -3827,7 +3827,7 @@ describe("W2e: option-token shape must match the pending question's arity", () =
           },
         }),
         editNotification: async () => { editCalled = true; return { ok: true }; },
-        sendTelegramReply: async (_chatId, text) => { sentTelegramText = text; },
+        sendChatReply: async (_chatId, text) => { sentChatText = text; },
       },
     );
 
@@ -3838,11 +3838,11 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     expect(row.currentStep).toBe(0);
     expect(row.answers).toEqual([]);
     expect(row.version).toBe(0);
-    expect(sentTelegramText).not.toBeNull();
-    expect(sentTelegramText).toBe(
+    expect(sentChatText).not.toBeNull();
+    expect(sentChatText).toBe(
       "That option doesn't belong to the question that's open now, so it wasn't recorded. Use the buttons on the latest question above.",
     );
-    expect(sentTelegramText!).not.toContain("q1");
+    expect(sentChatText!).not.toContain("q1");
     expect(storage.inbox.listUnfinished()).toHaveLength(0);
 
     storage.db.close();
@@ -3881,7 +3881,7 @@ describe("W2e: option-token shape must match the pending question's arity", () =
       sessionId: "sess-w2e-3b", requestId: "r3b", questions: twoQuestions, token: "t3b",
     }, now);
 
-    let sentTelegramText: string | null = null;
+    let sentChatText: string | null = null;
     await ingestWorkerCommand(
       storage,
       makeMsg({ commandId: "c3b", sessionId: "sess-w2e-3b", command: "another custom answer", chatId: "1" }),
@@ -3892,13 +3892,13 @@ describe("W2e: option-token shape must match the pending question's arity", () =
           async deliverQuestionReply() { return { ok: true as const }; },
         }),
         editNotification: async () => ({ ok: true }),
-        sendTelegramReply: async (_c, text) => { sentTelegramText = text; },
+        sendChatReply: async (_c, text) => { sentChatText = text; },
       },
     );
     const row = storage.pendingQuestions.getBySessionId("sess-w2e-3b")!;
     expect(row.currentStep).toBe(1);
     expect(row.answers).toEqual([["another custom answer"]]);
-    expect(sentTelegramText).toBeNull();
+    expect(sentChatText).toBeNull();
     storage.db.close();
   });
 
@@ -3957,7 +3957,7 @@ describe("W2e: option-token shape must match the pending question's arity", () =
     const warns: string[] = [];
     const spy = vi.spyOn(console, "warn").mockImplementation((m: unknown) => { warns.push(String(m)); });
 
-    let sentTelegramText: string | null = null;
+    let sentChatText: string | null = null;
     await ingestWorkerCommand(
       storage,
       makeMsg({
@@ -3970,15 +3970,15 @@ describe("W2e: option-token shape must match the pending question's arity", () =
           async deliverCommand() { return { ok: false, error: "no" }; },
           async deliverQuestionReply() { return { ok: true as const }; },
         }),
-        sendTelegramReply: async (_c, text) => { sentTelegramText = text; },
+        sendChatReply: async (_c, text) => { sentChatText = text; },
       },
     );
     spy.mockRestore();
 
-    expect(sentTelegramText).not.toBeNull();
+    expect(sentChatText).not.toBeNull();
     // the identity check's message, NOT the shape guard's -- proves ordering
-    expect(sentTelegramText!).toContain("replaced by a newer one");
-    expect(sentTelegramText!).not.toContain("doesn't belong to the question");
+    expect(sentChatText!).toContain("replaced by a newer one");
+    expect(sentChatText!).not.toContain("doesn't belong to the question");
     // the identity check logs "metadata mismatched"; the shape guard does not
     expect(warns.some(w => w.includes("metadata mismatched"))).toBe(true);
     expect(warns.some(w => w.includes("shape does not match"))).toBe(false);
@@ -4475,7 +4475,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
             async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
           },
           spawn: mockSpawn,
-          sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          sendChatReply: async (_chatId, text) => { replies.push(text); },
         },
       );
 
@@ -4600,7 +4600,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
               editedNotifications.push({ id: notificationId, text });
               return { ok: true };
             },
-            sendTelegramReply: async (_chatId, text) => {
+            sendChatReply: async (_chatId, text) => {
               replies.push(text);
             },
           },
@@ -4675,7 +4675,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
               editedNotifications.push({ id: notificationId, text });
               return { ok: true };
             },
-            sendTelegramReply: async (_chatId, text) => {
+            sendChatReply: async (_chatId, text) => {
               replies.push(text);
             },
           },
@@ -4744,7 +4744,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
             async sendPrompt(sid, dir, prompt) { sendPromptCalls.push({ sid, dir, prompt }); },
           },
           spawn: mockSpawn,
-          sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+          sendChatReply: async (_chatId, text) => { replies.push(text); },
         },
       );
 
@@ -4804,7 +4804,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).resolves.toBeUndefined();
@@ -4866,7 +4866,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).resolves.toBeUndefined();
@@ -4921,7 +4921,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).rejects.toThrow("request timed out");
@@ -4979,7 +4979,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).resolves.toBeUndefined();
@@ -5050,7 +5050,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).resolves.toBeUndefined();
@@ -5185,7 +5185,7 @@ describe("diagnostic failure logging (pigeon-m426.1)", () => {
                 };
               },
             }),
-            sendTelegramReply: async (_chatId, text) => { replies.push(text); },
+            sendChatReply: async (_chatId, text) => { replies.push(text); },
           },
         ),
       ).resolves.toBeUndefined();
@@ -5532,7 +5532,7 @@ describe("adapter failurePolicy (multi-backend safety)", () => {
           },
         }),
         unregisterSession: async (sessionId) => { unregistered.push(sessionId); },
-        sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+        sendChatReply: async (_chatId: string, text: string) => { replies.push(text); },
       },
     );
 
@@ -5591,7 +5591,7 @@ describe("adapter failurePolicy (multi-backend safety)", () => {
  * not a guard rail. Nothing fails at compile time or at run time if the goose
  * adapter stops setting it -- the session would silently start taking the
  * opencode path, where a socket blip is read as a dead plugin and the session
- * row, its routing assignment and its Telegram topic are DELETED. The point of
+ * row, its routing assignment and its channel are DELETED. The point of
  * these tests is to make that regression loud.
  */
 describe("goose sessions in the delivery machinery", () => {
@@ -5667,7 +5667,7 @@ describe("goose sessions in the delivery machinery", () => {
       unregisterSession: async (id: string) => {
         unregistered.push(id);
       },
-      sendTelegramReply: async (_chat: string, text: string) => {
+      sendChatReply: async (_chat: string, text: string) => {
         replies.push(text);
       },
     });
@@ -5748,7 +5748,7 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
           throw new Error("goose serve unreachable at ws://nonexistent.invalid:38910/acp: ENOTFOUND");
         },
       }),
-      sendTelegramReply: async (_chatId: string, text: string) => { replies.push(text); },
+      sendChatReply: async (_chatId: string, text: string) => { replies.push(text); },
     };
     const msg = makeMsg({
       commandId: "cmd-cap",
@@ -5792,7 +5792,7 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
           return { ok: true };
         },
       }),
-      sendTelegramReply: async () => {},
+      sendChatReply: async () => {},
     };
     const msg = makeMsg({ commandId: "cmd-flap", sessionId: "sess-flap", command: "hi", chatId: "12" });
 
@@ -5822,7 +5822,7 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
           failurePolicy: "surface" as const,
           async deliverCommand(): Promise<never> { throw new Error("boom-the-cause"); },
         }),
-        sendTelegramReply: async () => {},
+        sendChatReply: async () => {},
       },
     )).rejects.toThrow();
 
@@ -5845,7 +5845,7 @@ describe("redelivery cap (pigeon: unbounded 60s retry loop)", () => {
         failurePolicy: "surface" as const,
         async deliverCommand() { calls++; return { ok: true }; },
       }),
-      sendTelegramReply: async () => {},
+      sendChatReply: async () => {},
     };
     const msg = makeMsg({ commandId: "cmd-dd", sessionId: "sess-dedup", command: "hi", chatId: "12" });
 

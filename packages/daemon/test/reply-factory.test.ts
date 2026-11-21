@@ -1,12 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { createTelegramReplySender, type SendTelegramMessageFn } from "../src/worker/reply-factory";
-import type { TgEntity } from "../src/telegram-message";
+import { createChatReplySender, type SendChatMessageFn } from "../src/worker/reply-factory";
+import type { ChatEntity } from "../src/chat-message";
 
-describe("createTelegramReplySender", () => {
-  it("(a) forwards messageThreadId from command message to sendTelegramMessage", async () => {
-    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendTelegramMessageFn;
+describe("createChatReplySender", () => {
+  it("(a) forwards messageThreadId from command message to sendChatMessage", async () => {
+    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendChatMessageFn;
     const msg = { messageThreadId: 64003 };
-    const replySender = createTelegramReplySender(mockSend, msg);
+    const replySender = createChatReplySender(mockSend, msg);
 
     await replySender("chat-123", "hello from topic");
 
@@ -17,9 +17,9 @@ describe("createTelegramReplySender", () => {
   });
 
   it("(b) forwards undefined when messageThreadId is absent/null/undefined", async () => {
-    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendTelegramMessageFn;
+    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendChatMessageFn;
     const msgWithoutThread = {};
-    const replySender1 = createTelegramReplySender(mockSend, msgWithoutThread);
+    const replySender1 = createChatReplySender(mockSend, msgWithoutThread);
 
     await replySender1("chat-123", "hello general");
 
@@ -29,7 +29,7 @@ describe("createTelegramReplySender", () => {
     });
 
     const msgWithNullThread = { messageThreadId: null };
-    const replySender2 = createTelegramReplySender(mockSend, msgWithNullThread);
+    const replySender2 = createChatReplySender(mockSend, msgWithNullThread);
 
     await replySender2("chat-123", "hello general null");
 
@@ -40,11 +40,11 @@ describe("createTelegramReplySender", () => {
   });
 
   it("(c) forwards entities through closure without dropping them", async () => {
-    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendTelegramMessageFn;
+    const mockSend = vi.fn().mockResolvedValue(undefined) as unknown as SendChatMessageFn;
     const msg = { messageThreadId: 64003 };
-    const replySender = createTelegramReplySender(mockSend, msg);
+    const replySender = createChatReplySender(mockSend, msg);
 
-    const entities: TgEntity[] = [
+    const entities: ChatEntity[] = [
       { type: "bold", offset: 0, length: 5 },
       { type: "code", offset: 6, length: 10 },
     ];

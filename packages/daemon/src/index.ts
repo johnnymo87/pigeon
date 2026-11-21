@@ -57,7 +57,7 @@ import { whichKeyFor } from "./tag-key";
 import { SessionTagResolver } from "./tag-resolver";
 import { createRequesterTagResolver } from "./swarm/requester-tag";
 import { createMarkGooseRemoteReachable } from "./goose/remote-reachable.js";
-import { createTelegramReplySender } from "./worker/reply-factory";
+import { createChatReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
 import { gooseControlVerdict } from "./goose/control-guard.js";
 import { dropGooseRunnerWithSwarmNotify } from "./goose/runner-rotation.js";
@@ -70,7 +70,7 @@ import { recoverGooseTurns } from "./goose/recover-inflight.js";
 import { executeGooseKill } from "./goose/kill-control.js";
 import { startSessionReaper } from "./session-reaper";
 import { runPullInboxMaintenance } from "./pull-inbox-maintenance";
-import type { TgEntity } from "./telegram-message";
+import type { ChatEntity } from "./chat-message";
 import { IngressRouter } from "./routing/router";
 import { seedServes } from "./routing/serve-registry";
 import { ServeEndpointReconciler } from "./routing/endpoint-reconciler";
@@ -375,7 +375,7 @@ async function handleGooseControl(
   });
   if (verdict.kind === "not-goose") return false;
 
-  const send = createTelegramReplySender(sendTelegramMessage, msg);
+  const send = createChatReplySender(sendChatMessage, msg);
   const reply = (text: string) => send(msg.chatId, text);
   if (verdict.kind === "kill") {
     // Drops pigeon's side of the session, which is what the human is asking
@@ -437,7 +437,7 @@ const workerMessageClient = config.workerUrl && config.workerApiKey
   : undefined;
 
 /** Slash-command replies go through the worker; see worker/command-reply.ts. */
-const sendTelegramMessage: CommandReplySender = createCommandReplySender(workerMessageClient);
+const sendChatMessage: CommandReplySender = createCommandReplySender(workerMessageClient);
 
 /**
  * Builds the dependencies for a /tag command.
@@ -484,7 +484,7 @@ function tagDeps(msg: { commandId: string; chatId: string; messageThreadId?: num
     chatId: msg.chatId,
     machineId: config.machineId,
     runOcTags: resolveRunOcTags(),
-    sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+    sendChatReply: createChatReplySender(sendChatMessage, msg),
   };
 }
 
@@ -502,7 +502,7 @@ const workerHealthMonitor = new WorkerHealthMonitor({
     console.warn(`[worker-health] ${msg}`, fields ? JSON.stringify(fields) : ""),
 });
 
-// The owner's Telegram ids: who may bank a message for a pull-mode session, and
+// The owner's chat user ids: who may bank a message for a pull-mode session, and
 // who may prompt a goose-acp session (555.19). Empty (the default) means pull
 // sessions answer "not reachable", goose sessions bound to a topic accept no
 // prompts, and unbound goose sessions accept any sender the worker admits.
@@ -682,7 +682,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             }
           : {}),
         // Any inbound action on a session means the user is looking at it, so the
-        // unread badge clears. This is the single boundary every Telegram-originated
+        // unread badge clears. This is the single boundary every chat-originated
         // command crosses -- a typed reply and a question-card callback both arrive
         // here as execute commands -- which is why it lives at dispatch rather than
         // in the reply handler.
@@ -715,7 +715,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             editNotification: (nid, text, rm, entities) => poller!.editNotification(nid, text, rm as { inline_keyboard?: unknown[] }, entities as unknown[] | undefined),
             machineId: config.machineId,
             ...(client ? { opencodeClient: client } : {}),
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
             tagLookup: tagResolver,
             unregisterSession: async (sessionId) => { if (poller) await poller.unregisterSession(sessionId); },
             ...(gooseRunners ? { gooseRunnerFor: (s: SessionRecord) => gooseRunners.get(s) } : {}),
@@ -723,7 +723,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onLaunch: async (msg) => {
-          const reply = createTelegramReplySender(sendTelegramMessage, msg);
+          const reply = createChatReplySender(sendChatMessage, msg);
 
           // Deliberately redundant with the worker's capability gate; see
           // checkLaunchServable. Previously the no-opencodeClient case warned
@@ -777,7 +777,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
               // opens its TUI (honk-9qf.30). Wrapped so autoAttach's optional
               // `spawn` parameter is never handed anything.
               autoAttach: (target) => autoAttach(target),
-              sendTelegramReply: reply,
+              sendChatReply: reply,
             });
             return;
           }
@@ -825,9 +825,9 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             runOcTagsWhich: resolveRunOcTags(INHERIT_WHICH_TIMEOUT_MS),
             // The session registers (and warms its tag cache) before the tag is
             // written, so without this its FIRST notification would show no tag
-            // right after Telegram said the tag had been applied.
+            // right after the chat said the tag had been applied.
             onTagged: (sessionId: string) => tagResolver.refreshNow(sessionId),
-            sendTelegramReply: reply,
+            sendChatReply: reply,
           });
         },
         onKill: async (msg) => {
@@ -845,7 +845,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
             // pigeon-4ogz.20: the same teardown as DELETE /sessions/:id. Nothing else removes the
             // row after a /kill (the plugin's session.deleted handler only clears its own state),
             // so without this the topic stayed open until the orphan closer's 7-day TTL.
@@ -868,7 +868,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
         onCompact: async (msg) => {
@@ -884,7 +884,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             chatId: msg.chatId,
             machineId: config.machineId,
             opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
         onMcpList: async (msg) => {
@@ -895,7 +895,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestMcpListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             directory, machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
         onMcpEnable: async (msg) => {
@@ -906,7 +906,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestMcpEnableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
         onMcpDisable: async (msg) => {
@@ -917,7 +917,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestMcpDisableCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             serverName: msg.serverName, directory, machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
         onModelList: async (msg) => {
@@ -927,7 +927,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestModelListCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             machineId: config.machineId, opencodeClient: client,
-            sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            sendChatReply: createChatReplySender(sendChatMessage, msg),
             allowedProviders: config.allowedProviders,
           });
         },
@@ -938,7 +938,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           await ingestModelSetCommand({
             commandId: msg.commandId, sessionId: msg.sessionId, chatId: msg.chatId,
             model: msg.model, machineId: config.machineId, opencodeClient: client,
-            storage, sendTelegramReply: createTelegramReplySender(sendTelegramMessage, msg),
+            storage, sendChatReply: createChatReplySender(sendChatMessage, msg),
             allowedProviders: config.allowedProviders,
           });
         },
@@ -963,7 +963,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           });
         },
         onTagSetDir: async (msg) => {
-          const sendReply = createTelegramReplySender(sendTelegramMessage, msg);
+          const sendReply = createChatReplySender(sendChatMessage, msg);
           await sendReply(msg.chatId, "/tag dir was removed; tag sessions individually.");
         },
       },

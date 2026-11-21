@@ -7,7 +7,7 @@ import type { StopNotifier } from "../src/notification-service";
 /**
  * True when `s` contains no unpaired UTF-16 surrogate. An unpaired surrogate survives
  * JSON.stringify (which escapes it as a well-formed \\udXXX) but cannot be encoded as
- * UTF-8, so Telegram either rejects the request or mojibakes it to U+FFFD.
+ * UTF-8, so the chat either rejects the request or mojibakes it to U+FFFD.
  */
 function isWellFormedTitle(s: string): boolean {
   for (let i = 0; i < s.length; i++) {
@@ -1373,7 +1373,7 @@ describe("createApp", () => {
 
   it("POST /question-answered clears the unread watermark", async () => {
     // A question answered in the TUI creates NO user text message, so /mirror
-    // never fires and no Telegram command reaches poller.dispatch. This endpoint
+    // never fires and no chat command reaches poller.dispatch. This endpoint
     // is the only signal that the human acted.
     storage = openStorageDb(":memory:");
     const app = createApp(storage, { nowFn: () => 50_000 });

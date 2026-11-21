@@ -244,7 +244,7 @@ const ERROR_EVENTS = new Set(["Error", "Retry"]);
  * Every unnamed case delivers. `Error` and `Retry` arrive on the same POST /stop as `Stop`
  * (see the `Error` and `Retry` calls into `notifyStop` in opencode-plugin/src/index.ts).
  * Under `errors-only`, `Retry` is suppressed because rate-limit retries are transient,
- * self-healing, and have nothing for a human to do (pure noise in Telegram).
+ * self-healing, and have nothing for a human to do (pure noise in the chat).
  * Aborted `Error` events (`errorKind === "aborted"`) are also suppressed under `errors-only`
  * as expected routine stops. Genuine, non-abort errors are delivered.
  *

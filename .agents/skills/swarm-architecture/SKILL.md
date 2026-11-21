@@ -26,7 +26,7 @@ It also gives us durable delivery, retry with backoff, replay via inbox, and an 
 | `packages/daemon/src/swarm/envelope.ts` | `renderEnvelope({fields}, payload)` — produces the `<swarm_message>` XML the LLM sees |
 | `packages/daemon/src/swarm/registry.ts` | `SessionDirectoryRegistry` — caches `sessionId → directory` (5min TTL) |
 | `packages/daemon/src/swarm/arbiter.ts` | `SwarmArbiter` — per-target queue with at-most-one in-flight delivery and retry/backoff |
-| `packages/daemon/src/swarm/telegram-notice.ts` | `enqueueSwarmTelegramNotice()` — helper enqueuing best-effort chat (Slack channel or Telegram topic) outbox notice |
+| `packages/daemon/src/swarm/chat-notice.ts` | `enqueueSwarmChatNotice()` — helper enqueuing a best-effort chat (Slack channel) outbox notice |
 | `packages/daemon/src/swarm/bank-or-insert.ts` | `bankOrInsertSwarmMessage()` — routes swarm inserts to either `pull_inbox` (for opted-in pull sessions) or `swarm_messages` (arbiter delivery) |
 | `packages/daemon/src/app.ts` | `POST /swarm/send`, `POST /swarm/schedule`, `GET /swarm/inbox` route blocks (flat `if`-style, mirrors existing routes) |
 | `packages/daemon/src/index.ts` | Boots arbiter conditionally on `opencodeClient && config.opencodeUrl` |
@@ -594,12 +594,12 @@ The arbiter therefore stats the directory before sending (`swarm/directory-check
 
 ## Chat Mirroring (Telegram topic / Slack channel)
 
-Every swarm IPC message is mirrored to the **receiver's** chat conversation (its Slack session channel, or its Telegram forum topic for a machine rolled back to Telegram; the daemon just enqueues the outbox row and the worker resolves the conversation) so operators can see why a session started working. The helper keeps its Telegram name (`enqueueSwarmTelegramNotice`, `swarm/telegram-notice.ts`) until Telegram is deleted (`pigeon-4ogz.13`).
+Every swarm IPC message is mirrored to the **receiver's** chat conversation (its Slack session channel; the daemon just enqueues the outbox row and the worker resolves the conversation) so operators can see why a session started working. The helper is `enqueueSwarmChatNotice` in `swarm/chat-notice.ts` (renamed from the Telegram-era name, `pigeon-4ogz.13`).
 
 ### Hook Sites & Guarantees
 - **Hooked at insert, not delivery**: Swarm rows route through `bankOrInsertSwarmMessage()` and enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). For banked pull messages, Telegram notices are still enqueued on fresh inserts, but arbiter delivery is skipped. Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.
 - **Why insert-time**: Chosen to survive the on-hold quiet-swarm design under which agent-to-agent rows would never reach `handed_off`. Consequence: a chat post indicates **sent/enqueued**, NOT that the message reached the target session's transcript.
-- **Fault isolation**: The `enqueueSwarmTelegramNotice` helper (`packages/daemon/src/swarm/telegram-notice.ts`) is wrapped in an internal `try/catch`. A chat/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
+- **Fault isolation**: The `enqueueSwarmChatNotice` helper (`packages/daemon/src/swarm/chat-notice.ts`) is wrapped in an internal `try/catch`. A chat/outbox failure MUST NEVER regress or fail swarm IPC, even when called inside `db.transaction`.
 - **Channel broadcasts**: Skipped (`to_session IS NULL` has no topic).
 - **No local session row** (`pigeon-qioa`): enqueued as usual, but the outbox (`gateSwarmOnLocalSession`) holds a `kind='swarm'` entry while its session has no local `sessions` row, re-checking every 15s, and drops it (`no_local_session`) after `SWARM_LOCAL_SESSION_GRACE_MS` (60s). A foreign session never gains a row, so its notice, which would land in the wrong chat, is never posted; a reaped session revived by the message normally re-registers within the grace and still gets its notice (if its serve has not restarted since the reap, the plugin re-registers only at end of turn and the notice may be dropped).
 

@@ -516,7 +516,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
   });
 });
 
-describe("Task A3: notify=false goose-acp rows stay off Telegram", () => {
+describe("Task A3: notify=false goose-acp rows stay off the chat", () => {
   let storage: StorageDb | null = null;
 
   afterEach(() => {

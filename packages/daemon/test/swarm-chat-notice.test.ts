@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { pagesFrom } from "./transcript-pages";
 import {
-  enqueueSwarmTelegramNotice,
+  enqueueSwarmChatNotice,
   enqueueSwarmCancelNotice,
-} from "../src/swarm/telegram-notice";
+} from "../src/swarm/chat-notice";
 import type { StorageDb } from "../src/storage/database";
 import { openStorageDb } from "../src/storage/database";
 import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
@@ -86,13 +86,13 @@ function mockStorage(opts: {
   return { storage, upsertCalls };
 }
 
-describe("enqueueSwarmTelegramNotice", () => {
+describe("enqueueSwarmChatNotice", () => {
   it("enqueues exactly one row addressed to the receiver with kind: swarm and threaded: true", () => {
     const { storage, upsertCalls } = mockStorage();
     const record = makeRecord();
     const now = 1786363205000;
 
-    enqueueSwarmTelegramNotice(storage, record, now);
+    enqueueSwarmChatNotice(storage, record, now);
 
     expect(upsertCalls).toHaveLength(1);
     const call = upsertCalls[0]!;
@@ -118,7 +118,7 @@ describe("enqueueSwarmTelegramNotice", () => {
     const { storage, upsertCalls } = mockStorage();
     const record = makeRecord({ toSession: null, channel: "broadcast-channel" });
 
-    enqueueSwarmTelegramNotice(storage, record, Date.now());
+    enqueueSwarmChatNotice(storage, record, Date.now());
 
     expect(upsertCalls).toHaveLength(0);
   });
@@ -130,7 +130,7 @@ describe("enqueueSwarmTelegramNotice", () => {
       const record = makeRecord();
 
       expect(() => {
-        enqueueSwarmTelegramNotice(storage, record, Date.now());
+        enqueueSwarmChatNotice(storage, record, Date.now());
       }).not.toThrow();
 
       expect(consoleSpy).toHaveBeenCalled();
@@ -144,7 +144,7 @@ describe("enqueueSwarmTelegramNotice", () => {
     const record = makeRecord({ payload: "bad surrogate \uD83D here" });
     const now = 1786363205000;
 
-    enqueueSwarmTelegramNotice(storage, record, now);
+    enqueueSwarmChatNotice(storage, record, now);
 
     expect(upsertCalls).toHaveLength(1);
     const payload = JSON.parse(upsertCalls[0]!.input.payload);
@@ -160,7 +160,7 @@ describe("swarm notices respect a declared-quiet receiver", () => {
 
   it("suppresses the notice when the receiver is declared quiet", () => {
     const { storage, upsertCalls } = mockStorage({ originRow: QUIET_ROW });
-    enqueueSwarmTelegramNotice(storage, makeRecord(), 1786363205000);
+    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
     expect(upsertCalls).toHaveLength(0);
   });
 
@@ -168,7 +168,7 @@ describe("swarm notices respect a declared-quiet receiver", () => {
     const { storage, upsertCalls } = mockStorage({
       originRow: { notifyPolicy: "all", source: "declared", createdAt: 1786363200000 },
     });
-    enqueueSwarmTelegramNotice(storage, makeRecord(), 1786363205000);
+    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
     expect(upsertCalls).toHaveLength(1);
   });
 
@@ -239,7 +239,7 @@ describe("enqueueSwarmCancelNotice", () => {
 });
 
 describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)", () => {
-  it("notifySenderOfFailure enqueues a Telegram notice to original sender in outbox", () => {
+  it("notifySenderOfFailure enqueues a chat notice to original sender in outbox", () => {
     const storage = openStorageDb(":memory:");
     try {
       const failedRecord = makeRecord({
@@ -295,7 +295,7 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
       const row = storage.db.prepare("SELECT msg_id FROM swarm_messages WHERE from_session = 'pigeon'").get();
       expect(row).toBeUndefined();
 
-      // Telegram notice enqueued
+      // Chat notice enqueued
       const outboxRow = storage.outbox.getByNotificationId(`w:${claimed[0]!.msgId}`);
       expect(outboxRow).not.toBeNull();
       expect(outboxRow!.sessionId).toBe("ses_sender_pull");
@@ -304,7 +304,7 @@ describe("pigeon internal swarm inserts (notifySenderOfFailure & watchdog nudge)
     }
   });
 
-  it("DeliveryWatchdog nudge enqueues a Telegram notice to target session in outbox", async () => {
+  it("DeliveryWatchdog nudge enqueues a chat notice to target session in outbox", async () => {
     const storage = openStorageDb(":memory:");
     try {
       const now = 100_000;

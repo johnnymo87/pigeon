@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { QuestionInfoData } from "./storage/types";
-import { splitTelegramMessage } from "./split-message";
-import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-message";
+import { splitChatMessage } from "./split-message";
+import { ChatMessageBuilder, type ChatEntity, type ChatMessage } from "./chat-message";
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
 /**
@@ -39,7 +39,7 @@ interface NotificationInput {
  */
 const MAX_TAG_CHARS = 64;
 
-function appendTag(b: TgMessageBuilder, tag: string | null | undefined): void {
+function appendTag(b: ChatMessageBuilder, tag: string | null | undefined): void {
   const t = tag?.trim();
   if (!t) return;
   b.append(` · 🏷 ${t.length > MAX_TAG_CHARS ? `${t.slice(0, MAX_TAG_CHARS - 1)}…` : t}`);
@@ -107,24 +107,24 @@ export interface PlainAlertOptions {
 }
 
 /**
- * Telegram answered with a non-2xx status. Carries the status so a caller can
- * tell "Telegram rejected this payload" (400 — safe to resend a corrected
+ * The chat answered with a non-2xx status. Carries the status so a caller can
+ * tell "the chat rejected this payload" (400 — safe to resend a corrected
  * payload, nothing was posted) from "unknown outcome" (timeouts, 5xx).
  */
-export class TelegramSendError extends Error {
+export class ChatSendError extends Error {
   constructor(
     public readonly status: number,
     message: string,
-    /** Telegram's `description`, when the error body carried one. */
+    /** The chat's `description`, when the error body carried one. */
     public readonly description?: string,
     /**
      * The worker's `errorClass` for a Slack rejection (`conversation_gone`, `rejected_format`,
-     * ...; pigeon-4ogz.5). Absent for Telegram.
+     * ...; pigeon-4ogz.5). Absent for any other failure.
      */
     public readonly errorClass?: string,
   ) {
     super(description ? `${message}: ${description}` : message);
-    this.name = "TelegramSendError";
+    this.name = "ChatSendError";
   }
 }
 
@@ -143,21 +143,21 @@ function eventEmoji(event: string): string {
   return EVENT_EMOJIS[event] ?? "🤖";
 }
 
-export function formatTelegramNotification(input: NotificationInput): {
-  header: TgMessage;
-  body: TgMessage;
-  footer: TgMessage;
+export function formatChatNotification(input: NotificationInput): {
+  header: ChatMessage;
+  body: ChatMessage;
+  footer: ChatMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
 
-  const headerBuilder = new TgMessageBuilder()
+  const headerBuilder = new ChatMessageBuilder()
     .append(`${eventEmoji(input.event)} `)
     .append(input.label);
 
-  const bodyBuilder = new TgMessageBuilder().append(input.summary);
+  const bodyBuilder = new ChatMessageBuilder().append(input.summary);
 
-  const footerBuilder = new TgMessageBuilder()
+  const footerBuilder = new ChatMessageBuilder()
     .append("📂 ")
     .appendCode(cwdShort);
   if (input.machineId) {
@@ -210,9 +210,9 @@ export interface FormatSwarmNotificationInput {
 }
 
 export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
-  header: TgMessage;
-  body: TgMessage;
-  footer: TgMessage;
+  header: ChatMessage;
+  body: ChatMessage;
+  footer: ChatMessage;
 } {
   // The event time is required, not decoration. Task 1's arbitration allows a conversational row (question/stop)
   // to preempt a backlogged swarm post within the same session, so a swarm post can arrive below a later
@@ -220,7 +220,7 @@ export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
   // the order legible.
   const now = input.now ?? Date.now();
   const createdAtTime = formatEventTime(input.createdAt, now);
-  const headerBuilder = new TgMessageBuilder()
+  const headerBuilder = new ChatMessageBuilder()
     .append(`📨 swarm · ${input.kind} · ${input.priority}`)
     .newline()
     .append(`from ${input.fromLabel} · ${createdAtTime}`);
@@ -230,9 +230,9 @@ export function formatSwarmNotification(input: FormatSwarmNotificationInput): {
     headerBuilder.append(` · ⏰ scheduled ${deliverAtTime}`);
   }
 
-  const bodyBuilder = new TgMessageBuilder().append(input.payload);
+  const bodyBuilder = new ChatMessageBuilder().append(input.payload);
 
-  const footerBuilder = new TgMessageBuilder()
+  const footerBuilder = new ChatMessageBuilder()
     .append("🆔 ")
     .appendCode(input.toSessionId)
     .append(" · ")
@@ -251,17 +251,17 @@ export interface FormatSwarmCancelNotificationInput {
 }
 
 export function formatSwarmCancelNotification(input: FormatSwarmCancelNotificationInput): {
-  header: TgMessage;
-  body: TgMessage;
-  footer: TgMessage;
+  header: ChatMessage;
+  body: ChatMessage;
+  footer: ChatMessage;
 } {
-  const headerBuilder = new TgMessageBuilder()
+  const headerBuilder = new ChatMessageBuilder()
     .append("🚫 cancelled ")
     .appendCode(input.msgId);
 
-  const bodyBuilder = new TgMessageBuilder();
+  const bodyBuilder = new ChatMessageBuilder();
 
-  const footerBuilder = new TgMessageBuilder()
+  const footerBuilder = new ChatMessageBuilder()
     .append("🆔 ")
     .appendCode(input.toSessionId);
 
@@ -281,14 +281,14 @@ export function formatQuestionNotification(input: {
   machineId?: string;
   tag?: string | null;
 }): {
-  message: TgMessage;
+  message: ChatMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
   const firstQuestion = input.questions[0];
   const isMulti = input.questions.length > 1;
 
-  const b = new TgMessageBuilder()
+  const b = new ChatMessageBuilder()
     .append("❓ ")
     .appendBold("Question")
     .append(`: ${input.label}`)
@@ -355,14 +355,14 @@ export function formatQuestionWizardStep(input: {
   machineId?: string;
   tag?: string | null;
 }): {
-  message: TgMessage;
+  message: ChatMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
   const totalSteps = input.questions.length;
   const currentQuestion = input.questions[input.currentStep]!;
   const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
 
-  const b = new TgMessageBuilder()
+  const b = new ChatMessageBuilder()
     .append("❓ ")
     .appendBold(`Question ${input.currentStep + 1} of ${totalSteps}`)
     .append(`: ${input.label}`)

@@ -985,14 +985,14 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
 
   it("drops rich after a second failed rich attempt, so a persistent upstream 5xx cannot cost the notification", async () => {
     seed([{ text: "only" }]);
-    const telegram5xx = {
+    const provider5xx = {
       ok: false,
       kind: "http_error",
       status: 502,
       body: { error: "Telegram API error", details: { ok: false, error_code: 500 } },
     };
     let now = 5_000;
-    const sendFn = vi.fn().mockResolvedValue(telegram5xx);
+    const sendFn = vi.fn().mockResolvedValue(provider5xx);
     const sender = new OutboxSender({ storage, sendNotification: sendFn as unknown as SendNotificationFn, nowFn: () => now });
 
     await sender.processOnce();
@@ -1293,7 +1293,7 @@ describe("OutboxSender start/stop", () => {
     const sendNotification = vi.fn().mockImplementation(async () => {
       sendCount++;
       if (sendCount === 1) {
-        // Exactly what the worker returns when Telegram rate-limits the group:
+        // Exactly what the worker returns when the chat rate-limits the group:
         // HTTP 429 with a JSON body carrying retryAfter. See packages/worker/src/notifications.ts.
         return {
           ok: false,
@@ -1655,8 +1655,8 @@ describe("classified delivery failure actions", () => {
     expect(storage.outbox.getByNotificationId("notif-1")!.attempts).toBe(2);
 
     // Attempt 2: STILL retrying. A 403 reflects worker config (ALLOWED_CHAT_IDS), not the
-    // message, and never reaches Telegram (rejected at notifications.ts:202, before
-    // createTelegramClient at :248), so it costs none of the shared 20/min group budget.
+    // message, and never reaches the chat (rejected by the worker before any provider
+    // call), so it costs none of the shared send budget.
     // Killing it early would only convert a recoverable misconfiguration into permanent loss.
     now += 12_000;
     await sender.processOnce();
@@ -1729,8 +1729,8 @@ describe("classified delivery failure actions", () => {
         sessionId: "sess-1",
         attempts: 1,
         nextRetryIn: 5000,
-        telegramErrorCode: 400,
-        telegramErrorDescription: "invalid_blocks",
+        errorCode: 400,
+        errorDescription: "invalid_blocks",
       }),
     );
   });
@@ -3006,7 +3006,7 @@ describe("OutboxSender ledger append (unread substrate)", () => {
   });
 
   // The whole correctness argument for the ledger: a row exists only because
-  // Telegram accepted the message. If delivery failed, there must be nothing.
+  // the chat accepted the message. If delivery failed, there must be nothing.
   it("records nothing when delivery fails", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
     const sender = new OutboxSender({
@@ -3961,7 +3961,7 @@ describe("topic hold window (pigeon-iqpd)", () => {
     const sendCalls: SendNotificationInput[] = [];
     const sendNotification = vi.fn().mockImplementation(async (input: SendNotificationInput) => {
       sendCalls.push(input);
-      // Simulate 57s Telegram call latency inside each send
+      // Simulate 57s chat call latency inside each send
       currentTime += 57_000;
       if (input.onTopicUnavailable === "general") {
         return { ok: true, kind: "success", status: 200, body: {} };

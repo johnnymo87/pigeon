@@ -6,7 +6,7 @@ import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
-import { PLAIN_ALERT_TIMEOUT_MS, TelegramSendError, type StopNotifier } from "./notification-service";
+import { PLAIN_ALERT_TIMEOUT_MS, ChatSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
 import {
   DEFAULT_TOPIC_RESOLVE_TIMEOUT_MS,
@@ -14,8 +14,8 @@ import {
   resolveAlertTopic,
   type NamedTopicResolver,
 } from "./alert-topic";
-import { generateToken, formatTelegramNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
-import { splitTelegramMessage } from "./split-message";
+import { generateToken, formatChatNotification, formatQuestionNotification, formatQuestionWizardStep, displayName } from "./notification-service";
+import { splitChatMessage } from "./split-message";
 import { ALLOWED_PULL_SOURCES, type QuestionInfoData } from "./storage/types";
 import { IngressRouter, NoHealthyServeError, LeaseContendedError } from "./routing/router";
 import { checkAuth } from "./auth";
@@ -28,12 +28,12 @@ export { parseTitle };
 import { decideNotify, resolveEffectivePolicy, type NotifyDecision } from "./notify-policy";
 import { shouldEmitAncillaryFor } from "./ancillary-gate";
 import { parseStopMedia } from "./outbound-media";
-import { enqueueSwarmTelegramNotice, enqueueSwarmCancelNotice } from "./swarm/telegram-notice";
+import { enqueueSwarmChatNotice, enqueueSwarmCancelNotice } from "./swarm/chat-notice";
 import { bankOrInsertSwarmMessage } from "./swarm/bank-or-insert";
 import { shouldAllowRemoteGooseTarget } from "./swarm/remote-goose-target";
 import type { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import { hashPrompt } from "./hash-prompt";
-import { TgMessageBuilder } from "./telegram-message";
+import { ChatMessageBuilder } from "./chat-message";
 import { buildRichMarkdown } from "./rich-markdown";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
@@ -377,7 +377,7 @@ export const REMOTE_SESSIONS_TIMEOUT_MS = 5_000;
 
 /**
  * Bound on binding and unbinding named topics. Distinct from the 3s alert topic budget
- * because the worker may make 1-2 Telegram calls (reopen hourly, create on first use).
+ * because the worker may make 1-2 chat calls (reopen hourly, create on first use).
  */
 export const BIND_TIMEOUT_MS = 8_000;
 
@@ -385,7 +385,7 @@ type BindOutcome = { bound: true } | { bound: false; error: string };
 
 /**
  * Floor on the send bound for a links-bearing `/alert`, so a lookup that ate
- * most of the budget still leaves Telegram a real chance to answer.
+ * most of the budget still leaves the chat a real chance to answer.
  */
 const ALERT_MIN_SEND_MS = 1_000;
 
@@ -503,7 +503,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // enqueue and render), so it is safe to trust.
     //
     // This also closes a latent mirror leak: such a turn previously posted to
-    // Telegram as a 🧑 human message. Pinned by the "neither clears nor mirrors an
+    // the chat as a 🧑 human message. Pinned by the "neither clears nor mirrors an
     // enveloped turn" test.
     //
     // Residual: a human who pastes a literal close tag into a prompt gets neither
@@ -519,7 +519,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // injected turn begins somewhere just as surely as a typed one.
     //
     // The cost of conflating them was measured on the live daemon: opencode-launch
-    // records its own launch prompt as injected, sendPrompt records every Telegram
+    // records its own launch prompt as injected, sendPrompt records every chat
     // reply, and swarm messages carry an envelope -- so a headless worker's every
     // turn was excluded and it could never be jumped to at all. 155 of 239 sessions
     // with unread had no anchor, and the largest single group were sessions whose
@@ -550,7 +550,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // SAY WHAT THIS ACTUALLY ESTABLISHES, which is provenance, not presence.
     // It is tempting to write "a human typed this into the TUI"; ancillary-gate.ts
     // refutes that in terms, and it is the same trap that let lgtm's launch prompt
-    // mirror into Telegram: /mirror sees any user-role message absent from
+    // mirror into the chat: /mirror sees any user-role message absent from
     // injected_prompts, and a session started outside the daemon (opencode-launch,
     // `opencode run`, a peer driving the serve API) produces exactly that.
     // Residual, accepted: such a turn clears a badge no human saw. It is bounded
@@ -561,19 +561,19 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // PLACEMENT IS LOAD-BEARING, in both directions:
     //  - BELOW the early-return above, or injected prompts would clear.
     //  - ABOVE shouldEmitAncillaryFor, or a session with notify-policy
-    //    'none'/'errors-only' would never clear. Badge state and Telegram delivery
+    //    'none'/'errors-only' would never clear. Badge state and the chat delivery
     //    policy are unrelated concerns and must not be coupled.
     // Both directions are pinned by tests in mirror-route.test.ts.
     //
-    // The Telegram half of this behaviour is NOT here -- it lives at
+    // The chat half of this behaviour is NOT here -- it lives at
     // poller.dispatch (#125), which fires for every DISPATCHABLE command before its
     // handler runs (unknown command types return earlier without clearing, so
-    // version skew does not clear). Do not add a second Telegram clear here.
+    // version skew does not clear). Do not add a second chat clear here.
     storage.sessionEvents.markAllRead(sessionId, now);
 
     // A session declared quiet (lgtm's automated reviews) must not mirror its
     // prompts. Without this, lgtm's own launch prompt -- a user-role message the
-    // daemon never injected and so never suppressed -- posts into Telegram AND
+    // daemon never injected and so never suppressed -- posts into the chat AND
     // creates the topic, defeating the Stop suppression it sits beside.
     if (!shouldEmitAncillaryFor(storage, sessionId, now)) {
       console.log(`[mirror] quieted sessionId=${sessionId} reason=origin`);
@@ -592,11 +592,11 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       sessionId,
     });
 
-    const header = new TgMessageBuilder().append(`🧑 ${label}`).build();
-    const bodyMsg = new TgMessageBuilder().append(text).build();
-    const footer = new TgMessageBuilder().build();
+    const header = new ChatMessageBuilder().append(`🧑 ${label}`).build();
+    const bodyMsg = new ChatMessageBuilder().append(text).build();
+    const footer = new ChatMessageBuilder().build();
 
-    const chunks = splitTelegramMessage(header, bodyMsg, footer);
+    const chunks = splitChatMessage(header, bodyMsg, footer);
     const notificationId = `m:${sessionId}:${messageId}`;
     const notificationPayload = {
       messages: chunks.map((c) => ({ text: c.text, entities: c.entities })),
@@ -726,7 +726,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     }, now);
 
     // Format notification for the outbox
-    const notification = formatTelegramNotification({
+    const notification = formatChatNotification({
       event,
       tag: opts.tagLookup?.get(sessionId) ?? null,
       label: displayName({ title: effectiveTitle, label: label || session.label, boundTopicKey: session.boundTopicKey, sessionId }),
@@ -737,8 +737,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       sessionId,
     });
 
-    const chunks = splitTelegramMessage(notification.header, notification.body, notification.footer);
-    // A body with a pipe table also gets the whole notification as Telegram rich markdown
+    const chunks = splitChatMessage(notification.header, notification.body, notification.footer);
+    // A body with a pipe table also gets the whole notification as rich markdown
     // (pigeon-p909). The plain chunks stay: they are the worker's fallback, and what a worker
     // that predates rich sends. Stop notifications carry no buttons, so the single rich
     // message loses nothing the last plain chunk would have carried.
@@ -798,7 +798,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       // Precedence MUST match what the notification actually renders, a few
       // lines above: `message || summary || "Task completed"`. An excerpt that
       // disagrees would make the drill-down show different text than the
-      // Telegram message it refers to.
+      // chat message it refers to.
       excerpt: excerptOf(message || summary || "Task completed"),
       afterNotificationId,
     }, now);
@@ -884,7 +884,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           }
         }
 
-        // Fallback ladder. Only a Telegram 400 is retried: it means nothing was
+        // Fallback ladder. Only a chat 400 is retried: it means nothing was
         // posted. A timeout or 5xx has an unknown outcome and is NOT retried, to
         // avoid a duplicate post. Rungs: recreate a deleted topic once; drop the
         // buttons; move to General (buttons restored); drop the buttons again.
@@ -909,7 +909,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               });
               break;
             } catch (err) {
-              if (!(err instanceof TelegramSendError && err.status === 400)) throw err;
+              if (!(err instanceof ChatSendError && err.status === 400)) throw err;
               // Every provider rejection the worker relays carries an errorClass.
               const gone = err.errorClass === "conversation_gone";
               if (thread !== undefined && !recreated && gone) {
@@ -931,7 +931,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 thread = again?.messageThreadId;
                 topicChat = slackChat(again);
               } else if (replyMarkup) {
-                console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
+                console.warn(`[alert] the chat rejected the alert with buttons (${err.message}); resending without them`);
                 replyMarkup = undefined;
               } else if (thread !== undefined) {
                 if (strict) {
@@ -941,7 +941,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 // The buttons were already dropped and it still failed, so the
                 // topic is the likelier culprit: try General WITH the buttons
                 // again before giving them up for good.
-                console.warn(`[alert] Telegram rejected the alert in its topic (${err.message}); posting to General`);
+                console.warn(`[alert] the chat rejected the alert in its topic (${err.message}); posting to General`);
                 thread = undefined;
                 replyMarkup = keyboard;
               } else {
@@ -1592,7 +1592,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Every episode of an unattended pull client re-registers, so this is what turns
         // swarm banking off when the client stops advertising it (switched off, or rolled
         // back to a version that does not know the field).
-        // Note: pull_sources gates ONLY swarm banking. Telegram-reply banking stays active
+        // Note: pull_sources gates ONLY swarm banking. chat-reply (`telegram-reply` source) banking stays active
         // as today regardless of whether it is listed in pull_sources.
         storage.sessions.setPullSources(sessionId, pullSourcesToSet, nowFn());
 
@@ -1854,7 +1854,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
        * that something. `/launch` will replace the CALLER, not this route.
        *
        * `notify` is forced true rather than defaulted: a goose session exists
-       * only to be driven from Telegram, and with notify=false the /stop route
+       * only to be driven from the chat, and with notify=false the /stop route
        * returns early and the human never hears the turn finish -- which looks
        * exactly like a broken adapter.
        */
@@ -2220,7 +2220,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           );
         }
 
-        // Generate token for Telegram inline buttons
+        // Generate token for the question's inline buttons
         const token = generateToken();
 
         // Store pending question
@@ -2343,7 +2343,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         // Resolving a question is evidence of presence -- and for one resolved in the
         // TUI this is the ONLY such signal: it creates no user text message, so
-        // /mirror never fires, and no Telegram command reaches poller.dispatch.
+        // /mirror never fires, and no chat command reaches poller.dispatch.
         // Without this, a question notification's badge survives an unambiguous act at
         // the keyboard.
         //
@@ -2353,10 +2353,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // Known residual: opencode exposes HTTP question reply/reject routes, so an
         // external caller could resolve a question with no human involved. Verified at
         // time of writing that no pigeon tooling does this (none of the five swarm
-        // tools reference questions); the only repliers are the Telegram paths, which
+        // tools reference questions); the only repliers are the chat paths, which
         // poller.dispatch already covers.
         //
-        // A question resolved in Telegram therefore clears TWICE: once at
+        // A question resolved in the chat therefore clears TWICE: once at
         // poller.dispatch (#125), once here. Harmless -- but NOT because markAllRead is
         // monotone. Monotonicity makes the pair order-insensitive; it says nothing
         // about time, and markAllRead advances to MAX(id) AT CALL TIME, so anything

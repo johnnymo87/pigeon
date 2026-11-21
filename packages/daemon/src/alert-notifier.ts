@@ -14,7 +14,7 @@
  * worker") is recorded, so a broken worker is reported even while every alert still lands.
  *
  * Three behaviours per worker answer (`WorkerSendOutcome`): sent -> done; the provider said no
- * (400/429 relayed in a 200) -> throw `TelegramSendError`, NO fallback, because the direct
+ * (400/429 relayed in a 200) -> throw `ChatSendError`, NO fallback, because the direct
  * path would get the same verdict and the `/alert` ladder (app.ts) keys on the 400; worker
  * failed -> fall back.
  *
@@ -28,7 +28,7 @@
 
 import {
   PLAIN_ALERT_TIMEOUT_MS,
-  TelegramSendError,
+  ChatSendError,
   type AlertSeverity,
   type PlainAlertOptions,
   type StopNotifier,
@@ -137,10 +137,10 @@ class AlertNotifier {
       this.workerOnlyOutageReported = false;
       return;
     }
-    if (outcome.kind === "telegram_rejected") {
-      throw new TelegramSendError(
+    if (outcome.kind === "chat_rejected") {
+      throw new ChatSendError(
         outcome.status,
-        `Telegram sendMessage returned ${outcome.status} (via worker)`,
+        `chat send returned ${outcome.status} (via worker)`,
         outcome.description,
         outcome.errorClass,
       );
@@ -154,7 +154,7 @@ class AlertNotifier {
     // nothing about the worker: it may simply not have had time. A definite answer still
     // counts, however short the budget.
     const starved = workerBudget < WORKER_LEG_MS;
-    const indefinite = outcome.key === "timeout" || outcome.cause === "telegram_unreachable";
+    const indefinite = outcome.key === "timeout" || outcome.cause === "chat_unreachable";
     if (!(starved && indefinite)) this.noteWorkerFailure(outcome, Boolean(direct));
     if (!direct) {
       throw new Error(`worker /messages/send failed: ${outcome.reason}`);
@@ -196,7 +196,7 @@ class AlertNotifier {
         ? `Worker POST /messages/send failed${where} (${outcome.reason}) and this host has no direct ` +
           `${chat} path, so operational alerts and slash-command replies were not getting out. ` +
           `Reported once per outage.`
-        : outcome.cause === "telegram_unreachable"
+        : outcome.cause === "chat_unreachable"
           ? `The worker could not get a reply from ${chat} in time for an alert${where} ` +
             `(${outcome.reason}), so it was re-sent direct and may appear twice. The worker itself ` +
             `is probably fine; slash-command replies wait longer and are probably landing. ` +

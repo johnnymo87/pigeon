@@ -170,7 +170,7 @@ describe("pull routes", () => {
       expect(body.messages[1]!.in_reply_to_quote).toBeNull();
     });
 
-    it("returns kind and reply_to (null for telegram rows, values for swarm rows)", async () => {
+    it("returns kind and reply_to (null for chat rows, values for swarm rows)", async () => {
       const { app, storage: s } = newApp();
       s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
       bank(s, "tg1", 2_000);
@@ -198,10 +198,10 @@ describe("pull routes", () => {
         }>;
       };
 
-      const tgMsg = body.messages.find((m) => m.msg_id === "tg1")!;
-      expect(tgMsg.source).toBe("telegram-reply");
-      expect(tgMsg.kind).toBeNull();
-      expect(tgMsg.reply_to).toBeNull();
+      const chatMsg = body.messages.find((m) => m.msg_id === "tg1")!;
+      expect(chatMsg.source).toBe("telegram-reply");
+      expect(chatMsg.kind).toBeNull();
+      expect(chatMsg.reply_to).toBeNull();
 
       const swMsg = body.messages.find((m) => m.msg_id === "sw1")!;
       expect(swMsg.source).toBe("swarm");
@@ -217,7 +217,7 @@ describe("pull routes", () => {
         { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "swarm early" },
         1_000,
       );
-      // telegram reply arrived later
+      // chat reply arrived later
       bank(s, "tg1", 2_000);
 
       const res = await post(app, "/pull/drain", { session_id: "ses_pull", limit: 1 });

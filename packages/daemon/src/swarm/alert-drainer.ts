@@ -44,7 +44,7 @@ export class AlertDrainer {
   private processing = false;
   private hasLoggedBacklog = false;
   /**
-   * Alerts whose Telegram send SUCCEEDED but whose `markSent` then failed.
+   * Alerts whose chat send SUCCEEDED but whose `markSent` then failed.
    *
    * Deliberately the one piece of in-memory state here, and deliberately NOT a
    * DB column: recording "sent" is precisely the write that just failed, so

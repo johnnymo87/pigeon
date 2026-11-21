@@ -213,7 +213,7 @@ export class MessageTail {
    *
    * Both of those matter, and the reason is the same hazard. If a role entry is evicted while a
    * part for it can still arrive, onPartUpdated takes its `roleInfo === undefined` branch, treats
-   * the part as USER text, and flushes assistant output into Telegram as if the user typed it —
+   * the part as USER text, and flushes assistant output into the chat as if the user typed it —
    * the worst outcome in this codebase, and the exact leak the buffer-cancel above guards.
    *
    * An earlier version of this evicted in creation order and claimed that was safe because the

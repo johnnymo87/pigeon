@@ -228,7 +228,7 @@ describe("startup (src/index.ts) ignores leftover TELEGRAM_* variables", () => {
     expect(out).toContain("alert delivery: worker+direct-fallback");
   }, 60_000);
 
-  it("a launch receiver is capable with just the Slack webhook (no Telegram, no chat id)", async () => {
+  it("a launch receiver is capable with just the Slack webhook (no chat, no chat id)", async () => {
     const out = await boot(
       {
         CCR_WORKER_URL: "http://127.0.0.1:9",

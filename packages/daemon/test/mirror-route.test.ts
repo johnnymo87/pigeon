@@ -301,7 +301,7 @@ describe("POST /mirror route", () => {
     // REGRESSION. Production, 2026-08-11: lgtm's automated reviews had their Stop
     // correctly suppressed by session_origin, but still mirrored their own launch
     // prompt -- 16 mirror rows against 1 stop row for the quiet population. Because a
-    // Telegram topic is created by a session's FIRST notification, each of those also
+    // channel is created by a session's FIRST notification, each of those also
     // created a topic, so the user saw a new forum topic per automated PR review.
     //
     // The mirror fires for a HEADLESS session because /mirror's real predicate is
@@ -455,7 +455,7 @@ describe("POST /mirror route", () => {
 
     it("clears for a quiet-origin session even though it does not mirror", async () => {
       // PLACEMENT GUARD. Fails if markAllRead drifts BELOW shouldEmitAncillaryFor.
-      // Badge state and Telegram delivery policy are unrelated concerns.
+      // Badge state and the chat delivery policy are unrelated concerns.
       const app = newApp();
       storage!.sessions.upsert({ sessionId: "ses_lgtm", notify: true }, 1_000);
       storage!.sessionOrigins.record(

@@ -1,19 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { splitTelegramMessage } from "../src/split-message";
-import type { TgMessage } from "../src/telegram-message";
+import { splitChatMessage } from "../src/split-message";
+import type { ChatMessage } from "../src/chat-message";
 
-describe("splitTelegramMessage", () => {
-  const header: TgMessage = {
+describe("splitChatMessage", () => {
+  const header: ChatMessage = {
     text: "HEADER",
     entities: [{ offset: 0, length: 6, type: "bold" }],
   };
-  const footer: TgMessage = {
+  const footer: ChatMessage = {
     text: "FOOTER",
     entities: [{ offset: 0, length: 6, type: "code" }],
   };
-  const plainHeader: TgMessage = { text: "HEADER", entities: [] };
-  const plainFooter: TgMessage = { text: "FOOTER", entities: [] };
-  const plainBody = (text: string): TgMessage => ({ text, entities: [] });
+  const plainHeader: ChatMessage = { text: "HEADER", entities: [] };
+  const plainFooter: ChatMessage = { text: "FOOTER", entities: [] };
+  const plainBody = (text: string): ChatMessage => ({ text, entities: [] });
 
   function hasLoneSurrogate(str: string): boolean {
     for (let i = 0; i < str.length; i++) {
@@ -31,7 +31,7 @@ describe("splitTelegramMessage", () => {
   }
 
   it("returns single message when body fits", () => {
-    const result = splitTelegramMessage(plainHeader, plainBody("Short body"), plainFooter, 100);
+    const result = splitChatMessage(plainHeader, plainBody("Short body"), plainFooter, 100);
     expect(result).toHaveLength(1);
     expect(result[0]!.text).toBe("HEADER\n\nShort body\n\nFOOTER");
     expect(result[0]!.entities).toHaveLength(0);
@@ -39,7 +39,7 @@ describe("splitTelegramMessage", () => {
 
   it("adjusts header and footer entity offsets in combined message", () => {
     const body = plainBody("hello");
-    const result = splitTelegramMessage(header, body, footer, 100);
+    const result = splitChatMessage(header, body, footer, 100);
     expect(result).toHaveLength(1);
     expect(result[0]!.text).toBe("HEADER\n\nhello\n\nFOOTER");
     // header bold: offset 0, length 6
@@ -53,7 +53,7 @@ describe("splitTelegramMessage", () => {
   it("splits on paragraph boundary and duplicates header/footer entities", () => {
     const body = plainBody("Paragraph one.\n\nParagraph two.");
     // overhead = 6 + 6 + 4 = 16, maxBody = 30 - 16 = 14
-    const result = splitTelegramMessage(header, body, footer, 30);
+    const result = splitChatMessage(header, body, footer, 30);
     expect(result).toHaveLength(2);
     expect(result[0]!.text).toContain("Paragraph one.");
     expect(result[1]!.text).toContain("Paragraph two.");
@@ -64,7 +64,7 @@ describe("splitTelegramMessage", () => {
 
   it("splits on line boundary when no paragraph break fits", () => {
     const body = plainBody("Line one.\nLine two.");
-    const result = splitTelegramMessage(plainHeader, body, plainFooter, 26);
+    const result = splitChatMessage(plainHeader, body, plainFooter, 26);
     expect(result).toHaveLength(2);
     expect(result[0]!.text).toContain("Line one.");
     expect(result[1]!.text).toContain("Line two.");
@@ -72,7 +72,7 @@ describe("splitTelegramMessage", () => {
 
   it("splits on sentence boundary when no line break fits", () => {
     const body = plainBody("First sentence. Second sentence.");
-    const result = splitTelegramMessage(plainHeader, body, plainFooter, 32);
+    const result = splitChatMessage(plainHeader, body, plainFooter, 32);
     expect(result).toHaveLength(2);
     expect(result[0]!.text).toContain("First sentence.");
     expect(result[1]!.text).toContain("Second sentence.");
@@ -80,7 +80,7 @@ describe("splitTelegramMessage", () => {
 
   it("hard-cuts when no natural boundary found", () => {
     const body = plainBody("x".repeat(100));
-    const result = splitTelegramMessage(plainHeader, body, plainFooter, 50);
+    const result = splitChatMessage(plainHeader, body, plainFooter, 50);
     expect(result.length).toBeGreaterThan(1);
     for (const chunk of result) {
       expect(chunk.text.length).toBeLessThanOrEqual(50);
@@ -89,22 +89,22 @@ describe("splitTelegramMessage", () => {
 
   it("uses 4096 as default maxLen", () => {
     const body = plainBody("x".repeat(4000));
-    const result = splitTelegramMessage(plainHeader, body, plainFooter);
+    const result = splitChatMessage(plainHeader, body, plainFooter);
     expect(result).toHaveLength(1);
   });
 
   it("handles empty body", () => {
-    const result = splitTelegramMessage(plainHeader, plainBody(""), plainFooter, 100);
+    const result = splitChatMessage(plainHeader, plainBody(""), plainFooter, 100);
     expect(result).toHaveLength(1);
     expect(result[0]!.text).toBe("HEADER\n\nFOOTER");
   });
 
   it("preserves body entities within a single chunk", () => {
-    const body: TgMessage = {
+    const body: ChatMessage = {
       text: "plain then code_thing plain",
       entities: [{ offset: 11, length: 10, type: "code" }],
     };
-    const result = splitTelegramMessage(plainHeader, body, plainFooter, 200);
+    const result = splitChatMessage(plainHeader, body, plainFooter, 200);
     expect(result).toHaveLength(1);
     // body entity offset shifts by header + "\n\n" = 8
     expect(result[0]!.entities).toEqual([
@@ -117,7 +117,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("H".repeat(4200));
       const body = plainBody("B".repeat(500));
       const footer = plainBody("F".repeat(10));
-      const result = splitTelegramMessage(header, body, footer, 4096);
+      const result = splitChatMessage(header, body, footer, 4096);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(4096);
@@ -128,7 +128,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("H".repeat(4092));
       const body = plainBody("Hi");
       const footer = plainBody("");
-      const result = splitTelegramMessage(header, body, footer, 4096);
+      const result = splitChatMessage(header, body, footer, 4096);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(4096);
@@ -139,7 +139,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("H".repeat(4080));
       const body = plainBody("B".repeat(10000));
       const footer = plainBody("");
-      const result = splitTelegramMessage(header, body, footer, 4096);
+      const result = splitChatMessage(header, body, footer, 4096);
       expect(result.length).toBeLessThan(60);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(4096);
@@ -150,7 +150,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("HEADER");
       const body = plainBody("B".repeat(10000));
       const footer = plainBody("F".repeat(5000));
-      const result = splitTelegramMessage(header, body, footer, 4096);
+      const result = splitChatMessage(header, body, footer, 4096);
       expect(result.length).toBeGreaterThan(0);
       expect(result.length).toBeLessThan(60);
       for (const chunk of result) {
@@ -159,19 +159,19 @@ describe("splitTelegramMessage", () => {
     });
 
     it("keeps entity offsets within range after header truncation", () => {
-      const header: TgMessage = {
+      const header: ChatMessage = {
         text: "H".repeat(4200),
         entities: [{ offset: 0, length: 4200, type: "bold" }],
       };
-      const body: TgMessage = {
+      const body: ChatMessage = {
         text: "B".repeat(500),
         entities: [{ offset: 10, length: 100, type: "code" }],
       };
-      const footer: TgMessage = {
+      const footer: ChatMessage = {
         text: "F".repeat(10),
         entities: [{ offset: 0, length: 10, type: "italic" }],
       };
-      const result = splitTelegramMessage(header, body, footer, 4096);
+      const result = splitChatMessage(header, body, footer, 4096);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(4096);
@@ -186,7 +186,7 @@ describe("splitTelegramMessage", () => {
       const originalBodyText = "x".repeat(4085) + "😀" + "y".repeat(200);
       const header = plainBody("Hdr");
       const footer = plainBody("Ftr");
-      const result = splitTelegramMessage(header, plainBody(originalBodyText), footer, 4096);
+      const result = splitChatMessage(header, plainBody(originalBodyText), footer, 4096);
 
       expect(result.length).toBeGreaterThan(1);
       for (const chunk of result) {
@@ -210,7 +210,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("Header");
       const body = plainBody("hello");
       const footer = plainBody("Footer");
-      const result = splitTelegramMessage(header, body, footer, 3);
+      const result = splitChatMessage(header, body, footer, 3);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(3);
@@ -219,7 +219,7 @@ describe("splitTelegramMessage", () => {
     });
 
     it("returns without infinite loop when maxBody === 1 and body starts with surrogate pair", () => {
-      const result = splitTelegramMessage(plainBody(""), plainBody("😀hello"), plainBody(""), 5);
+      const result = splitChatMessage(plainBody(""), plainBody("😀hello"), plainBody(""), 5);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(5);
@@ -228,7 +228,7 @@ describe("splitTelegramMessage", () => {
     });
 
     it("returns without infinite loop when body ends in unpaired high surrogate at tiny maxLen", () => {
-      const result = splitTelegramMessage(plainBody(""), plainBody("abc\uD83D"), plainBody(""), 5);
+      const result = splitChatMessage(plainBody(""), plainBody("abc\uD83D"), plainBody(""), 5);
       expect(result.length).toBeGreaterThan(0);
       for (const chunk of result) {
         expect(chunk.text.length).toBeLessThanOrEqual(5);
@@ -240,7 +240,7 @@ describe("splitTelegramMessage", () => {
       const header = plainBody("Header");
       const body = plainBody("");
       const footer = plainBody("Footer");
-      const result = splitTelegramMessage(header, body, footer);
+      const result = splitChatMessage(header, body, footer);
       expect(result).toHaveLength(1);
       expect(result[0]!.text).toBe("Header\n\nFooter");
     });
@@ -252,11 +252,11 @@ describe("splitTelegramMessage", () => {
       for (const headerLen of [0, 50, 4000, 4092, 4200]) {
         for (const footerLen of [0, 10, 100, 5000]) {
           for (const bodyLen of [0, 2, 500, 10000]) {
-            const h: TgMessage = {
+            const h: ChatMessage = {
               text: "H".repeat(headerLen),
               entities: headerLen > 0 ? [{ offset: 0, length: headerLen, type: "bold" }] : [],
             };
-            const f: TgMessage = {
+            const f: ChatMessage = {
               text: "F".repeat(footerLen),
               entities: footerLen > 0 ? [{ offset: 0, length: footerLen, type: "italic" }] : [],
             };
@@ -264,11 +264,11 @@ describe("splitTelegramMessage", () => {
             if (bodyText.length > 0 && bodyText.charCodeAt(bodyText.length - 1) >= 0xd800 && bodyText.charCodeAt(bodyText.length - 1) <= 0xdbff) {
               bodyText = bodyText.slice(0, -1);
             }
-            const b: TgMessage = {
+            const b: ChatMessage = {
               text: bodyText,
               entities: bodyLen > 10 ? [{ offset: 2, length: Math.min(8, bodyLen - 2), type: "code" }] : [],
             };
-            const result = splitTelegramMessage(h, b, f, maxLen);
+            const result = splitChatMessage(h, b, f, maxLen);
             expect(result.length).toBeGreaterThan(0);
             const expectedMaxChunks = bodyLen === 0 ? 1 : Math.ceil(bodyLen / minBodyBudget) + 5;
             expect(result.length).toBeLessThanOrEqual(expectedMaxChunks);

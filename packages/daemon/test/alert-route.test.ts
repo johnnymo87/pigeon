@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { TelegramSendError, type StopNotifier } from "../src/notification-service";
+import { ChatSendError, type StopNotifier } from "../src/notification-service";
 
 describe("POST /alert", () => {
   let storage: StorageDb | null = null;
@@ -154,7 +154,7 @@ describe("POST /alert", () => {
 
     it("if the provider rejects the buttons with a 400, resends once without them", async () => {
       sendPlainAlert
-        .mockRejectedValueOnce(new TelegramSendError(400, "Bad Request: BUTTON_URL_INVALID"))
+        .mockRejectedValueOnce(new ChatSendError(400, "Bad Request: BUTTON_URL_INVALID"))
         .mockResolvedValueOnce(undefined);
       const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: CHAT, messageThreadId: 42, state: "open", url: URL42 } });
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), lookupTopics });
@@ -167,7 +167,7 @@ describe("POST /alert", () => {
     });
 
     it("does not resend on a non-400 failure (it may have been delivered)", async () => {
-      sendPlainAlert.mockRejectedValueOnce(new Error("Telegram sendMessage timed out after 10000ms"));
+      sendPlainAlert.mockRejectedValueOnce(new Error("chat send timed out after 10000ms"));
       const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: CHAT, messageThreadId: 42, state: "open", url: URL42 } });
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), lookupTopics });
       const res = await post(app, { text: "x", links: [{ label: "a", sessionId: "s1" }] });
@@ -186,7 +186,7 @@ describe("POST /alert", () => {
     }
     const URL42 = "https://acme.slack.com/archives/C42";
     // Every provider rejection the worker relays carries an errorClass; a deleted channel is this one.
-    const threadNotFound = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "channel_not_found", "conversation_gone");
+    const threadNotFound = () => new ChatSendError(400, "chat send returned 400", "channel_not_found", "conversation_gone");
 
     it("absent topic: notifier called with exactly (text, severity) and no resolve", async () => {
       const resolveNamedTopic = vi.fn();
@@ -259,7 +259,7 @@ describe("POST /alert", () => {
     it("another 400 in the topic: drop the buttons, then move to General with the buttons restored", async () => {
       const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
       const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "slack:T1", messageThreadId: 42, state: "open", url: "https://acme.slack.com/archives/C42" } });
-      const bad = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: something");
+      const bad = () => new ChatSendError(400, "chat send returned 400", "Bad Request: something");
       sendPlainAlert.mockRejectedValueOnce(bad()).mockRejectedValueOnce(bad()).mockResolvedValueOnce(undefined);
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
       const res = await post(app, { text: "x", topic: { key: "k" }, links: [{ label: "a", sessionId: "s1" }] });
@@ -274,7 +274,7 @@ describe("POST /alert", () => {
     it("400 on every rung: five sends at most, then 502", async () => {
       const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
       const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "slack:T1", messageThreadId: 42, state: "open", url: "https://acme.slack.com/archives/C42" } });
-      sendPlainAlert.mockRejectedValue(new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: x"));
+      sendPlainAlert.mockRejectedValue(new ChatSendError(400, "chat send returned 400", "Bad Request: x"));
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
       const res = await post(app, { text: "x", topic: { key: "k" }, links: [{ label: "a", sessionId: "s1" }] });
       expect(res.status).toBe(502);
@@ -283,7 +283,7 @@ describe("POST /alert", () => {
 
     it("a timeout in the topic is not retried (it may have posted)", async () => {
       const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
-      sendPlainAlert.mockRejectedValueOnce(new Error("Telegram sendMessage timed out after 10000ms"));
+      sendPlainAlert.mockRejectedValueOnce(new Error("chat send timed out after 10000ms"));
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
       expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(502);
       expect(sendPlainAlert).toHaveBeenCalledTimes(1);
@@ -292,7 +292,7 @@ describe("POST /alert", () => {
     it("a legacy `thread not found` description with no errorClass is no longer read as a deleted topic", async () => {
       const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
       sendPlainAlert.mockRejectedValueOnce(
-        new TelegramSendError(400, "x", "Bad Request: message thread not found"),
+        new ChatSendError(400, "x", "Bad Request: message thread not found"),
       ).mockResolvedValueOnce(undefined);
       const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic });
       expect((await post(app, { text: "x", topic: { key: "k" } })).status).toBe(204);
@@ -361,7 +361,7 @@ describe("POST /alert", () => {
       it("400-after-buttons + strict → 502 without a General send", async () => {
         const resolveNamedTopic = vi.fn().mockResolvedValue({ messageThreadId: 77, created: false });
         const lookupTopics = vi.fn().mockResolvedValue({ s1: { chatId: "slack:T1", messageThreadId: 42, state: "open", url: "https://acme.slack.com/archives/C42" } });
-        const bad = () => new TelegramSendError(400, "Telegram sendMessage returned 400", "Bad Request: something in topic");
+        const bad = () => new ChatSendError(400, "chat send returned 400", "Bad Request: something in topic");
         sendPlainAlert.mockRejectedValueOnce(bad()).mockRejectedValueOnce(bad());
         const app = createApp(storage!, { nowFn: () => 1000, notifier: makeNotifier(true), resolveNamedTopic, lookupTopics });
         const res = await post(app, {

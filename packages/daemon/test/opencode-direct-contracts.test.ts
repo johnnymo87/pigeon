@@ -21,7 +21,7 @@ describe("opencode-direct contracts", () => {
       commandId: "cmd-1",
       sessionId: "sess-1",
       command: "echo hi",
-      source: OpencodeDirectSource.TelegramReply,
+      source: OpencodeDirectSource.ChatReply,
       issuedAt: Date.now(),
       metadata: { chatId: "8248" },
     };

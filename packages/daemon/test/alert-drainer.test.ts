@@ -99,7 +99,7 @@ describe("AlertDrainer", () => {
     fixture = makeFixture();
     const { storage, drainer, sendPlainAlert, setNow, getNow } = fixture;
 
-    sendPlainAlert.mockRejectedValueOnce(new Error("Telegram API 429 Rate Limit"));
+    sendPlainAlert.mockRejectedValueOnce(new Error("chat API 429 Rate Limit"));
 
     storage.alerts.enqueue({ id: "a1", source: "s1", text: "Flaky Alert", severity: "error", now: getNow() });
 

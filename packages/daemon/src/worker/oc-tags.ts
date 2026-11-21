@@ -128,7 +128,7 @@ export function describeOcTagsFailure(err: unknown, timeoutMs: number = RUN_TIME
  * validators reject.
  *
  * A non-zero exit resolves rather than rejects: oc-tags reports user errors as
- * exit 1 plus a line on stderr, and those belong in the Telegram reply. Only a
+ * exit 1 plus a line on stderr, and those belong in the chat reply. Only a
  * failure to run at all (ENOENT, timeout) rejects.
  *
  * `timeoutMs` defaults to the 20s a `/tag` command needs. A caller that only

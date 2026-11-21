@@ -1,10 +1,10 @@
 import os from "node:os";
-import { TgMessageBuilder, type TgEntity } from "../telegram-message";
+import { ChatMessageBuilder, type ChatEntity } from "../chat-message";
 import { describeOcTagsFailure, type OcTagsRunner } from "./oc-tags";
 import { tagKeyFor, type TagKeySessionLookup } from "../tag-key";
 
 /**
- * /tag — session tagging from Telegram, backed by the oc-tags binary.
+ * /tag — session tagging from the chat, backed by the oc-tags binary.
  *
  * oc-tags is the single source of truth for tag precedence (explicit session tag
  * > "auto:" fallback) and for the sidecar DB at ~/.local/share/oc-tags/tags.db.
@@ -56,7 +56,7 @@ export interface TagCommandDeps {
   homeDir?: string;
   /** null means oc-tags is not installed on this machine. */
   runOcTags: OcTagsRunner | null;
-  sendTelegramReply: (chatId: string, text: string, entities?: TgEntity[]) => Promise<void>;
+  sendChatReply: (chatId: string, text: string, entities?: ChatEntity[]) => Promise<void>;
   /**
    * Called once a tag has actually been written, so a cached copy (the
    * notification footer's) can be dropped. Never called on a rejected or failed
@@ -119,7 +119,7 @@ function parseHeaderWidths(line: string): { idWidth: number; titleWidth: number 
  *  - **Columns are sliced by CODE POINT, not UTF-16 code unit.** Python pads with
  *    `{s:<40}`, which counts code points, so a title containing an astral
  *    character (an emoji) would otherwise be cut mid-surrogate — and a lone
- *    surrogate makes the JSON body invalid UTF-8, so Telegram rejects the whole
+ *    surrogate makes the JSON body invalid UTF-8, so the chat rejects the whole
  *    backlog message with a 400 rather than mangling one line. Every column
  *    after it shifts too.
  *  - **Offsets are anchored on each row's own session id**, not on the header's
@@ -168,7 +168,7 @@ export function parseTopOutput(stdout: string): { rows: TopRow[] } {
 // ─── rendering ────────────────────────────────────────────────────────────────
 
 const MAX_ROWS = 8;
-/** Telegram's hard limit is 4096; this path does not split messages. */
+/** The chat's hard limit is 4096; this path does not split messages. */
 const MAX_TEXT = 3800;
 
 /** Home and the projects root are noise on a phone screen. */
@@ -193,7 +193,7 @@ function formatDollars(dollars: number): string {
 /**
  * Truncates without ever leaving an unpaired surrogate.
  *
- * A lone surrogate makes the JSON request body invalid UTF-8 and Telegram
+ * A lone surrogate makes the JSON request body invalid UTF-8 and the chat
  * rejects the WHOLE message with a 400 — so one emoji in a session title would
  * drop the entire backlog rather than mangle one line.
  */
@@ -212,7 +212,7 @@ export function truncate(s: string, max: number): string {
 
 function notInstalledMessage(machineId: string | undefined) {
   const where = machineId ? ` on ${machineId}` : "";
-  return new TgMessageBuilder()
+  return new ChatMessageBuilder()
     .append(`oc-tags is not installed${where}.\n\nInstall it from workstation (`)
     .appendCode("pkgs/oc-tags")
     .append(") or point the daemon at it with ")
@@ -225,14 +225,14 @@ function notInstalledMessage(machineId: string | undefined) {
  * Runs oc-tags and hands the caller the stdout, or replies and returns null.
  *
  * Every failure mode — not installed, spawn failure, non-zero exit — becomes a
- * Telegram message rather than a throw, so the command is always acked. A throw
+ * chat message rather than a throw, so the command is always acked. A throw
  * would skip the ack and redeliver the same command every lease expiry for 24h,
  * which for a user-visible command means the same error posted repeatedly.
  */
 async function runOrExplain(deps: TagCommandDeps, args: string[], what: string): Promise<string | null> {
   if (!deps.runOcTags) {
     const msg = notInstalledMessage(deps.machineId);
-    await deps.sendTelegramReply(deps.chatId, msg.text, msg.entities);
+    await deps.sendChatReply(deps.chatId, msg.text, msg.entities);
     return null;
   }
 
@@ -244,13 +244,13 @@ async function runOrExplain(deps: TagCommandDeps, args: string[], what: string):
     // kill as "Command failed: <argv>", which names no reason at all.
     const message = describeOcTagsFailure(err);
     console.error(`[tag-ingest] oc-tags ${what} failed to run commandId=${deps.commandId}: ${message}`);
-    await deps.sendTelegramReply(deps.chatId, `Failed to run oc-tags: ${message}`);
+    await deps.sendChatReply(deps.chatId, `Failed to run oc-tags: ${message}`);
     return null;
   }
 
   if (result.code !== 0) {
     const detail = (result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`).slice(0, 500);
-    await deps.sendTelegramReply(deps.chatId, `oc-tags ${what} failed: ${detail}`);
+    await deps.sendChatReply(deps.chatId, `oc-tags ${what} failed: ${detail}`);
     return null;
   }
 
@@ -273,15 +273,15 @@ export async function ingestTagTopCommand(deps: TagCommandDeps): Promise<void> {
     // shape this parser does not recognise. Showing it raw beats showing nothing.
     const raw = stdout.trim() || "No untagged root sessions found.";
     // pre, so an unrecognised fixed-width table still lines up on a phone.
-    const msg = new TgMessageBuilder().appendPre(truncate(raw, MAX_TEXT)).build();
-    await deps.sendTelegramReply(deps.chatId, msg.text, msg.entities);
+    const msg = new ChatMessageBuilder().appendPre(truncate(raw, MAX_TEXT)).build();
+    await deps.sendChatReply(deps.chatId, msg.text, msg.entities);
     return;
   }
 
   const total = rows.reduce((sum, r) => sum + r.dollars, 0);
   const shown = rows.slice(0, MAX_ROWS);
 
-  const b = new TgMessageBuilder()
+  const b = new ChatMessageBuilder()
     .append("💰 ")
     .appendBold(`Untagged — last ${TOP_DAYS} days`)
     .newline()
@@ -296,7 +296,7 @@ export async function ingestTagTopCommand(deps: TagCommandDeps): Promise<void> {
   }
 
   const msg = b.build();
-  await deps.sendTelegramReply(deps.chatId, msg.text, msg.entities);
+  await deps.sendChatReply(deps.chatId, msg.text, msg.entities);
 }
 
 // ─── /tag list ────────────────────────────────────────────────────────────────
@@ -306,7 +306,7 @@ export async function ingestTagListCommand(deps: TagCommandDeps): Promise<void> 
   if (stdout === null) return;
 
   const table = stdout.replace(/\s+$/, "");
-  const msg = new TgMessageBuilder()
+  const msg = new ChatMessageBuilder()
     .append("🏷 ")
     .appendBold("Tags")
     .newline(2)
@@ -314,7 +314,7 @@ export async function ingestTagListCommand(deps: TagCommandDeps): Promise<void> 
     // and re-rendering it would be a second formatter to keep in step for nothing.
     .appendPre(truncate(table || "No tags defined.", MAX_TEXT))
     .build();
-  await deps.sendTelegramReply(deps.chatId, msg.text, msg.entities);
+  await deps.sendChatReply(deps.chatId, msg.text, msg.entities);
 }
 
 function announceTagged(deps: TagCommandDeps): void {
@@ -335,12 +335,12 @@ export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void
     const text = typeof targetSessionId === "string" && targetSessionId.startsWith("gse_")
       ? `Cannot tag ${truncate(targetSessionId, 64)}: ${key.reason}.`
       : `Invalid session id: ${truncate(String(targetSessionId), 64)}`;
-    await deps.sendTelegramReply(deps.chatId, text);
+    await deps.sendChatReply(deps.chatId, text);
     return;
   }
   const sessionKey = key.key;
   if (!isValidTag(tag)) {
-    await deps.sendTelegramReply(
+    await deps.sendChatReply(
       deps.chatId,
       `Invalid tag: ${truncate(tag, 64)}\nTags are one word of letters, digits, . _ - : / and may not start with "auto:".`,
     );
@@ -354,5 +354,5 @@ export async function ingestTagSetCommand(deps: TagSetCommandDeps): Promise<void
 
   announceTagged(deps);
   console.log(`[tag-ingest] set commandId=${deps.commandId} session=${targetSessionId} key=${sessionKey} tag=${tag}`);
-  await deps.sendTelegramReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${sessionKey} as ${tag}`, 500)}`);
+  await deps.sendChatReply(deps.chatId, `🏷 ${truncate(stdout.trim() || `Tagged ${sessionKey} as ${tag}`, 500)}`);
 }

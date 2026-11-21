@@ -1,7 +1,7 @@
 /**
  * HTTP client for the worker's session-free send route, `POST /messages/send` (chat-transport
  * phase 1, pigeon-lenr). The wire shapes are the worker's (`packages/worker/src`), which is the
- * source of truth. Several wire values still carry Telegram's names (`telegram:{status,..}`,
+ * source of truth. Several wire values still carry Telegram's old names (`telegram:{status,..}`,
  * `/^telegram call /`): they are kept on purpose, so a daemon and a worker of different ages
  * still read each other.
  *
@@ -9,12 +9,12 @@
  * shape is that the daemon can tell them apart:
  *
  *  - `sent`: posted.
- *  - `telegram_rejected`: Telegram itself said no (400, 429), relayed in a 200. Nothing was
+ *  - `chat_rejected`: the chat itself said no (400, 429), relayed in a 200. Nothing was
  *    posted, and the worker is healthy, so a caller with a fallback must NOT fall back: the
  *    direct path would get the same answer.
  *  - `worker_failed`: anything else -- the worker is broken, absent (a 404 from a worker
- *    older than the route), misconfigured (403 `chat_not_allowed`), its own Telegram token is
- *    broken (502 carrying a Telegram 401/403/404), or it did not answer in time. This is the
+ *    older than the route), misconfigured (403 `chat_not_allowed`), its own provider token is
+ *    broken (502 carrying a provider 401/403/404), or it did not answer in time. This is the
  *    case a fallback exists for.
  *
  * Never throws from `sendMessage`, and is bounded even against a fetch that ignores its
@@ -22,7 +22,7 @@
  * path awaits this inside the drainer and the watchdog.
  */
 
-import type { TgEntity } from "../telegram-message";
+import type { ChatEntity } from "../chat-message";
 
 export interface WorkerMessageBody {
   /**
@@ -31,10 +31,10 @@ export interface WorkerMessageBody {
    */
   chatId?: string;
   text: string;
-  entities?: TgEntity[];
+  entities?: ChatEntity[];
   messageThreadId?: number;
   urlButtons?: Array<Array<{ text: string; url: string }>>;
-  /** The worker's own abort on its Telegram call. Absent: the worker's default (~4s). */
+  /** The worker's own abort on its chat call. Absent: the worker's default (~4s). */
   timeoutMs?: number;
   /**
    * Ask for the owner mention (Slack only, still gated by the worker's `SLACK_NOTIFY_OWNER`;
@@ -46,7 +46,7 @@ export interface WorkerMessageBody {
 export type WorkerSendOutcome =
   | { kind: "sent"; messageId?: number }
   | {
-      kind: "telegram_rejected";
+      kind: "chat_rejected";
       status: 400 | 429;
       description?: string;
       retryAfter?: number;
@@ -60,11 +60,11 @@ export type WorkerSendOutcome =
       /** Stable and low-cardinality, for throttling one health alert per kind of failure. */
       key: string;
       /**
-       * `telegram_unreachable`: the worker answered but could not get a reply from Telegram
-       * in time (its own abort, or a transport error to Telegram). The worker itself is
+       * `chat_unreachable`: the worker answered but could not get a reply from the chat
+       * in time (its own abort, or a transport error to the chat). The worker itself is
        * probably fine. `worker`: everything else.
        */
-      cause: "worker" | "telegram_unreachable";
+      cause: "worker" | "chat_unreachable";
       status?: number;
     };
 
@@ -152,9 +152,11 @@ export class WorkerMessageClient {
     }
 
     const obj = isObject(res.parsed) ? res.parsed : undefined;
-    const tg = obj && isObject(obj.telegram) ? obj.telegram : undefined;
-    const tgStatus = tg && typeof tg.status === "number" ? tg.status : undefined;
-    const tgDesc = tg && typeof tg.description === "string" ? tg.description : undefined;
+    // `obj.telegram` is the worker's wire name for the provider's answer ({status, description,
+    // retryAfter}); it is kept so daemons and workers of different ages still read each other.
+    const provider = obj && isObject(obj.telegram) ? obj.telegram : undefined;
+    const providerStatus = provider && typeof provider.status === "number" ? provider.status : undefined;
+    const providerDesc = provider && typeof provider.description === "string" ? provider.description : undefined;
     const errorClass = obj && typeof obj.errorClass === "string" && /^[a-z_]{1,40}$/.test(obj.errorClass)
       ? obj.errorClass
       : undefined;
@@ -172,18 +174,18 @@ export class WorkerMessageClient {
       if (obj.ok) {
         return typeof obj.messageId === "number" ? { kind: "sent", messageId: obj.messageId } : { kind: "sent" };
       }
-      if (tgStatus === 400 || tgStatus === 429) {
-        const out: WorkerSendOutcome = { kind: "telegram_rejected", status: tgStatus };
-        if (tgDesc !== undefined) out.description = tgDesc;
-        if (tg && typeof tg.retryAfter === "number") out.retryAfter = tg.retryAfter;
+      if (providerStatus === 400 || providerStatus === 429) {
+        const out: WorkerSendOutcome = { kind: "chat_rejected", status: providerStatus };
+        if (providerDesc !== undefined) out.description = providerDesc;
+        if (provider && typeof provider.retryAfter === "number") out.retryAfter = provider.retryAfter;
         if (errorClass !== undefined) out.errorClass = errorClass;
         return out;
       }
       // ok:false that is not a documented rejection: not a verdict we can trust.
       return {
         kind: "worker_failed",
-        reason: `200 ok:false${tgStatus !== undefined ? ` (Telegram ${tgStatus})` : ""}`,
-        key: `ok_false${tgStatus !== undefined ? `:tg${tgStatus}` : ""}`,
+        reason: `200 ok:false${providerStatus !== undefined ? ` (chat ${providerStatus})` : ""}`,
+        key: `ok_false${providerStatus !== undefined ? `:chat${providerStatus}` : ""}`,
         cause: "worker",
         status: 200,
       };
@@ -192,26 +194,26 @@ export class WorkerMessageClient {
     const error = obj && typeof obj.error === "string" ? obj.error : undefined;
     let reason = `HTTP ${res.status}`;
     let key = `http${res.status}`;
-    let cause: "worker" | "telegram_unreachable" = "worker";
+    let cause: "worker" | "chat_unreachable" = "worker";
     if (errorClass !== undefined) {
       // A Slack answer: its class is the low-cardinality part, the description the detail.
-      reason += ` (Slack ${errorClass}${tgDesc ? `: ${sanitise(tgDesc, 80)}` : ""})`;
+      reason += ` (Slack ${errorClass}${providerDesc ? `: ${sanitise(providerDesc, 80)}` : ""})`;
       key += `:${errorClass}`;
-    } else if (tgStatus !== undefined) {
-      reason += ` (Telegram ${tgStatus}${tgDesc ? `: ${tgDesc}` : ""})`;
-      key += `:tg${tgStatus}`;
+    } else if (providerStatus !== undefined) {
+      reason += ` (chat ${providerStatus}${providerDesc ? `: ${providerDesc}` : ""})`;
+      key += `:chat${providerStatus}`;
     } else if (error && /^[a-z_]{1,40}$/.test(error)) {
       // A slug: low-cardinality, safe as a throttle key.
       reason += ` ${error}`;
       key += `:${error}`;
     } else if (error) {
       // Free text (the worker's "telegram call timed out after 4000ms" / "telegram call
-      // failed: ..."). Kept in the reason, sanitised and short, but never in the key, which
+      // failed: ...", wire text kept as is). Kept in the reason, sanitised and short, but never in the key, which
       // must stay low-cardinality.
       reason += ` (${sanitise(error, 80)})`;
       if (res.status === 502 && /^telegram call /.test(error)) {
-        key += ":telegram_unreachable";
-        cause = "telegram_unreachable";
+        key += ":chat_unreachable";
+        cause = "chat_unreachable";
       }
     }
     return { kind: "worker_failed", reason, key, cause, status: res.status };
