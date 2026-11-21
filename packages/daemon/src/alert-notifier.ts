@@ -203,17 +203,20 @@ class AlertNotifier {
       this.lastFallbackAlertAt.set(outcome.key, now);
       if (!this.deps.alerts) return;
       const where = this.deps.machineId ? ` on ${this.deps.machineId}` : "";
+      // Name the chat the human should look in (pigeon-4ogz.5): a flipped machine's alerts
+      // are in Slack #alerts.
+      const chat = this.deps.transport?.() === "slack" ? "Slack" : "Telegram";
       const text = !hasDirect
         ? `Worker POST /messages/send failed${where} (${outcome.reason}) and this host has no direct ` +
-          `Telegram path, so operational alerts and slash-command replies were not getting out. ` +
+          `${chat} path, so operational alerts and slash-command replies were not getting out. ` +
           `Reported once per outage.`
         : outcome.cause === "telegram_unreachable"
-          ? `The worker could not get a reply from Telegram in time for an alert${where} ` +
+          ? `The worker could not get a reply from ${chat} in time for an alert${where} ` +
             `(${outcome.reason}), so it was re-sent direct and may appear twice. The worker itself ` +
             `is probably fine; slash-command replies wait longer and are probably landing. ` +
             `Reported at most once an hour per kind of failure.`
           : `Alerts${where} are bypassing the worker: POST /messages/send failed (${outcome.reason}), ` +
-            `so operational alerts are being sent direct to Telegram. Slash-command replies have no ` +
+            `so operational alerts are being sent direct to ${chat}. Slash-command replies have no ` +
             `fallback and are probably being lost. Reported at most once an hour per kind of failure.`;
       this.deps.alerts.enqueue({
         source: "worker-health-fallback",

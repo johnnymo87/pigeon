@@ -15,7 +15,8 @@
  * enforces that, as it does the Bot API host for the Telegram file.
  *
  * Pushes (D7, off by default): the owner is mentioned only when `PIGEON_SLACK_NOTIFY_OWNER=1`
- * and `PIGEON_SLACK_OWNER_USER_ID` is set. pigeon never emits a broadcast: `<` is escaped (so no
+ * and `PIGEON_SLACK_OWNER_USER_ID` are set, and only on an error-severity alert: the same
+ * `errors` category the worker leg asks for, so the two legs push alike. pigeon never emits a broadcast: `<` is escaped (so no
  * `<!channel>` can form) and a bare `@channel`/`@here`/`@everyone` gets a zero-width joiner.
  */
 
@@ -121,7 +122,7 @@ export class DirectSlackAlarm {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text: renderSlackAlarmText(text, severity, options, this.mention),
+          text: renderSlackAlarmText(text, severity, options, severity === "error" ? this.mention : undefined),
           unfurl_links: false,
           unfurl_media: false,
         }),

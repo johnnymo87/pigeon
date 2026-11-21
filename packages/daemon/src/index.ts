@@ -1015,6 +1015,14 @@ const notifier: StopNotifier | undefined = config.telegramChatId
     })
   : undefined;
 console.log(`[pigeon-daemon] alert delivery: ${alertDelivery}`);
+// Never the URL itself: it is a credential. INVALID means the env var is set but is not a Slack
+// incoming-webhook URL, so it is ignored (an empty one counts as unset).
+{
+  const raw = process.env.PIGEON_SLACK_ALARM_WEBHOOK_URL?.trim();
+  const slack = config.slackAlarmWebhookUrl ? "set" : raw ? "INVALID (ignored)" : "unset";
+  const line = `[alert] direct paths: telegram=${config.telegramBotToken && config.telegramChatId ? "yes" : "no"} slack=${slack}`;
+  (slack.startsWith("INVALID") ? console.warn : console.log)(line);
+}
 
 // Swarm IPC: per-target arbiter that delivers swarm_messages to opencode
 // serve via prompt_async with at-most-one in-flight per target session.

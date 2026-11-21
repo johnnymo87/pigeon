@@ -17,6 +17,8 @@ import { classifyDeliveryFailure, getErrorClass } from "../src/worker/delivery-p
 import { classifyWorkerHealthSample } from "../src/worker/worker-health";
 import { WorkerMessageClient } from "../src/worker/worker-message-client";
 import { createAlertNotifier } from "../src/alert-notifier";
+import { OutboxSender } from "../src/worker/outbox-sender";
+import { DirectTelegramAlarm } from "../src/direct-telegram-alarm";
 import { buildAlertKeyboard } from "../src/alert-links";
 import { loadConfig } from "../src/config";
 import { TelegramSendError } from "../src/notification-service";
@@ -132,11 +134,14 @@ describe("DirectSlackAlarm", () => {
     expect(text).not.toContain("<@");
   });
 
-  it("mentions the owner only with PIGEON_SLACK_NOTIFY_OWNER=1 and an id", () => {
+  it("mentions the owner only with PIGEON_SLACK_NOTIFY_OWNER=1, an id, and an error alert", async () => {
     expect(renderSlackAlarmText("x", "info", undefined, "U1")).toBe("<@U1> x");
     const { fetchFn, calls } = hook();
-    void new DirectSlackAlarm(HOOK, { notifyOwner: true, fetchFn }).sendPlainAlert("x", "info");
-    expect(calls[0]!.body.text).toBe("x");
+    await new DirectSlackAlarm(HOOK, { notifyOwner: true, fetchFn }).sendPlainAlert("x", "error");
+    await new DirectSlackAlarm(HOOK, { notifyOwner: true, ownerUserId: "U1", fetchFn }).sendPlainAlert("y", "warning");
+    await new DirectSlackAlarm(HOOK, { notifyOwner: true, ownerUserId: "U1", fetchFn }).sendPlainAlert("z", "error");
+    await new DirectSlackAlarm(HOOK, { ownerUserId: "U1", fetchFn }).sendPlainAlert("w", "error");
+    expect(calls.map((c) => c.body.text)).toEqual(["❌ x", "⚠️ y", "<@U1> ❌ z", "❌ w"]);
   });
 
   it("throws SlackWebhookError on a non-2xx, never TelegramSendError", async () => {
@@ -444,5 +449,73 @@ describe("Slack egress guard", () => {
       .filter((p) => p !== "direct-slack-alarm.ts");
     expect(offenders).toEqual([]);
     expect(readFileSync(join(src, "direct-slack-alarm.ts"), "utf8")).toContain("hooks\\.slack\\.com");
+  });
+});
+
+describe("outbox carries dialect and notifyOwner to /notifications/send", () => {
+  it("passes rich.dialect and notifyOwner through to the worker body", async () => {
+    const s = mem();
+    s.outbox.upsert({
+      notificationId: "q:sess-1:r",
+      sessionId: "sess-1",
+      requestId: "r",
+      kind: "question",
+      payload: JSON.stringify({
+        messages: [{ text: "hi", entities: [] }],
+        replyMarkup: { inline_keyboard: [] },
+        notificationId: "q:sess-1:r",
+        rich: { markdown: "**hi**", dialect: "slack" },
+        notifyOwner: true,
+      }),
+      token: "t",
+    }, 1_000);
+    const bodies: Array<Record<string, unknown>> = [];
+    const poller = new Poller({ workerUrl: "https://w", apiKey: "k", machineId: "d" }, {} as PollerCallbacks, {
+      fetchFn: (async (_u: string, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ ok: true, messageId: 1, rich: "sent" });
+      }) as unknown as typeof fetch,
+    });
+    const sender = new OutboxSender({
+      storage: s,
+      sendNotification: (input) => poller.sendNotification(input),
+      chatId: "-100123",
+      nowFn: () => 5_000,
+    });
+    await sender.processOnce();
+    expect(bodies[0]).toMatchObject({ rich: { markdown: "**hi**", dialect: "slack" }, notifyOwner: true });
+  });
+});
+
+describe("Slack alarm ladder via the composed notifier", () => {
+  it("worker fails -> the Slack webhook gets the alert with the suffix; a Slack handle never reaches Telegram", async () => {
+    let transport: "slack" | "telegram" = "slack";
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      calls.push({ url, body });
+      if (url.startsWith("https://w/")) return new Response("down", { status: 503 });
+      return url.startsWith(HOOK) ? new Response("ok") : Response.json({ ok: true, result: {} });
+    }) as unknown as typeof fetch;
+    const n = createAlertNotifier({
+      chatId: "-100123",
+      worker: new WorkerMessageClient({ workerUrl: "https://w", apiKey: "k", fetchFn }),
+      direct: createDirectAlarm({
+        telegram: new DirectTelegramAlarm("tok", "-100123", fetchFn),
+        slack: new DirectSlackAlarm(HOOK, { fetchFn }),
+        transport: () => transport,
+      }),
+      transport: () => transport,
+    })!;
+    await n.sendPlainAlert!("worker is down", "error");
+    const hookCall = calls.find((c) => c.url === HOOK)!;
+    expect(hookCall.body.text).toMatch(/^❌ worker is down · sent direct; worker: HTTP 503/);
+
+    transport = "telegram";
+    calls.length = 0;
+    await n.sendPlainAlert!("x", "info", { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN + 1 });
+    const tgCall = calls.find((c) => c.url.includes("/sendMessage"))!;
+    expect(tgCall.body).not.toHaveProperty("message_thread_id");
+    expect(calls.find((c) => c.url.startsWith("https://w/"))!.body).toMatchObject({ chatId: "slack:T1" });
   });
 });
