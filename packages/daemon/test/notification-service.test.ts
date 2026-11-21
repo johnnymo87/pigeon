@@ -6,7 +6,6 @@ import {
   formatSwarmNotification,
   formatSwarmCancelNotification,
   formatEventTime,
-  RateLimitError,
   displayName,
 } from "../src/notification-service";
 import type { QuestionInfoData } from "../src/storage/types";

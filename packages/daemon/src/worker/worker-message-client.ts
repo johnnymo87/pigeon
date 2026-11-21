@@ -1,8 +1,9 @@
 /**
- * HTTP client for the worker's session-free Telegram routes, `POST /messages/send` and
- * `POST /topics/unpin` (chat-transport phase 1, pigeon-lenr; design
- * docs/plans/2026-11-20-telegram-single-egress-design.md). The wire shapes are the worker's
- * (`packages/worker/src`), which is the source of truth.
+ * HTTP client for the worker's session-free send route, `POST /messages/send` (chat-transport
+ * phase 1, pigeon-lenr). The wire shapes are the worker's (`packages/worker/src`), which is the
+ * source of truth. Several wire values still carry Telegram's names (`telegram:{status,..}`,
+ * `/^telegram call /`): they are kept on purpose, so a daemon and a worker of different ages
+ * still read each other.
  *
  * Every answer is reduced to one of three behaviours, and the whole point of the route's
  * shape is that the daemon can tell them apart:
@@ -24,7 +25,11 @@
 import type { TgEntity } from "../telegram-message";
 
 export interface WorkerMessageBody {
-  chatId: string;
+  /**
+   * Absent: the machine's own `#alerts`. Set it only to an address the worker handed out (a
+   * named topic's returned `slack:` chat).
+   */
+  chatId?: string;
   text: string;
   entities?: TgEntity[];
   messageThreadId?: number;
@@ -130,7 +135,8 @@ export class WorkerMessageClient {
   }
 
   async sendMessage(body: WorkerMessageBody, opts: { timeoutMs: number }): Promise<WorkerSendOutcome> {
-    const wire: Record<string, unknown> = { chatId: body.chatId, text: body.text };
+    const wire: Record<string, unknown> = { text: body.text };
+    if (body.chatId !== undefined) wire.chatId = body.chatId;
     if (body.entities && body.entities.length > 0) wire.entities = body.entities;
     if (body.messageThreadId !== undefined) wire.messageThreadId = body.messageThreadId;
     if (body.urlButtons && body.urlButtons.length > 0) wire.urlButtons = body.urlButtons;
@@ -209,20 +215,6 @@ export class WorkerMessageClient {
       }
     }
     return { kind: "worker_failed", reason, key, cause, status: res.status };
-  }
-
-  /** `POST /topics/unpin`. Best-effort: throws on any failure, for the caller to log. */
-  async unpinTopic(body: { chatId: string; messageThreadId: number }, opts: { timeoutMs: number }): Promise<void> {
-    let res: Awaited<ReturnType<WorkerMessageClient["post"]>>;
-    try {
-      res = await this.post("/topics/unpin", body, opts.timeoutMs);
-    } catch (err) {
-      throw new Error(`worker /topics/unpin ${err instanceof Timeout ? err.message : `failed: ${errText(err)}`}`);
-    }
-    if (!res.ok) throw new Error(`worker /topics/unpin returned ${res.status}`);
-    if (isObject(res.parsed) && res.parsed.ok === false) {
-      throw new Error("worker /topics/unpin answered ok:false");
-    }
   }
 }
 

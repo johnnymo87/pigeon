@@ -1,18 +1,19 @@
 /**
  * Operational-alert delivery: worker first, direct fallback (chat-transport phase 1,
  * pigeon-lenr; design docs/plans/2026-11-20-telegram-single-egress-design.md, "Daemon PR").
+ * The direct leg is Slack's `#alerts` webhook (Telegram's was deleted, pigeon-4ogz.13).
  *
  * WHY NOT JUST THE WORKER. These alerts include the alarms that report a broken worker
  * (worker-health.ts, pigeon-n4v: the 2026-07-14 outage went unnoticed for sixteen days).
  * Routing them only through the worker would silence the alarm built to report it. So the
- * worker leg goes first, and when the WORKER fails (not when Telegram says no) the alert is
- * re-sent through `DirectTelegramAlarm`, the daemon's one remaining direct Bot API caller.
+ * worker leg goes first, and when the WORKER fails (not when the chat provider says no) the alert
+ * is re-sent through `DirectSlackAlarm`, the daemon's one direct chat caller.
  *
  * THE FALLBACK IS VISIBLE, twice over: the alert itself carries
  * `· sent direct; worker: <reason>`, and a throttled health alert ("alerts are bypassing the
  * worker") is recorded, so a broken worker is reported even while every alert still lands.
  *
- * Three behaviours per worker answer (`WorkerSendOutcome`): sent -> done; Telegram said no
+ * Three behaviours per worker answer (`WorkerSendOutcome`): sent -> done; the provider said no
  * (400/429 relayed in a 200) -> throw `TelegramSendError`, NO fallback, because the direct
  * path would get the same verdict and the `/alert` ladder (app.ts) keys on the 400; worker
  * failed -> fall back.
@@ -20,8 +21,9 @@
  * DUPLICATES, accepted on purpose. A worker leg that times out AFTER the worker posted, then
  * a direct post, gives two copies; and `AlertDrainer` retries a thrown error, so a failure
  * after a successful post can compound that. For an operational alert a duplicate beats
- * silence. The worker leg's 5s cap sits above the worker's own ~4s Telegram abort precisely
- * to make that race rare: a slow Telegram yields a definite 502 before our timer fires.
+ * silence. The worker leg's 5s cap sits above the worker's own ~4s abort on its provider
+ * call precisely to make that race rare: a slow provider yields a definite 502 before our
+ * timer fires.
  */
 
 import {
@@ -31,12 +33,11 @@ import {
   type PlainAlertOptions,
   type StopNotifier,
 } from "./notification-service";
-import { severityPrefix, type DirectTelegramAlarm } from "./direct-telegram-alarm";
+import { severityPrefix, type DirectSlackAlarm } from "./direct-slack-alarm";
 import type { WorkerMessageClient, WorkerSendOutcome } from "./worker/worker-message-client";
 import type { WorkerHealthAlertSink } from "./worker/worker-health";
-import type { ChatTransportName } from "./chat-transport-state";
 
-/** Worker-leg cap when a direct path exists. Above the worker's ~4s Telegram abort. */
+/** Worker-leg cap when a direct path exists. Above the worker's ~4s provider abort. */
 export const WORKER_LEG_MS = 5_000;
 /** Below this much budget, a host with a direct path skips the worker. */
 export const DIRECT_ONLY_BELOW_MS = 2_000;
@@ -44,8 +45,8 @@ export const DIRECT_ONLY_BELOW_MS = 2_000;
 export const DIRECT_RESERVE_MS = 1_000;
 /** One fallback health alert per failure kind per this window. */
 export const FALLBACK_ALERT_THROTTLE_MS = 60 * 60 * 1000;
-/** Telegram's sendMessage text limit. Counted in UTF-16 units, which never undercounts. */
-export const TELEGRAM_MAX_TEXT = 4096;
+/** Cap on a direct-fallback alert's text. Counted in UTF-16 units, which never undercounts. */
+export const DIRECT_ALERT_MAX_TEXT = 4096;
 const MAX_REASON_CHARS = 200;
 
 export type AlertDeliveryMode = "worker+direct-fallback" | "worker-only" | "direct-only" | "UNAVAILABLE";
@@ -58,15 +59,8 @@ export function describeAlertDelivery(has: { worker: boolean; direct: boolean })
 }
 
 export interface AlertNotifierDeps {
-  chatId: string;
-  worker?: Pick<WorkerMessageClient, "sendMessage" | "unpinTopic">;
-  direct?: Pick<DirectTelegramAlarm, "sendPlainAlert">;
-  /**
-   * The machine's persisted `whoami.transport` (pigeon-4ogz.5). On Slack an error-severity
-   * alert asks the worker for the owner mention (`notifyOwner`, D7; the worker's
-   * `SLACK_NOTIFY_OWNER` still decides). Absent or Telegram: the wire is unchanged.
-   */
-  transport?: () => ChatTransportName | undefined;
+  worker?: Pick<WorkerMessageClient, "sendMessage">;
+  direct?: Pick<DirectSlackAlarm, "sendPlainAlert">;
   /** Where the throttled "alerts are bypassing the worker" alert is recorded. */
   alerts?: WorkerHealthAlertSink;
   machineId?: string;
@@ -82,8 +76,6 @@ export function createAlertNotifier(deps: AlertNotifierDeps): StopNotifier | und
   const out: StopNotifier = {
     sendPlainAlert: (text, severity, options) => n.sendPlainAlert(text, severity, options),
   };
-  // Worker only, best-effort, no fallback: a missed unpin is cosmetic.
-  if (deps.worker) out.unpinTopic = (threadId) => n.unpinTopic(threadId);
   return out;
 }
 
@@ -125,12 +117,15 @@ class AlertNotifier {
     const workerBudget = direct ? Math.min(WORKER_LEG_MS, total - DIRECT_RESERVE_MS) : total;
     const outcome = await worker.sendMessage(
       {
-        chatId: options?.chatId ?? this.deps.chatId,
+        // Only an address the worker handed out; otherwise the machine's own `#alerts`.
+        ...(options?.chatId !== undefined ? { chatId: options.chatId } : {}),
         text: `${severityPrefix(severity)}${text}`,
-        ...(severity === "error" && this.deps.transport?.() === "slack" ? { notifyOwner: true } : {}),
+        // An error-severity alert asks for the owner mention (D7); the worker's
+        // `SLACK_NOTIFY_OWNER` still decides, and unset means no mention at all.
+        ...(severity === "error" ? { notifyOwner: true } : {}),
         ...(options?.messageThreadId !== undefined ? { messageThreadId: options.messageThreadId } : {}),
         ...(options?.replyMarkup ? { urlButtons: options.replyMarkup.inline_keyboard } : {}),
-        // Keep the worker's Telegram abort under our own cap, so a slow Telegram is a
+        // Keep the worker's provider abort under our own cap, so a slow provider is a
         // definite 502 rather than our timer racing an in-flight post. At the full cap the
         // worker's default (~4s) already is.
         ...(workerBudget < WORKER_LEG_MS ? { timeoutMs: Math.max(500, workerBudget - 1_000) } : {}),
@@ -168,13 +163,6 @@ class AlertNotifier {
     return this.sendDirect(text, severity, options, left, outcome.reason);
   }
 
-  async unpinTopic(messageThreadId: number): Promise<void> {
-    await this.deps.worker!.unpinTopic(
-      { chatId: this.deps.chatId, messageThreadId },
-      { timeoutMs: PLAIN_ALERT_TIMEOUT_MS },
-    );
-  }
-
   private sendDirect(
     text: string,
     severity: AlertSeverity,
@@ -184,7 +172,7 @@ class AlertNotifier {
   ): Promise<void> {
     const r = reason.length > MAX_REASON_CHARS ? `${reason.slice(0, MAX_REASON_CHARS - 1)}…` : reason;
     const suffix = ` · sent direct; worker: ${r}`;
-    const room = TELEGRAM_MAX_TEXT - severityPrefix(severity).length - suffix.length;
+    const room = DIRECT_ALERT_MAX_TEXT - severityPrefix(severity).length - suffix.length;
     return this.deps.direct!.sendPlainAlert(`${truncate(text, room)}${suffix}`, severity, {
       ...options,
       timeoutMs,
@@ -203,9 +191,7 @@ class AlertNotifier {
       this.lastFallbackAlertAt.set(outcome.key, now);
       if (!this.deps.alerts) return;
       const where = this.deps.machineId ? ` on ${this.deps.machineId}` : "";
-      // Name the chat the human should look in (pigeon-4ogz.5): a flipped machine's alerts
-      // are in Slack #alerts.
-      const chat = this.deps.transport?.() === "slack" ? "Slack" : "Telegram";
+      const chat = "Slack";
       const text = !hasDirect
         ? `Worker POST /messages/send failed${where} (${outcome.reason}) and this host has no direct ` +
           `${chat} path, so operational alerts and slash-command replies were not getting out. ` +

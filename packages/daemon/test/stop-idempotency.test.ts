@@ -28,7 +28,7 @@ describe("POST /stop idempotency key", () => {
 
   function newApp(now = 1_000) {
     storage = openStorageDb(":memory:");
-    return createApp(storage, { nowFn: () => now, chatId: "chat-1", machineId: "devbox" });
+    return createApp(storage, { nowFn: () => now, machineId: "devbox" });
   }
 
   async function startSession(app: ReturnType<typeof createApp>, sessionId: string) {

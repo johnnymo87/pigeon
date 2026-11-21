@@ -1,24 +1,20 @@
 /**
- * Markdown for Telegram's `sendRichMessage` (Bot API 10.1), used for stop notifications whose
- * body contains a GFM pipe table (pigeon-p909), and for every goose turn (pigeon-6mkr). Design:
+ * Markdown for a Slack `markdown` block, used for stop notifications whose body contains a GFM
+ * pipe table (pigeon-p909), and for every goose turn (pigeon-6mkr). Design:
  * docs/plans/2026-11-02-telegram-rich-tables-design.md and
- * docs/plans/2026-11-03-goose-rich-markdown-design.md.
+ * docs/plans/2026-11-03-goose-rich-markdown-design.md (written for Telegram's dialect, which
+ * was deleted with Telegram, pigeon-4ogz.13; Slack's is plain GFM).
  *
- * Why only tables trigger it for opencode (whose plugin strips markdown anyway): plain `sendMessage` shows a table as a wall of `|`, and nothing
- * else agents write is unreadable that way. Turning markdown on for every message would change
- * how every answer reads, and Telegram's dialect is GFM PLUS extensions that make ordinary
- * prose fragile (`$5 and $10` is inline math, `a || b` a spoiler, `Promise<void>` an
- * unsupported HTML tag and therefore a parse error). So rich is the exception, and
- * `sanitizeBodyMarkdown` defangs exactly those extensions.
+ * Why only tables trigger it for opencode (whose plugin strips markdown anyway): plain text
+ * shows a table as a wall of `|`, and nothing else agents write is unreadable that way. Turning
+ * markdown on for every message would change how every answer reads. So rich is the exception.
  *
  * Everything here is pure, and every "this cannot be sent rich" answer is `null`, which the
  * caller treats as "send plain, as before".
  */
 import type { TgMessage } from "./telegram-message";
 
-/** Telegram's documented limits for a rich message. */
-export const RICH_MAX_CHARS = 32768;
-export const RICH_MAX_BLOCKS = 500;
+/** The widest table a rich message is offered with (a conservative bound, kept from Telegram's limit). */
 export const RICH_MAX_COLUMNS = 20;
 
 /**
@@ -45,24 +41,6 @@ const DASH_RULE = /^\s{0,3}-{3,}\s*$/;
 const ATX_HEADING = /^ {0,3}#{1,6}(?:[ \t]|$)/;
 /** A blockquote line, at any indentation (quotes nest inside list items). */
 const QUOTE_LINE = /^\s*>/;
-/** A list item marker, which Telegram counts as two blocks (the item and its paragraph). */
-const LIST_ITEM = /^\s*(?:[-*+]|\d+[.)])\s+/;
-/**
- * A `#` that starts a line's content (after indentation, quote markers and list markers) and
- * is followed by text with no space. GFM reads `#5620 is ready` as a paragraph; Telegram reads
- * it as a heading (probed, pigeon-ravn), in lists, task lists and quotes too.
- */
-const LOOSE_HASH =
-  /^((?:[ \t]*>|[ \t]*(?:[-*+]|\d+[.)])[ \t]+(?:\[[ xX]\][ \t]+)?)*[ \t]*)#(?=#*[^#\s])/;
-/**
- * An empty paragraph. Telegram draws rich paragraphs with no gap between them, so the blank
- * line between two paragraphs, which plain text showed as an empty line, vanished
- * (pigeon-ravn). This paragraph is that empty line.
- */
-const SPACER = "&nbsp;";
-/** A list item indented under another: a nested list. */
-const NESTED_ITEM = /^[ \t]+([-*+]|\d+[.)])[ \t]+(.*)$/;
-
 interface LineInfo {
   text: string;
   /** Inside a fenced code block, including the fence lines themselves. */
@@ -73,10 +51,6 @@ interface LineInfo {
   table: boolean;
   /** Column count, on a table's delimiter row only. */
   columns?: number;
-  /** A `SPACER` paragraph pigeon inserted; emitted as is. */
-  spacer?: boolean;
-  /** A nested list item flattened into a `◦` line of its parent item. */
-  subItem?: boolean;
 }
 
 /**
@@ -162,93 +136,10 @@ export function maxTableColumns(text: string): number {
   return classifyLines(text).reduce((max, l) => Math.max(max, l.columns ?? 0), 0);
 }
 
-const ASCII_PUNCT = /[!-/:-@[-`{-~]/;
-
 /**
- * Characters Telegram's rich markdown does NOT take a backslash escape for, so they are
- * written as entities. Probed against the live API on 2026-11-02: `Promise\<void>` rendered as
- * `Promise\` with `<void>` silently dropped (read as an unsupported HTML tag), and `\&` kept
- * its backslash. `&lt;` and `&amp;` render as `<` and `&`. Every other escape used here
- * (`\$ \= \| \! \* \_ \> \# \~ \\ \[ \] \``) was probed and works. Not applied inside code,
- * where entities are not decoded.
- */
-const ENTITY_SHAPED = /^&(?:[A-Za-z][A-Za-z0-9]*|#[0-9]+|#[xX][0-9a-fA-F]+);/;
-const ENTITY_ENCODED = new Map([
-  ["<", "&lt;"],
-  ["&", "&amp;"],
-]);
-
-/**
- * Escapes Telegram's non-GFM extensions in one line of prose, outside inline code spans:
- * `$` (math), `<` (HTML), `==` (marked) and, off table rows, `||` (spoiler). A table row keeps
- * `||` because there it is an empty cell. An existing backslash escape is copied as is.
- */
-function escapeInline(line: string, inTable: boolean): string {
-  let out = "";
-  let i = 0;
-  while (i < line.length) {
-    const ch = line[i]!;
-    if (ch === "\\" && i + 1 < line.length && ASCII_PUNCT.test(line[i + 1]!) && !ENTITY_ENCODED.has(line[i + 1]!)) {
-      out += line.slice(i, i + 2);
-      i += 2;
-      continue;
-    }
-    if (ch === "`") {
-      let run = 1;
-      while (line[i + run] === "`") run++;
-      const close = findBacktickRun(line, i + run, run);
-      if (close === -1) {
-        out += line.slice(i, i + run);
-        i += run;
-      } else {
-        out += line.slice(i, close + run);
-        i = close + run;
-      }
-      continue;
-    }
-    if (ch === "<") {
-      out += "&lt;";
-    } else if (ch === "&" && ENTITY_SHAPED.test(line.slice(i))) {
-      // Only an `&` that would be decoded: a lone `&` (R&D, `?a=1&b=2` in a URL) already
-      // renders as itself, and encoding it would break query strings in links.
-      out += "&amp;";
-    } else if (ch === "$") {
-      out += "\\$";
-    } else if (ch === "!" && line[i + 1] === "[") {
-      // `![alt](url)` is a media block that Telegram fetches, and inline it is a parse error.
-      out += "\\!";
-    } else if (ch === "=" && (line[i + 1] === "=" || line[i - 1] === "=")) {
-      out += "\\=";
-    } else if (!inTable && ch === "|" && (line[i + 1] === "|" || line[i - 1] === "|")) {
-      out += "\\|";
-    } else {
-      out += ch;
-    }
-    i++;
-  }
-  return out;
-}
-
-/** Index of the next backtick run of exactly `len` at or after `from`, or -1. */
-function findBacktickRun(line: string, from: number, len: number): number {
-  let i = from;
-  while (i < line.length) {
-    if (line[i] !== "`") {
-      i++;
-      continue;
-    }
-    let run = 1;
-    while (line[i + run] === "`") run++;
-    if (run === len) return i;
-    i += run;
-  }
-  return -1;
-}
-
-/**
- * Prepares an agent's text for rich markdown:
+ * Prepares an agent's text for Slack's markdown block (plain GFM, so none of Telegram's
+ * extensions to defang and none of its rendering quirks to work around):
  *
- * - escapes the Telegram extensions (see `escapeInline`) outside fenced and inline code;
  * - turns a lone newline into a hard break (`"  \n"`), because plain text showed every
  *   newline and markdown would otherwise fold consecutive lines into one paragraph. Not
  *   inside fences or tables, and not next to a fence line;
@@ -256,24 +147,16 @@ function findBacktickRun(line: string, from: number, len: number): number {
  *   prose is not read as part of that paragraph, and a line directly under a table is not
  *   read as one more row;
  * - puts a blank line before a heading under a non-blank line, and after a quote line followed
- *   by an unquoted one. Probed: Telegram folds `- done\n# Heading` into the list item, and
- *   `> said\nreply` into the quote (lazy continuation), where plain text showed the `>`
- *   (pigeon-6mkr).
+ *   by an unquoted one, so neither folds into the line above (lazy continuation);
+ * - closes an agent's unclosed top-level fence, which would otherwise take the footer in.
  */
-export function sanitizeBodyMarkdown(text: string, dialect?: RichDialect): string {
-  const slack = dialect === "slack";
+export function sanitizeBodyMarkdown(text: string): string {
   const classified = classify(text);
-  // Slack's markdown block is plain GFM: none of Telegram's extensions to defang, and none of
-  // the Telegram app's rendering quirks (spacer paragraphs, nested-list bullets, `#5620` read as
-  // a heading) to work around. Only the generic layout fixes below apply (pigeon-4ogz.5).
-  const lines = slack ? classified.lines : withSpacers(flattenSublists(classified.lines));
+  const lines = classified.lines;
   let out = "";
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
-    out +=
-      line.fenced || line.spacer || slack
-        ? line.text
-        : escapeInline(line.table ? line.text : line.text.replace(LOOSE_HASH, "$1\\#"), line.table);
+    out += line.text;
     const next = lines[i + 1];
     if (!next) break;
     const blank = line.text.trim() === "";
@@ -301,128 +184,8 @@ export function sanitizeBodyMarkdown(text: string, dialect?: RichDialect): strin
       out += "\n";
     }
   }
-  // An agent's unclosed fence would otherwise take the footer in with it (pigeon-ravn).
   if (classified.openTopLevelFence !== null) out += "\n" + classified.openTopLevelFence;
   return out;
-}
-
-/**
- * Turns a nested list into lines of its parent item: `  - sub` becomes `◦ sub`, and
- * `  2. sub` becomes `2\. sub` (escaped, or it would start a new list). The Telegram app
- * draws a list item that holds a nested list with its bullet on a line of its own, above the
- * text (seen on a phone, pigeon-ravn); a list item that is one paragraph is drawn properly.
- * A blank line before a sub-item is dropped so it joins its item. Applies only under a list
- * item (an indented list with no parent is left alone), and not in fences, tables or quotes.
- */
-function flattenSublists(lines: LineInfo[]): LineInfo[] {
-  const out: LineInfo[] = [];
-  // Content column of the item whose sub-items are flattened, or null outside a list.
-  let parentContent: number | null = null;
-  // The last flattened sub-item: lines under it (its fences, its later paragraphs) move left
-  // by `delta`, so they stay where they belong relative to its new position.
-  let sub: { content: number; delta: number } | null = null;
-  const indentOf = (text: string) => text.length - text.trimStart().length;
-  const dedent = (line: LineInfo, by: number): LineInfo => {
-    const strip = Math.min(by, indentOf(line.text));
-    return { ...line, text: line.text.slice(strip) };
-  };
-  for (const raw of lines) {
-    const blank = raw.text.trim() === "";
-    const indent = indentOf(raw.text);
-    if (raw.table) {
-      parentContent = null;
-      sub = null;
-      out.push(raw);
-      continue;
-    }
-    if (raw.fenced || blank) {
-      const line = sub && !blank && indent >= sub.content ? dedent(raw, sub.delta) : raw;
-      // A fence at the margin ends the list; one under an item is indented.
-      if (raw.fenceLine && indent === 0) {
-        parentContent = null;
-        sub = null;
-      }
-      out.push(line);
-      continue;
-    }
-    const nested = parentContent !== null && indent >= parentContent ? raw.text.match(NESTED_ITEM) : null;
-    if (nested) {
-      while (out.length > 0 && !out[out.length - 1]!.fenced && out[out.length - 1]!.text.trim() === "") out.pop();
-      const marker = nested[1]!;
-      const bullet = /\d/.test(marker) ? marker.slice(0, -1) + "\\" + marker.slice(-1) : "◦";
-      const rest = nested[2]!.replace(/^\[ \](?=[ \t])/, "☐").replace(/^\[[xX]\](?=[ \t])/, "☑");
-      // Right after a fence or quote there is no paragraph to continue, so the line is
-      // indented into the item as a paragraph of its own instead of falling out of the list.
-      const prev = out[out.length - 1];
-      const inside = prev !== undefined && (prev.fenceLine || QUOTE_LINE.test(prev.text));
-      out.push({ ...raw, text: `${inside ? " ".repeat(parentContent!) : ""}${bullet} ${rest}`, subItem: true });
-      const content = raw.text.match(LIST_ITEM)![0].length;
-      sub = { content, delta: content - parentContent! };
-      continue;
-    }
-    if (sub && indent >= sub.content) {
-      out.push(dedent(raw, sub.delta));
-      continue;
-    }
-    sub = null;
-    if (LIST_ITEM.test(raw.text) && !QUOTE_LINE.test(raw.text)) {
-      // Four spaces with no list open is an indented code block, not a list.
-      if (parentContent !== null || indent < 4) parentContent = raw.text.match(LIST_ITEM)![0].length;
-    } else if (indent === 0) {
-      parentContent = null;
-    }
-    out.push(raw);
-  }
-  return out;
-}
-
-/**
- * Replaces each run of blank lines between two blocks with one `SPACER` paragraph, so the
- * empty line plain text showed stays visible. Not inside fenced code, not before an indented
- * line (it would end the list item or code it continues), and not between two list items (it
- * would split the list, restarting an ordered list's numbering). Blank lines at either end are
- * left alone, and so are the blank lines the sanitizer adds itself: plain text showed no gap
- * there.
- */
-function withSpacers(lines: LineInfo[]): LineInfo[] {
-  const out: LineInfo[] = [];
-  let prev: LineInfo | undefined;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]!;
-    if (line.fenced || line.text.trim() !== "") {
-      out.push(line);
-      prev = line;
-      continue;
-    }
-    let j = i;
-    while (j < lines.length && !lines[j]!.fenced && lines[j]!.text.trim() === "") j++;
-    const next = lines[j];
-    const run = lines.slice(i, j);
-    i = j - 1;
-    const spaced =
-      prev !== undefined &&
-      next !== undefined &&
-      !/^\s/.test(next.text) &&
-      !(LIST_ITEM.test(next.text) && (LIST_ITEM.test(prev.text) || prev.subItem === true || /^\s/.test(prev.text)));
-    if (!spaced) {
-      out.push(...run);
-      continue;
-    }
-    const blank = (): LineInfo => ({ text: "", fenced: false, fenceLine: false, table: false });
-    out.push(blank(), { ...blank(), text: SPACER, spacer: true }, blank());
-  }
-  return out;
-}
-
-/** Characters escaped in pigeon's own (non-agent) text: header, footer. */
-const MD_SPECIAL = /[\\`*_[\]<>|$=~#&!]/g;
-
-function escapePlain(s: string): string {
-  return s
-    .replace(MD_SPECIAL, (c, i: number) =>
-      c === "&" ? (ENTITY_SHAPED.test(s.slice(i)) ? "&amp;" : "&") : (ENTITY_ENCODED.get(c) ?? "\\" + c),
-    )
-    .replace(/\n/g, "  \n");
 }
 
 function codeSpan(content: string): string {
@@ -430,21 +193,6 @@ function codeSpan(content: string): string {
   const fence = "`".repeat(longest + 1);
   const pad = content.startsWith("`") || content.endsWith("`") ? " " : "";
   return `${fence}${pad}${content}${pad}${fence}`;
-}
-
-/** Telegram's limit on a copy_text button's text (probed: 256 passes, 300 is rejected). */
-const COPY_TEXT_MAX = 256;
-
-/**
- * A code entity as an inline copy button. In a plain message a code entity copies with one
- * tap (the 🆔 session id, the 📂 path); rich inline code does not (pigeon-ravn). The label is
- * markdown (Telegram parses markdown inside inline tags), the copy text an HTML attribute.
- * Null when the text does not fit a button, and the caller uses a code span.
- */
-function copyButton(content: string): string | null {
-  if (content.length === 0 || content.length > COPY_TEXT_MAX || content.includes("\n")) return null;
-  const attr = content.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<tg-button type="copy_text" text="${attr}">${escapePlain(content)}</tg-button>`;
 }
 
 function codeBlock(content: string): string {
@@ -458,64 +206,44 @@ function codeBlock(content: string): string {
  * segments are escaped; entities become their markdown form. Returns null on overlapping
  * entities, which pigeon never builds, so the caller falls back to plain.
  */
-export function tgMessageToMarkdown(msg: TgMessage, dialect?: RichDialect): string | null {
-  const slack = dialect === "slack";
-  const esc = slack ? escapePlainSlack : escapePlain;
+export function tgMessageToMarkdown(msg: TgMessage): string | null {
   const entities = [...msg.entities].sort((a, b) => a.offset - b.offset);
   let out = "";
   let pos = 0;
   for (const e of entities) {
     if (e.offset < pos) return null;
-    out += esc(msg.text.slice(pos, e.offset));
+    out += escapePlainSlack(msg.text.slice(pos, e.offset));
     const content = msg.text.slice(e.offset, e.offset + e.length);
     switch (e.type) {
       case "code":
         // Slack has no copy button; a code span is what its client lets you copy.
-        out += (slack ? null : copyButton(content)) ?? codeSpan(content);
+        out += codeSpan(content);
         break;
       case "pre":
         out += codeBlock(content);
         break;
       case "bold":
-        out += `**${esc(content)}**`;
+        out += `**${escapePlainSlack(content)}**`;
         break;
       case "italic":
-        out += `_${esc(content)}_`;
+        out += `_${escapePlainSlack(content)}_`;
         break;
     }
     pos = e.offset + e.length;
   }
-  out += esc(msg.text.slice(pos));
+  out += escapePlainSlack(msg.text.slice(pos));
   return out;
 }
 
 /**
- * Characters escaped in pigeon's own text for Slack: CommonMark's backslash escapes for the
- * emphasis, code, link, strikethrough and table characters. No entities and no Telegram
- * escapes (`\$`, `\=`, `&lt;`), which Slack would show literally.
+ * Characters escaped in pigeon's own text: CommonMark's backslash escapes for the emphasis,
+ * code, link, strikethrough and table characters.
  */
 const MD_SPECIAL_SLACK = /[\\`*_[\]~|]/g;
 
 function escapePlainSlack(s: string): string {
   return s.replace(MD_SPECIAL_SLACK, (c) => "\\" + c).replace(/\n/g, "  \n");
 }
-
-/**
- * Estimate of Telegram's block count, which includes nested blocks: every non-blank line
- * outside fences, list items twice (item plus paragraph), plus fences. An undercount costs
- * one rejected call and a plain fallback, not a lost message.
- */
-function estimateBlocks(markdown: string): number {
-  let blocks = 0;
-  for (const line of classifyLines(markdown)) {
-    if (line.fenceLine) blocks++;
-    else if (!line.fenced && line.text.trim() !== "") blocks += LIST_ITEM.test(line.text) ? 2 : 1;
-  }
-  return blocks;
-}
-
-/** Which markdown dialect to write. Absent: Telegram's (the default since pigeon-p909). */
-export type RichDialect = "slack";
 
 /** Slack's limit for a markdown block, in characters (the worker's `SLACK_MARKDOWN_MAX`). */
 export const SLACK_RICH_MAX_CHARS = 12_000;
@@ -526,18 +254,13 @@ export interface BuildRichOptions {
    * goose turns, whose markdown is rendered whatever it contains (pigeon-6mkr).
    */
   requireTable?: boolean;
-  /**
-   * `"slack"`: standard GFM for a Slack markdown block (pigeon-4ogz.5), with Slack's limit and no
-   * Telegram block estimate.
-   */
-  dialect?: RichDialect;
 }
 
 /**
  * The rich markdown for a notification, or null when it should go plain: no table in the
- * body (unless `requireTable` is false), a header/footer that cannot be converted, or any of
- * Telegram's limits exceeded. Layout matches the plain chunk: header, body, footer separated
- * by blank lines (as `SPACER` paragraphs), empty parts skipped.
+ * body (unless `requireTable` is false), a header/footer that cannot be converted, or a limit
+ * exceeded. Layout matches the plain chunk: header, body, footer separated by blank lines,
+ * empty parts skipped.
  */
 export function buildRichMarkdown(
   header: TgMessage,
@@ -548,20 +271,12 @@ export function buildRichMarkdown(
   if ((options.requireTable ?? true) && !hasPipeTable(body.text)) return null;
   if (maxTableColumns(body.text) > RICH_MAX_COLUMNS) return null;
 
-  const dialect = options.dialect;
-  const head = tgMessageToMarkdown(header, dialect);
-  const foot = tgMessageToMarkdown(footer, dialect);
+  const head = tgMessageToMarkdown(header);
+  const foot = tgMessageToMarkdown(footer);
   if (head === null || foot === null) return null;
 
-  const parts = [head, sanitizeBodyMarkdown(body.text, dialect), foot].filter((p) => p.length > 0);
-  if (dialect === "slack") {
-    // Slack draws the gap between paragraphs itself.
-    const markdown = parts.join("\n\n");
-    return [...markdown].length > SLACK_RICH_MAX_CHARS ? null : markdown;
-  }
-  const markdown = parts.join(`\n\n${SPACER}\n\n`);
-
-  if ([...markdown].length > RICH_MAX_CHARS) return null;
-  if (estimateBlocks(markdown) > RICH_MAX_BLOCKS) return null;
-  return markdown;
+  const parts = [head, sanitizeBodyMarkdown(body.text), foot].filter((p) => p.length > 0);
+  // Slack draws the gap between paragraphs itself.
+  const markdown = parts.join("\n\n");
+  return [...markdown].length > SLACK_RICH_MAX_CHARS ? null : markdown;
 }

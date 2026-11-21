@@ -112,9 +112,31 @@ describe("classifyDeliveryFailure", () => {
       expected: { action: "pause", retryAfterSec: 5 },
     },
 
-    // --- Rule 6: 502 + details.error_code 400 + entities ---
+    // --- Rule 6: 502 + errorClass rejected_format + entities ---
     {
-      name: "502 with details.error_code 400 AND payloadHasEntities returns strip_entities",
+      name: "502 with errorClass rejected_format AND payloadHasEntities returns strip_entities",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 502,
+        body: { error: "Telegram API error", errorClass: "rejected_format", details: { error_code: 400, description: "invalid_blocks" } },
+      },
+      ctx: { payloadHasEntities: true },
+      expected: { action: "strip_entities" },
+    },
+    {
+      name: "502 with errorClass rejected_format but NO entities returns retry",
+      result: {
+        ok: false,
+        kind: "http_error",
+        status: 502,
+        body: { error: "Telegram API error", errorClass: "rejected_format", details: { error_code: 400, description: "invalid_blocks" } },
+      },
+      ctx: { payloadHasEntities: false },
+      expected: { action: "retry" },
+    },
+    {
+      name: "502 with a bare details.error_code 400 and no errorClass returns retry (the Telegram fallback is gone)",
       result: {
         ok: false,
         kind: "http_error",
@@ -122,17 +144,17 @@ describe("classifyDeliveryFailure", () => {
         body: { error: "Telegram API error", details: { error_code: 400, description: "Bad Request: can't parse entities" } },
       },
       ctx: { payloadHasEntities: true },
-      expected: { action: "strip_entities" },
+      expected: { action: "retry" },
     },
     {
-      name: "502 with details.error_code 400 but NO entities returns retry",
+      name: "502 with errorClass conversation_gone returns retry, not strip_entities",
       result: {
         ok: false,
         kind: "http_error",
         status: 502,
-        body: { error: "Telegram API error", details: { error_code: 400, description: "Bad Request: bad formatting" } },
+        body: { error: "Telegram API error", errorClass: "conversation_gone", details: { error_code: 400 } },
       },
-      ctx: { payloadHasEntities: false },
+      ctx: { payloadHasEntities: true },
       expected: { action: "retry" },
     },
     {

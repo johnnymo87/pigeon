@@ -27,6 +27,14 @@ describe("WorkerMessageClient.sendMessage", () => {
     expect(body).toEqual({ chatId: "-100", text: "hi" });
   });
 
+  it("sends no chatId when it has none (the machine's #alerts), and still sends a worker-supplied one", async () => {
+    const f = vi.fn(async () => json({ ok: true, messageId: 1 }));
+    await client(f as unknown as typeof fetch).sendMessage({ text: "hi" }, { timeoutMs: 5_000 });
+    expect(call(f).body).toEqual({ text: "hi" });
+    await client(f as unknown as typeof fetch).sendMessage({ chatId: "slack:T1", text: "hi" }, { timeoutMs: 5_000 });
+    expect(call(f, 1).body).toEqual({ chatId: "slack:T1", text: "hi" });
+  });
+
   it("passes entities, thread, buttons and the worker-side timeoutMs through", async () => {
     const f = vi.fn(async () => json({ ok: true, messageId: 1 }));
     const urlButtons = [[{ text: "a", url: "https://t.me/c/1/2" }]];
@@ -141,22 +149,5 @@ describe("WorkerMessageClient.sendMessage", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-});
-
-describe("WorkerMessageClient.unpinTopic", () => {
-  it("POSTs /topics/unpin and resolves on 2xx", async () => {
-    const f = vi.fn(async () => json({ ok: true }));
-    await client(f as unknown as typeof fetch).unpinTopic({ chatId: "-100", messageThreadId: 12 }, { timeoutMs: 5_000 });
-    const { url, body } = call(f);
-    expect(url).toBe(`${URL_BASE}/topics/unpin`);
-    expect(body).toEqual({ chatId: "-100", messageThreadId: 12 });
-  });
-
-  it("throws on a non-2xx and on ok:false", async () => {
-    const c1 = client(vi.fn(async () => json({ error: "x" }, 502)) as unknown as typeof fetch);
-    await expect(c1.unpinTopic({ chatId: "-100", messageThreadId: 1 }, { timeoutMs: 5_000 })).rejects.toThrow(/502/);
-    const c2 = client(vi.fn(async () => json({ ok: false })) as unknown as typeof fetch);
-    await expect(c2.unpinTopic({ chatId: "-100", messageThreadId: 1 }, { timeoutMs: 5_000 })).rejects.toThrow();
   });
 });

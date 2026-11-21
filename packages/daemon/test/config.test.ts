@@ -31,13 +31,15 @@ describe("loadConfig", () => {
     expect(config.dbPath).toBe("/tmp/daemon.db");
   });
 
-  it("loads telegram env vars", () => {
+  it("ignores leftover TELEGRAM_* env vars (Telegram was deleted, pigeon-4ogz.13): no field, no throw", () => {
     const config = loadConfig({
       TELEGRAM_BOT_TOKEN: "bot",
       TELEGRAM_CHAT_ID: "123",
+      TELEGRAM_GROUP_ID: "456",
     });
-    expect(config.telegramBotToken).toBe("bot");
-    expect(config.telegramChatId).toBe("123");
+    expect(config).not.toHaveProperty("telegramBotToken");
+    expect(config).not.toHaveProperty("telegramChatId");
+    expect(JSON.stringify(config)).not.toMatch(/bot|123|456/);
   });
 
   it("loads opencode env vars when OPENCODE_URL is set", () => {

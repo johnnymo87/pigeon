@@ -5,7 +5,7 @@ import { TgMessageBuilder, type TgEntity, type TgMessage } from "./telegram-mess
 import type { SendNotificationInput, WorkerResult } from "./worker/poller";
 
 /**
- * Upper bound on a plain-alert Telegram request. Deliberately short: the
+ * Upper bound on a plain-alert request. Deliberately short: the
  * callers await this on their critical paths (see `sendPlainAlert`), so the
  * cost of waiting is a stalled delivery loop, while the cost of giving up is
  * one lost operational alert that is already best-effort.
@@ -66,29 +66,11 @@ export function displayName(input: {
 
 export type AlertSeverity = "info" | "warning" | "error";
 
-/**
- * Error thrown when a notification attempt is rate-limited by the worker / Telegram API.
- */
-export class RateLimitError extends Error {
-  /**
-   * @param message Human-readable error description.
-   * @param retryAfter Duration to wait before retrying, in **seconds** (direct from Telegram API `parameters.retry_after`).
-   */
-  constructor(
-    message: string,
-    public readonly retryAfter: number,
-  ) {
-    super(message);
-    this.name = "RateLimitError";
-  }
-}
-
 export interface StopNotifier {
   /**
    * Optional: send a free-form text alert (no inline_keyboard, no token,
    * no session binding). Used by external services (e.g. lgtm) that want
-   * to surface a one-shot operational message via the existing Telegram
-   * bot. Implementations may omit this method; callers must check for
+   * to surface a one-shot operational message in the chat. Implementations may omit this method; callers must check for
    * its presence and degrade gracefully.
    */
   sendPlainAlert?(
@@ -96,11 +78,6 @@ export interface StopNotifier {
     severity: AlertSeverity,
     options?: PlainAlertOptions,
   ): Promise<void>;
-  /**
-   * Optional: clear the pin Telegram puts on the first message of a newly
-   * created forum topic. Best-effort; callers must tolerate absence and failure.
-   */
-  unpinTopic?(messageThreadId: number): Promise<void>;
 }
 
 export interface PlainAlertOptions {
@@ -124,7 +101,7 @@ export interface PlainAlertOptions {
   /**
    * The chat `messageThreadId` belongs to, when the worker named it (`/topics/named` returns
    * `chatId`, pigeon-4ogz.5): a `slack:<team>` address for a Slack channel. Absent means the
-   * notifier's configured chat, as before.
+   * machine's own `#alerts`.
    */
   chatId?: string;
 }

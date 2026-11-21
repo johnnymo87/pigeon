@@ -21,11 +21,11 @@
  * DELIVERY. The alert leaves via `AlertRepository` -> `AlertDrainer` ->
  * `StopNotifier.sendPlainAlert`, which since chat-transport phase 1 (pigeon-lenr) tries the
  * worker's `POST /messages/send` first and, when the WORKER fails, re-sends through the
- * daemon's one direct Bot API path (`DirectTelegramAlarm`, see alert-notifier.ts), marked
- * `sent direct; worker: <reason>`. The fallback is what keeps this alarm meaningful: it can
- * still get out while the thing it is reporting on is broken. On a host with no bot token
+ * daemon's one direct path (`DirectSlackAlarm`, the `#alerts` webhook, see alert-notifier.ts),
+ * marked `sent direct; worker: <reason>`. The fallback is what keeps this alarm meaningful: it
+ * can still get out while the thing it is reporting on is broken. On a host with no webhook
  * there is no fallback, and an alert about a broken worker is only recorded. Everything else
- * the daemon sends to Telegram goes through the worker with no fallback and would be stuck
+ * the daemon sends to chat goes through the worker with no fallback and would be stuck
  * behind the very outage being reported.
  *
  * WHAT THIS DOES NOT COVER. The counters observe CALLS, so they measure "our writes to the
@@ -181,14 +181,14 @@ function describeConsequence(endpoint: WorkerEndpoint, cls: WorkerFailureClass):
   }
   if (cls === "client_error") {
     return (
-      "Telegram delivery through the worker is failing. What happens to the queued entries " +
+      "Chat delivery through the worker is failing. What happens to the queued entries " +
       "depends on the exact status, so read the one above before assuming anything is still " +
       "held: 400 is terminal at once and 404 is terminal once re-registration is spent, and " +
       "those entries are DROPPED rather than retried; 403 retries indefinitely; 429 pauses " +
       "the outbox."
     );
   }
-  return "Telegram delivery through the worker is down; the daemon outbox is holding and retrying.";
+  return "Chat delivery through the worker is down; the daemon outbox is holding and retrying.";
 }
 
 const MIN_SPAN_MS: Record<WorkerFailureClass, number> = {
@@ -207,7 +207,7 @@ const MIN_SPAN_MS: Record<WorkerFailureClass, number> = {
  * A 4xx was called neutral on the grounds that it proves the worker is answering. That is
  * true and it is beside the point: a SUSTAINED 4xx on a write route is a total outage for
  * the affected function while the worker stays perfectly healthy. A 429 from the session
- * cap means no session can register; a 403 from `ALLOWED_CHAT_IDS` means every send is
+ * cap means no session can register; a 403 (chat not allowed) means every send is
  * refused and, per delivery-policy rule 3, retried forever. The 2026-07-14 outage in this
  * file's header was most likely exactly that shape, so the alarm written in response to it
  * would have stayed silent through it.
@@ -219,32 +219,28 @@ const MIN_SPAN_MS: Record<WorkerFailureClass, number> = {
  *
  *  - `app_rejection` (HTTP 2xx carrying `ok:false`) is ambiguous by construction and is
  *    not currently reachable on either route.
- *  - A 502 relaying a Telegram 400 — and ONLY 400 — is Telegram's verdict on our message,
- *    not the worker failing. This one is load-bearing rather than fastidious: a 5xx never
- *    charges an outbox entry an attempt (`isTransportFailure`), so a message Telegram
- *    keeps rejecting retries until the age cap. After `strip_entities` fires once the
+ *  - A 502 with `errorClass` `rejected_format` or `conversation_gone` is the chat provider's
+ *    verdict on our message or conversation, not the worker failing. This one is
+ *    load-bearing rather than fastidious: a 5xx never charges an outbox entry an attempt
+ *    (`isTransportFailure`), so a message the provider keeps rejecting retries until the
+ *    age cap. After `strip_entities` fires once the
  *    payload no longer has entities, so rule 6 stops matching and every subsequent
  *    rejection lands on the generic retry arm as a bare 502. Counting those would let ONE
  *    poisoned message raise an alert naming the wrong component while the worker is
  *    perfectly healthy.
  *
- * The exclusion stops at 400 deliberately. The worker relays EVERY Telegram error as a 502
- * carrying that code (`getTelegramErrorDetails` in worker/telegram.ts), so excluding the
- * whole 4xx range would also swallow 401 (bot token revoked, or a botched rotation) and
- * 403 (bot removed from the group). Those are verdicts on the DEPLOYMENT rather than on one
- * message: they fail every send until a human intervenes, which is exactly the sustained
+ * The exclusion is only those two classes, deliberately. `upstream` (a dead or revoked
+ * token, the provider down) and `rate_limited` are verdicts on the DEPLOYMENT rather than on
+ * one message: they fail every send until a human intervenes, which is exactly the sustained
  * total failure this alarm exists to record. The alert text will name the worker when the
  * true culprit is the token, but a misattributed alert beats six hours of silence.
  *
- * A 502 relaying a Telegram 5xx, or carrying no Telegram error code at all, still counts:
- * those are the worker's own failures, or Telegram being down, and both are worth knowing.
- *
- * TWO DIFFERENT 400s, and only one is excluded. A Telegram 400 is excluded (above); a
+ * TWO DIFFERENT 400s, and only one is excluded. A provider rejection is excluded (above); a
  * WORKER 400 is counted. That is not an inconsistency, because the two arrive by different
  * routes and behave differently once they do:
  *
- *  - Telegram's 400 never reaches us as an HTTP 400 — it comes back as a 502 carrying
- *    `details.error_code`. Being a 5xx, `isTransportFailure` calls it transient, so it is
+ *  - A provider rejection never reaches us as an HTTP 400 — it comes back as a 502 carrying
+ *    `errorClass`. Being a 5xx, `isTransportFailure` calls it transient, so it is
  *    never charged an outbox attempt and ONE poisoned message can retry until the age cap.
  *    That single entry could trip an alarm by itself, which is why it is carved out.
  *  - A worker 400 is field validation only, and delivery-policy rule 4 makes it TERMINAL:
@@ -262,17 +258,16 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     return "transport";
   }
   if (result.kind === "http_error" && result.status >= 500) {
-    // A Slack verdict on one message or one conversation (pigeon-4ogz.5) is the twin of the
-    // Telegram 400 below. `upstream` (a dead token, Slack down) and `rate_limited` still count.
+    // A Slack verdict on one message or one conversation (pigeon-4ogz.5) is not the worker
+    // failing. `upstream` (a dead token, Slack down) and `rate_limited` still count. Every
+    // provider failure the worker relays carries a class, so the former `details.error_code`
+    // 400 carve-out (Telegram) is gone (pigeon-4ogz.13).
     const errorClass = getErrorClass(result.body);
     if (errorClass === "rejected_format" || errorClass === "conversation_gone") {
       return "neutral";
     }
-    if (errorClass === undefined && getTelegramErrorCode(result.body) === 400) {
-      return "neutral";
-    }
     // A 502 with error "topic_unavailable" (pigeon-iqpd) is the worker holding a transient
-    // topic-resolution failure (Telegram createForumTopic 5xx / poll_exhausted) for outbox retry.
+    // topic-resolution failure (channel create 5xx / poll_exhausted) for outbox retry.
     // One held entry produces 5 samples over ~105s and would otherwise page "Worker
     // /notifications/send is failing" and then a recovery, both naming the wrong component.
     // The relocation alert after the hold window is the human-facing signal; the existing
@@ -287,7 +282,7 @@ export function classifyWorkerHealthSample(result: WorkerResult): WorkerHealthSa
     return "server_error";
   }
   // No per-status cases in the 4xx range, and that is the point: 401 from a rotated token,
-  // 403 from ALLOWED_CHAT_IDS, 404 from a lost session row, 429 from the session cap, and
+  // 403 from a refused chat, 404 from a lost session row, 429 from the session cap, and
   // anything Cloudflare injects in front of the worker are all deployment-level conditions
   // that fail every call alike. Enumerating them would mean maintaining a list that a new
   // worker route or an intermediary could silently fall outside of.
@@ -383,7 +378,7 @@ export class WorkerHealthMonitor implements WorkerHealthObserver {
         // quiet, so it is also the one case that would otherwise leave no trace at all.
         // Leave a journal line: "no durable record" is what made the outage that motivated
         // this alarm undiagnosable. Since pigeon-5typ the samples reaching here are the
-        // carved-out 502 (Telegram 400 or topic_unavailable), the unreachable app_rejection,
+        // carved-out 502 (rejected_format, conversation_gone or topic_unavailable), the unreachable app_rejection,
         // and an http_error below 400 — an unfollowed 3xx, which `safeExecuteWorkerFetch` turns into an http_error like
         // any other non-ok response. That last one stays silent even here, since the guard
         // below is deliberately 5xx-only; it is remote enough not to be worth a line.

@@ -38,9 +38,7 @@ const plugin: Plugin = async (ctx) => {
 
     const sessionManager = new SessionManager()
 
-    const daemonUrl =
-      process.env.PIGEON_DAEMON_URL ??
-      `http://127.0.0.1:${process.env.TELEGRAM_WEBHOOK_PORT ?? "4731"}`
+    const daemonUrl = process.env.PIGEON_DAEMON_URL ?? "http://127.0.0.1:4731"
 
     const messageTail = new MessageTail({
       postMirror: (opts) => postMirror({ ...opts, daemonUrl, log }),

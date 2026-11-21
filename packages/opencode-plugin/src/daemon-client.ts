@@ -86,8 +86,7 @@ let breakerBackoff = 30_000
 function getDaemonUrl(override?: string): string {
   if (override) return override
   if (process.env.PIGEON_DAEMON_URL) return process.env.PIGEON_DAEMON_URL
-  const port = process.env.TELEGRAM_WEBHOOK_PORT ?? "4731"
-  return `http://127.0.0.1:${port}`
+  return "http://127.0.0.1:4731"
 }
 
 function checkBreaker(): boolean {

@@ -73,7 +73,6 @@ export interface OutboxSenderOptions {
   unregisterSession?: UnregisterSessionFn;
   /** Uploads a stop's parked files (pigeon-4ogz.23). Absent: files are dropped, text still goes. */
   uploadMedia?: UploadMediaFn;
-  chatId?: string;
   nowFn?: () => number;
   log?: LogFn;
   /**
@@ -374,7 +373,6 @@ export class OutboxSender {
   private readonly registerSession: RegisterSessionFn | undefined;
   private readonly unregisterSession: UnregisterSessionFn | undefined;
   private readonly gateSwarmOnLocalSession: boolean;
-  private readonly chatId: string | undefined;
   private readonly nowFn: () => number;
   private readonly log: LogFn;
 
@@ -456,7 +454,6 @@ export class OutboxSender {
     this.unregisterSession = opts.unregisterSession;
     this.uploadMedia = opts.uploadMedia;
     this.gateSwarmOnLocalSession = opts.gateSwarmOnLocalSession ?? false;
-    this.chatId = opts.chatId;
     this.nowFn = opts.nowFn ?? (() => Date.now());
     this.log = opts.log ?? ((msg, fields) => {
       if (fields) {
@@ -668,10 +665,6 @@ export class OutboxSender {
     this.processing = true;
 
     try {
-      if (!this.chatId) {
-        return;
-      }
-
       const now = this.nowFn();
       if (this.pausedUntil > 0) {
         if (now < this.pausedUntil) {
@@ -811,7 +804,7 @@ export class OutboxSender {
         let title: string | undefined;
         let dir: string | undefined;
         let threaded: boolean | undefined;
-        let rich: { markdown: string; dialect?: "slack" } | undefined;
+        let rich: { markdown: string; dialect: "slack" } | undefined;
         let notifyOwner: true | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
@@ -831,13 +824,15 @@ export class OutboxSender {
           title = parsed.title;
           dir = parsed.dir;
           threaded = parsed.threaded;
+          // A row queued before Telegram was deleted carries Telegram-dialect markdown (no
+          // `dialect`): it is dropped here, so that entry goes out as its plain chunks.
           rich =
-            typeof parsed.rich?.markdown === "string" && parsed.rich.markdown.length > 0
-              ? parsed.rich.dialect === "slack"
-                ? { markdown: parsed.rich.markdown, dialect: "slack" }
-                : { markdown: parsed.rich.markdown }
+            typeof parsed.rich?.markdown === "string" &&
+            parsed.rich.markdown.length > 0 &&
+            parsed.rich.dialect === "slack"
+              ? { markdown: parsed.rich.markdown, dialect: "slack" }
               : undefined;
-          // Set at enqueue on a Slack machine (pigeon-4ogz.5); the worker decides.
+          // Set at enqueue (pigeon-4ogz.5); the worker decides whether it becomes a mention.
           notifyOwner = parsed.notifyOwner === true ? true : undefined;
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
@@ -959,7 +954,6 @@ export class OutboxSender {
             }
             const result = await this.sendNotification({
               sessionId: entry.sessionId,
-              chatId: this.chatId,
               text: msg.text,
               replyMarkup: isLast ? replyMarkup : { inline_keyboard: [] },
               notificationId: chunkNotificationId(notificationId, i, isLast),

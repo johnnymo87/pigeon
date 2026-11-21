@@ -49,9 +49,9 @@ export function getTelegramErrorDescription(body: unknown): string | undefined {
 }
 
 /**
- * The worker's `errorClass` for a Slack failure (pigeon-4ogz.5): top-level on the response body,
- * or inside `details` (the Slack client puts it in both). Undefined for every Telegram response,
- * which is how the legacy rules below keep applying to them unchanged.
+ * The worker's `errorClass` for a failure (pigeon-4ogz.5): top-level on the response body,
+ * or inside `details` (the Slack client puts it in both). Every failure the worker's send routes
+ * relay from the chat provider carries one; worker-side refusals (validation, auth) do not.
  */
 export function getErrorClass(body: unknown): string | undefined {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
@@ -98,9 +98,9 @@ export function isTransportFailure(result: WorkerResult): boolean {
  * 3. 403 -> retry, never terminal (a 403 never reaches Telegram; see the arm for why)
  * 4. 400 -> terminal
  * 5. positive finite retryAfter on remaining !ok -> pause
- * 6. 502 + payloadHasEntities + a rejected payload -> strip_entities. A Slack response says so
- *    with `errorClass: "rejected_format"` (any other class is not a payload problem); a
- *    Telegram one, which has no class, with details.error_code 400.
+ * 6. 502 + payloadHasEntities + `errorClass: "rejected_format"` -> strip_entities (any other
+ *    class is not a payload problem). The former fallback on `details.error_code === 400` is
+ *    gone with Telegram: every provider failure the worker relays carries a class.
  * 7. anything else -> retry
  *
  * Note on ok:true results:
@@ -194,19 +194,13 @@ export function classifyDeliveryFailure(
     return { action: "pause", retryAfterSec: result.retryAfter };
   }
 
-  // Rule 6: http_error status 502 AND body.details.error_code === 400 AND ctx.payloadHasEntities
-  // WHY: Entity stripping keys on 502 + details.error_code 400.
-  // A Telegram 400 (for example a malformed message entity) does NOT reach the daemon as HTTP 400.
-  // It arrives as HTTP 502 with body.details.error_code === 400. The only 400 the daemon can observe
-  // is worker field validation, where stripping entities would be useless.
-  // The class is preferred when present, so either deploy order is safe: an older worker sends
-  // only the code, and a Slack `conversation_gone` (code 400 too) is not stripped.
+  // Rule 6: http_error status 502 AND errorClass === "rejected_format" AND ctx.payloadHasEntities
+  // WHY: a rejected payload (for example malformed entities) does NOT reach the daemon as HTTP 400.
+  // It arrives as HTTP 502 carrying the class. The only 400 the daemon can observe is worker field
+  // validation, where stripping entities would be useless. `conversation_gone` (code 400 too) and
+  // every other class are not payload problems and are retried.
   if (result.kind === "http_error" && result.status === 502 && ctx.payloadHasEntities) {
-    const errorClass = getErrorClass(result.body);
-    const rejected = errorClass !== undefined
-      ? errorClass === "rejected_format"
-      : getTelegramErrorCode(result.body) === 400;
-    if (rejected) return { action: "strip_entities" };
+    if (getErrorClass(result.body) === "rejected_format") return { action: "strip_entities" };
   }
 
   // Rule 7: Anything else still !ok (other 5xx, 502 without an entity-400, app_rejection)

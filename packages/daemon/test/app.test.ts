@@ -674,7 +674,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-123",
     });
 
     await app(new Request("http://localhost/session-start", {
@@ -707,7 +706,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 60_000,
-      chatId: "chat-123",
       machineId: "devbox",
     });
 
@@ -746,7 +744,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 65_000,
-      chatId: "chat-123",
       machineId: "devbox",
     });
 
@@ -810,7 +807,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 68_000,
-      chatId: "chat-123",
     });
 
     await app(new Request("http://localhost/session-start", {
@@ -848,7 +844,6 @@ describe("createApp", () => {
     const fixedNow = 70_000;
     const app = createApp(storage, {
       nowFn: () => fixedNow,
-      chatId: "chat-123",
     });
 
     await app(new Request("http://localhost/session-start", {
@@ -880,7 +875,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-123",
       machineId: "devbox",
     });
 
@@ -936,7 +930,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-123",
       machineId: "devbox",
     });
 
@@ -983,7 +976,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-123",
       machineId: "devbox",
     });
 
@@ -1066,7 +1058,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 85_000,
-      chatId: "chat-123",
     });
 
     await app(new Request("http://localhost/session-start", {
@@ -1130,7 +1121,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => now,
-      chatId: "42",
     });
 
     await app(new Request("http://localhost/session-start", {
@@ -1162,7 +1152,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 100_000,
-      chatId: "42",
       machineId: "devbox",
     });
 
@@ -1216,7 +1205,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-wiz",
       machineId: "devbox",
     });
 
@@ -1268,7 +1256,6 @@ describe("createApp", () => {
     storage = openStorageDb(":memory:");
     const app = createApp(storage, {
       nowFn: () => 50_000,
-      chatId: "chat-single",
       machineId: "devbox",
     });
 
@@ -1438,7 +1425,6 @@ describe("createApp", () => {
       const now = 50_000;
       const app = createApp(storage, {
         nowFn: () => now,
-        chatId: "chat-123",
         machineId: "devbox",
       });
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1504,7 +1490,6 @@ describe("createApp", () => {
       const now = 50_000;
       const app = createApp(storage, {
         nowFn: () => now,
-        chatId: "chat-123",
         machineId: "devbox",
       });
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1568,7 +1553,6 @@ describe("createApp", () => {
       const now = 50_000;
       const app = createApp(storage, {
         nowFn: () => now,
-        chatId: "chat-123",
         machineId: "devbox",
       });
 
@@ -1615,7 +1599,6 @@ describe("createApp", () => {
       const now = 50_000;
       const app = createApp(storage, {
         nowFn: () => now,
-        chatId: "chat-123",
         machineId: "devbox",
       });
 
@@ -1657,7 +1640,6 @@ describe("createApp", () => {
 
       const app = createApp(storage, {
         nowFn: () => expiredNow,
-        chatId: "chat-123",
         machineId: "devbox",
       });
 
@@ -1701,7 +1683,6 @@ describe("createApp", () => {
       const now = 50_000;
       const app = createApp(storage, {
         nowFn: () => now,
-        chatId: "chat-123",
         machineId: "devbox",
       });
 

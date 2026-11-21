@@ -171,10 +171,16 @@ describe("classifyWorkerHealthSample", () => {
    * poisoned message retries until the age cap. Counting it would produce a "worker is
    * down" alert naming the wrong component.
    */
-  it("treats a 502 relaying a Telegram 400 as neutral, not a server error", () => {
+  it("treats a 502 relaying a rejected payload (errorClass rejected_format) as neutral, not a server error", () => {
+    expect(
+      classifyWorkerHealthSample(serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } })),
+    ).toBe("neutral");
+  });
+
+  it("counts a 502 carrying only details.error_code 400: the Telegram carve-out is gone", () => {
     expect(
       classifyWorkerHealthSample(serverError(502, { details: { error_code: 400 } })),
-    ).toBe("neutral");
+    ).toBe("server_error");
   });
 
   it("treats a 502 with error 'topic_unavailable' as neutral, not a server error (pigeon-iqpd)", () => {
@@ -325,9 +331,9 @@ describe("WorkerHealthMonitor — server error episodes", () => {
     const { sink, monitor } = createMonitor(clock);
 
     driveServerErrors(monitor, clock, SERVER_ERROR_THRESHOLD - 1, 30_000);
-    // A 502 relaying a Telegram 400 is the neutral case that survives pigeon-5typ; a plain
+    // A 502 relaying a rejected payload is the neutral case that survives pigeon-5typ; a plain
     // 4xx is no longer neutral and would now open an episode of its own class.
-    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
+    monitor.record("send", serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } }));
     clock.now += 30_000;
     expect(sink.alerts).toHaveLength(0);
 
@@ -674,7 +680,7 @@ describe("WorkerHealthMonitor — robustness", () => {
       log: (msg, fields) => logged.push({ msg, ...(fields ? { fields } : {}) }),
     });
 
-    monitor.record("send", serverError(502, { details: { error_code: 400 } }));
+    monitor.record("send", serverError(502, { errorClass: "rejected_format", details: { error_code: 400 } }));
 
     expect(logged).toHaveLength(1);
     expect(logged[0]!.msg).toContain("not counted");
@@ -711,8 +717,8 @@ describe("WorkerHealthMonitor — robustness", () => {
     const sendAlert = sink.alerts.find((a) => a.text.includes("/notifications/send"))!;
 
     expect(registerAlert.text).toContain("session");
-    expect(registerAlert.text).not.toContain("Telegram delivery through the worker is down");
-    expect(sendAlert.text).toContain("Telegram delivery through the worker is down");
+    expect(registerAlert.text).not.toContain("Chat delivery through the worker is down");
+    expect(sendAlert.text).toContain("Chat delivery through the worker is down");
   });
 
   it("logs the trip so there is durable journal evidence even with no alert egress", () => {

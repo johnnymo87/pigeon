@@ -4,10 +4,8 @@ import { join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
-import { ChatTransportState, transportOf } from "../src/chat-transport-state";
 import { Poller, type PollerCallbacks } from "../src/worker/poller";
 import { DirectSlackAlarm, parseSlackWebhookUrl, renderSlackAlarmText, SlackWebhookError } from "../src/direct-slack-alarm";
-import { createDirectAlarm, pickDirectAlarm, SLACK_HANDLE_MIN } from "../src/direct-alarm";
 import { launchCapability } from "../src/launch-capability";
 import { buildRichMarkdown } from "../src/rich-markdown";
 import type { TgMessage } from "../src/telegram-message";
@@ -18,12 +16,13 @@ import { classifyWorkerHealthSample } from "../src/worker/worker-health";
 import { WorkerMessageClient } from "../src/worker/worker-message-client";
 import { createAlertNotifier } from "../src/alert-notifier";
 import { OutboxSender } from "../src/worker/outbox-sender";
-import { DirectTelegramAlarm } from "../src/direct-telegram-alarm";
 import { buildAlertKeyboard } from "../src/alert-links";
 import { loadConfig } from "../src/config";
 import { TelegramSendError } from "../src/notification-service";
 
 const HOOK = "https://hooks.slack.com/services/T0/B0/xyz";
+/** Slack conversation handles start here (worker `SLACK_HANDLE_MIN`, 2^40). */
+const SLACK_HANDLE_MIN = 2 ** 40;
 
 let storages: StorageDb[] = [];
 afterEach(() => {
@@ -42,7 +41,7 @@ describe("whoami.transport", () => {
       fetchFn: (async () => Response.json(body)) as unknown as typeof fetch,
     });
 
-  it("reads transport only when the worker says slack; absent stays byte-identical", async () => {
+  it("is informational: read when the worker says slack, and its absence never means another chat", async () => {
     expect(await poller({ credential: "machine", machine_id: "devbox", transport: "slack" }).whoami())
       .toEqual({ kind: "machine", machineId: "devbox", transport: "slack" });
     expect(await poller({ credential: "machine", machine_id: "devbox" }).whoami())
@@ -51,45 +50,10 @@ describe("whoami.transport", () => {
       .toEqual({ kind: "machine", machineId: "devbox" });
   });
 
-  it("maps answers: absent in a 200 is telegram, non-answers establish nothing", () => {
-    expect(transportOf({ kind: "machine", machineId: "d", transport: "slack" })).toBe("slack");
-    expect(transportOf({ kind: "machine", machineId: "d" })).toBe("telegram");
-    expect(transportOf({ kind: "shared" })).toBe("telegram");
-    expect(transportOf({ kind: "rejected", status: 401 })).toBeUndefined();
-    expect(transportOf({ kind: "unsupported" })).toBeUndefined();
-    expect(transportOf({ kind: "unknown", error: "x" })).toBeUndefined();
-  });
-
-  it("persists the last value, keeps it on an unreadable whoami, and reloads it", () => {
+  it("the daemon keeps no transport state: nothing is persisted from whoami", () => {
     const s = mem();
-    const log = vi.fn();
-    const a = new ChatTransportState({ db: s.db, log });
-    expect(a.get()).toBeUndefined();
-    a.observe({ kind: "machine", machineId: "d", transport: "slack" });
-    expect(a.get()).toBe("slack");
-    a.observe({ kind: "unknown", error: "timeout" });
-    a.observe({ kind: "rejected", status: 403 });
-    expect(a.get()).toBe("slack");
-    // A restart (new instance on the same DB) during an outage keeps it.
-    expect(new ChatTransportState({ db: s.db, log }).get()).toBe("slack");
-    a.observe({ kind: "machine", machineId: "d" });
-    expect(new ChatTransportState({ db: s.db, log }).get()).toBe("telegram");
-    expect(log).toHaveBeenCalledWith("[chat-transport] transport=telegram (was slack)");
-  });
-
-  it("re-reads on an interval", async () => {
-    vi.useFakeTimers();
-    try {
-      const st = new ChatTransportState({ db: mem().db, log: () => {} });
-      const whoami = vi.fn(async () => ({ kind: "machine" as const, machineId: "d", transport: "slack" as const }));
-      st.start(whoami, 60_000);
-      await vi.advanceTimersByTimeAsync(60_000);
-      expect(whoami).toHaveBeenCalledTimes(1);
-      expect(st.get()).toBe("slack");
-      st.stop();
-    } finally {
-      vi.useRealTimers();
-    }
+    const tables = s.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>;
+    expect(tables.map((t) => t.name)).not.toContain("daemon_kv");
   });
 });
 
@@ -160,48 +124,24 @@ describe("DirectSlackAlarm", () => {
   });
 });
 
-describe("direct alarm selection", () => {
-  const tg = { sendPlainAlert: vi.fn(async () => {}) };
-  const sl = { sendPlainAlert: vi.fn(async () => {}) };
-
-  it("slack transport -> slack; telegram -> telegram; unknown -> telegram first", () => {
-    expect(pickDirectAlarm({ telegram: tg, slack: sl }, "slack")?.name).toBe("slack");
-    expect(pickDirectAlarm({ telegram: tg, slack: sl }, "telegram")?.name).toBe("telegram");
-    expect(pickDirectAlarm({ telegram: tg, slack: sl }, undefined)?.name).toBe("telegram");
-    expect(pickDirectAlarm({ slack: sl }, undefined)?.name).toBe("slack");
-    expect(pickDirectAlarm({ telegram: tg }, "slack")?.name).toBe("telegram");
-    expect(createDirectAlarm({ transport: () => "slack" })).toBeUndefined();
-  });
-
-  it("follows the transport per alert and never hands Telegram a Slack address", async () => {
-    let t: "slack" | "telegram" | undefined = "slack";
-    const alarm = createDirectAlarm({ telegram: tg, slack: sl, transport: () => t })!;
-    await alarm.sendPlainAlert("a", "info");
-    expect(sl.sendPlainAlert).toHaveBeenCalledTimes(1);
-    t = "telegram";
-    await alarm.sendPlainAlert("b", "info", { messageThreadId: SLACK_HANDLE_MIN + 3, chatId: "slack:T1", timeoutMs: 9 });
-    expect(tg.sendPlainAlert).toHaveBeenLastCalledWith("b", "info", { timeoutMs: 9 });
-    await alarm.sendPlainAlert("c", "info", { messageThreadId: 42 });
-    expect(tg.sendPlainAlert).toHaveBeenLastCalledWith("c", "info", { messageThreadId: 42 });
-  });
-});
-
 describe("launchCapability", () => {
   const base = {
     remoteLaunchFrom: ["cloudbox"],
     opencodeClient: true,
     remoteLaunchClient: true,
-    telegramBotToken: true,
-    telegramChatId: true,
-    slackAlarmWebhook: false,
+    slackAlarmWebhook: true,
   };
-  it("telegram (or unknown) needs the bot token; slack needs the webhook instead", () => {
-    expect(launchCapability(base, "telegram").capable).toBe(true);
-    expect(launchCapability(base, undefined).capable).toBe(true);
-    expect(launchCapability(base, "slack")).toEqual({ capable: false, missing: ["slackAlarmWebhookUrl"] });
-    expect(launchCapability({ ...base, telegramBotToken: false, slackAlarmWebhook: true }, "slack").capable).toBe(true);
-    expect(launchCapability({ ...base, telegramBotToken: false }, "telegram").missing).toEqual(["telegramBotToken"]);
-    expect(launchCapability({ ...base, remoteLaunchFrom: [] }, "telegram")).toEqual({ capable: false, missing: [] });
+  it("needs only the opencode client, the worker client and the Slack webhook: no Telegram input", () => {
+    expect(launchCapability(base)).toEqual({ capable: true, missing: [] });
+    expect(launchCapability({ ...base, slackAlarmWebhook: false })).toEqual({
+      capable: false,
+      missing: ["slackAlarmWebhookUrl"],
+    });
+    expect(launchCapability({ ...base, opencodeClient: false, remoteLaunchClient: false }).missing).toEqual([
+      "opencodeClient",
+      "remoteLaunchClient",
+    ]);
+    expect(launchCapability({ ...base, remoteLaunchFrom: [] })).toEqual({ capable: false, missing: [] });
   });
 
   it("the poller reads the relay header per poll", async () => {
@@ -225,77 +165,44 @@ describe("launchCapability", () => {
 });
 
 describe("rich dialect", () => {
-  const header = msg("✅ s", [{ type: "bold", offset: 0, length: 3 }]);
-  const footer = msg("🆔 ses_abc", [{ type: "code", offset: 3, length: 7 }]);
-  const body = msg("Costs $5 == a || b <T>\n| a | b |\n|---|---|\n| 1 | 2 |");
-
-  it("slack: standard GFM, no tg-button, no Telegram escapes or spacers", () => {
-    const md = buildRichMarkdown(header, body, footer, { dialect: "slack" })!;
-    expect(md).not.toContain("tg-button");
-    expect(md).not.toContain("&nbsp;");
-    expect(md).not.toContain("\\$");
-    expect(md).not.toContain("&lt;");
-    expect(md).not.toContain("\\=");
-    expect(md).toContain("Costs $5 == a || b <T>");
-    expect(md).toContain("`ses_abc`");
-    expect(md).toContain("| a | b |\n|---|---|\n| 1 | 2 |");
-  });
-
-  it("telegram default is unchanged", () => {
-    const md = buildRichMarkdown(header, body, footer)!;
-    expect(md).toContain("tg-button");
-    expect(md).toContain("\\$5");
-  });
-
-  it("slack limit is 12000 chars", () => {
-    const big = msg(`| a |\n|---|\n| ${"x".repeat(13_000)} |`);
-    expect(buildRichMarkdown(header, big, footer, { dialect: "slack" })).toBeNull();
-    expect(buildRichMarkdown(header, big, footer)).not.toBeNull();
-  });
-
-  async function app(transport: "slack" | "telegram" | undefined) {
+  async function stopPayload() {
     const s = mem();
-    const a = createApp(s, { nowFn: () => 1_000, chatId: "chat-1", machineId: "devbox", chatTransport: () => transport });
+    const a = createApp(s, { nowFn: () => 1_000, machineId: "devbox" });
     await a(new Request("http://localhost/session-start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: "sess-r", notify: true, label: "l" }),
     }));
-    return { s, a };
+    await a(new Request("http://localhost/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: "sess-r", event: "Stop", message: "| a |\n|---|\n| 1 |", notification_id: "s:sess-r:m.0" }),
+    }));
+    return { s, a, payload: JSON.parse(s.outbox.getByNotificationId("s:sess-r:m.0")!.payload) };
   }
 
-  it("a stop on a Slack machine carries dialect slack; on Telegram no dialect", async () => {
-    for (const [t, dialect] of [["slack", "slack"], ["telegram", undefined], [undefined, undefined]] as const) {
-      const { s, a } = await app(t);
-      await a(new Request("http://localhost/stop", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: "sess-r", event: "Stop", message: "| a |\n|---|\n| 1 |", notification_id: "s:sess-r:m.0" }),
-      }));
-      const payload = JSON.parse(s.outbox.getByNotificationId("s:sess-r:m.0")!.payload);
-      expect(payload.rich.dialect).toBe(dialect);
-      expect("dialect" in payload.rich).toBe(dialect !== undefined);
-      expect(payload).not.toHaveProperty("notifyOwner");
-    }
+  it("a stop always carries dialect slack, with no transport state at all", async () => {
+    const { payload } = await stopPayload();
+    expect(payload.rich.dialect).toBe("slack");
+    expect(payload.rich.markdown).not.toContain("tg-button");
+    // The mention is a question's thing (below); a stop never asks for one.
+    expect(payload).not.toHaveProperty("notifyOwner");
   });
 
-  it("a question carries notifyOwner only on Slack", async () => {
-    for (const t of ["slack", "telegram"] as const) {
-      const { s, a } = await app(t);
-      const res = await a(new Request("http://localhost/question-asked", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          session_id: "sess-r",
-          request_id: "req1",
-          questions: [{ question: "Q?", header: "h", options: [{ label: "a", description: "d" }] }],
-        }),
-      }));
-      expect(res.status).toBe(202);
-      const payload = JSON.parse(s.outbox.getByNotificationId("q:sess-r:req1")!.payload);
-      if (t === "slack") expect(payload.notifyOwner).toBe(true);
-      else expect(payload).not.toHaveProperty("notifyOwner");
-    }
+  it("a question carries notifyOwner (the worker's SLACK_NOTIFY_OWNER decides)", async () => {
+    const { s, a } = await stopPayload();
+    const res = await a(new Request("http://localhost/question-asked", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        session_id: "sess-r",
+        request_id: "req1",
+        questions: [{ question: "Q?", header: "h", options: [{ label: "a", description: "d" }] }],
+      }),
+    }));
+    expect(res.status).toBe(202);
+    const payload = JSON.parse(s.outbox.getByNotificationId("q:sess-r:req1")!.payload);
+    expect(payload.notifyOwner).toBe(true);
   });
 });
 
@@ -303,20 +210,22 @@ describe("errorClass", () => {
   const ctx = { hasLocalSession: true, alreadyReregistered: false, payloadHasEntities: true, attempts: 0 };
   const err = (body: unknown) => ({ ok: false as const, kind: "http_error" as const, status: 502, body });
 
-  it("is preferred over details.error_code; legacy still honoured", () => {
+  it("keys on errorClass; a bare details.error_code no longer means a rejected payload", () => {
     expect(getErrorClass({ errorClass: "rejected_format" })).toBe("rejected_format");
     expect(getErrorClass({ details: { errorClass: "upstream" } })).toBe("upstream");
     expect(classifyDeliveryFailure(err({ errorClass: "rejected_format", details: { error_code: 400 } }), ctx).action)
       .toBe("strip_entities");
     expect(classifyDeliveryFailure(err({ errorClass: "conversation_gone", details: { error_code: 400 } }), ctx).action)
       .toBe("retry");
-    expect(classifyDeliveryFailure(err({ details: { error_code: 400 } }), ctx).action).toBe("strip_entities");
+    expect(classifyDeliveryFailure(err({ details: { error_code: 400 } }), ctx).action).toBe("retry");
   });
 
   it("worker-health: rejected_format and conversation_gone are neutral, upstream counts", () => {
     expect(classifyWorkerHealthSample(err({ errorClass: "rejected_format" }))).toBe("neutral");
     expect(classifyWorkerHealthSample(err({ errorClass: "conversation_gone" }))).toBe("neutral");
     expect(classifyWorkerHealthSample(err({ errorClass: "upstream", details: { error_code: 400 } }))).toBe("server_error");
+    // No class: not a verdict on one message any more, so it counts.
+    expect(classifyWorkerHealthSample(err({ details: { error_code: 400 } }))).toBe("server_error");
   });
 
   it("the worker client carries errorClass on a rejection and in the failure key", async () => {
@@ -332,52 +241,47 @@ describe("errorClass", () => {
 });
 
 describe("alert notifier on Slack", () => {
-  function notifier(transport: "slack" | "telegram") {
+  function notifier() {
     const bodies: Array<Record<string, unknown>> = [];
     const fetchFn = (async (_u: string, init?: RequestInit) => {
       bodies.push(JSON.parse(String(init?.body)));
       return Response.json({ ok: true, messageId: 1 });
     }) as unknown as typeof fetch;
     const n = createAlertNotifier({
-      chatId: "-100123",
       worker: new WorkerMessageClient({ workerUrl: "https://w", apiKey: "k", fetchFn }),
-      transport: () => transport,
     })!;
     return { n, bodies };
   }
 
-  it("asks for notifyOwner on error alerts on Slack only, and uses a returned chatId", async () => {
-    const s = notifier("slack");
+  it("asks for notifyOwner on error alerts, sends no chatId of its own, and uses a returned one", async () => {
+    const s = notifier();
     await s.n.sendPlainAlert!("boom", "error");
     await s.n.sendPlainAlert!("fyi", "info");
     await s.n.sendPlainAlert!("x", "warning", { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN });
-    expect(s.bodies[0]).toMatchObject({ notifyOwner: true, chatId: "-100123" });
-    expect(s.bodies[1]).not.toHaveProperty("notifyOwner");
+    expect(s.bodies[0]).toEqual({ text: "❌ boom", notifyOwner: true });
+    expect(s.bodies[1]).toEqual({ text: "fyi" });
     expect(s.bodies[2]).toMatchObject({ chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN });
-    const t = notifier("telegram");
-    await t.n.sendPlainAlert!("boom", "error");
-    expect(t.bodies[0]).toEqual({ chatId: "-100123", text: "❌ boom" });
+    for (const b of s.bodies) expect(JSON.stringify(b)).not.toMatch(/-100|chat-1/);
   });
 });
 
 describe("/topics/lookup url", () => {
-  it("prefers the worker's url, drops null, builds t.me when absent", () => {
+  it("uses the worker's url, and builds none itself: null, absent or a numeric Telegram row gets no button", () => {
     const kb = buildAlertKeyboard(
       [
         { label: "slack", sessionId: "a" },
         { label: "none", sessionId: "b" },
         { label: "tg", sessionId: "c" },
+        { label: "bad", sessionId: "d" },
       ],
       {
         a: { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN, state: "open", url: "https://acme.slack.com/archives/C1" },
         b: { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN + 1, state: "open", url: null },
         c: { chatId: "-100555", messageThreadId: 7, state: "open" },
+        d: { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN + 2, state: "open", url: "javascript:alert(1)" },
       },
     );
-    expect(kb?.inline_keyboard).toEqual([
-      [{ text: "slack", url: "https://acme.slack.com/archives/C1" }],
-      [{ text: "tg", url: "https://t.me/c/555/7" }],
-    ]);
+    expect(kb?.inline_keyboard).toEqual([[{ text: "slack", url: "https://acme.slack.com/archives/C1" }]]);
   });
 });
 
@@ -386,7 +290,6 @@ describe("/alert named topic chatId", () => {
     const s = mem();
     const sent: Array<object | undefined> = [];
     const a = createApp(s, {
-      chatId: "-100123",
       notifier: {
         sendPlainAlert: async (_t, _s, o) => {
           sent.push(o);
@@ -411,7 +314,6 @@ describe("/alert named topic chatId", () => {
     const sent: Array<object | undefined> = [];
     const resolves: unknown[] = [];
     const a = createApp(s, {
-      chatId: "-100123",
       notifier: {
         sendPlainAlert: async (_t, _s, o) => {
           sent.push(o);
@@ -450,6 +352,15 @@ describe("Slack egress guard", () => {
     expect(offenders).toEqual([]);
     expect(readFileSync(join(src, "direct-slack-alarm.ts"), "utf8")).toContain("hooks\\.slack\\.com");
   });
+
+  it("the Telegram Bot API host appears nowhere in daemon src (its direct alarm was deleted)", () => {
+    const src = join(__dirname, "..", "src");
+    const offenders = walk(src)
+      .filter((p) => /\.[cm]?[jt]s$/.test(p))
+      .filter((p) => readFileSync(p, "utf8").includes("api.telegram.org"))
+      .map((p) => relative(src, p));
+    expect(offenders).toEqual([]);
+  });
 });
 
 describe("outbox carries dialect and notifyOwner to /notifications/send", () => {
@@ -479,7 +390,6 @@ describe("outbox carries dialect and notifyOwner to /notifications/send", () => 
     const sender = new OutboxSender({
       storage: s,
       sendNotification: (input) => poller.sendNotification(input),
-      chatId: "-100123",
       nowFn: () => 5_000,
     });
     await sender.processOnce();
@@ -488,34 +398,30 @@ describe("outbox carries dialect and notifyOwner to /notifications/send", () => 
 });
 
 describe("Slack alarm ladder via the composed notifier", () => {
-  it("worker fails -> the Slack webhook gets the alert with the suffix; a Slack handle never reaches Telegram", async () => {
-    let transport: "slack" | "telegram" = "slack";
+  it("worker fails -> the Slack webhook gets the alert with the suffix", async () => {
     const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
     const fetchFn = (async (url: string, init?: RequestInit) => {
-      const body = JSON.parse(String(init?.body));
-      calls.push({ url, body });
+      calls.push({ url, body: JSON.parse(String(init?.body)) });
       if (url.startsWith("https://w/")) return new Response("down", { status: 503 });
-      return url.startsWith(HOOK) ? new Response("ok") : Response.json({ ok: true, result: {} });
+      return new Response("ok");
     }) as unknown as typeof fetch;
     const n = createAlertNotifier({
-      chatId: "-100123",
       worker: new WorkerMessageClient({ workerUrl: "https://w", apiKey: "k", fetchFn }),
-      direct: createDirectAlarm({
-        telegram: new DirectTelegramAlarm("tok", "-100123", fetchFn),
-        slack: new DirectSlackAlarm(HOOK, { fetchFn }),
-        transport: () => transport,
-      }),
-      transport: () => transport,
+      direct: new DirectSlackAlarm(HOOK, { fetchFn }),
     })!;
     await n.sendPlainAlert!("worker is down", "error");
     const hookCall = calls.find((c) => c.url === HOOK)!;
     expect(hookCall.body.text).toMatch(/^❌ worker is down · sent direct; worker: HTTP 503/);
+  });
 
-    transport = "telegram";
-    calls.length = 0;
-    await n.sendPlainAlert!("x", "info", { chatId: "slack:T1", messageThreadId: SLACK_HANDLE_MIN + 1 });
-    const tgCall = calls.find((c) => c.url.includes("/sendMessage"))!;
-    expect(tgCall.body).not.toHaveProperty("message_thread_id");
-    expect(calls.find((c) => c.url.startsWith("https://w/"))!.body).toMatchObject({ chatId: "slack:T1" });
+  it("a direct-only host (no worker) posts straight to the webhook", async () => {
+    const calls: string[] = [];
+    const fetchFn = (async (url: string) => {
+      calls.push(url);
+      return new Response("ok");
+    }) as unknown as typeof fetch;
+    const n = createAlertNotifier({ direct: new DirectSlackAlarm(HOOK, { fetchFn }) })!;
+    await n.sendPlainAlert!("x", "info");
+    expect(calls).toEqual([HOOK]);
   });
 });

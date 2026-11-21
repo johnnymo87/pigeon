@@ -70,7 +70,7 @@ function harness(authToken?: string, over: Record<string, unknown> = {}) {
     },
     1_000,
   );
-  const app = createApp(storage, { ...(authToken ? { authToken } : {}), chatId: "42" });
+  const app = createApp(storage, { ...(authToken ? { authToken } : {}) });
   const client = new StubClient();
   const logs: string[] = [];
 

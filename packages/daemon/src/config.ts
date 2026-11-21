@@ -10,8 +10,6 @@ import { parseSlackWebhookUrl } from "./direct-slack-alarm";
 export interface DaemonConfig {
   port: number;
   dbPath: string;
-  telegramBotToken?: string;
-  telegramChatId?: string;
   workerUrl?: string;
   workerApiKey?: string;
   machineId?: string;
@@ -153,8 +151,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   return {
     port: parsePort(env.PIGEON_DAEMON_PORT),
     dbPath: env.PIGEON_DAEMON_DB_PATH?.trim() || defaultDbPath,
-    telegramBotToken: env.TELEGRAM_BOT_TOKEN?.trim() || undefined,
-    telegramChatId: env.TELEGRAM_CHAT_ID?.trim() || env.TELEGRAM_GROUP_ID?.trim() || undefined,
     workerUrl: env.CCR_WORKER_URL?.trim() || undefined,
     workerApiKey: env.CCR_API_KEY?.trim() || undefined,
     machineId: env.CCR_MACHINE_ID?.trim() || undefined,

@@ -32,10 +32,7 @@ import { WorkerHealthMonitor } from "./worker/worker-health";
 import { WorkerMessageClient } from "./worker/worker-message-client";
 import { createCommandReplySender, type CommandReplySender } from "./worker/command-reply";
 import { createAlertNotifier, describeAlertDelivery } from "./alert-notifier";
-import { DirectTelegramAlarm } from "./direct-telegram-alarm";
 import { DirectSlackAlarm } from "./direct-slack-alarm";
-import { createDirectAlarm } from "./direct-alarm";
-import { ChatTransportState } from "./chat-transport-state";
 import { launchCapability } from "./launch-capability";
 import { OutboxSender } from "./worker/outbox-sender";
 import { SwarmArbiter } from "./swarm/arbiter";
@@ -102,11 +99,18 @@ const ALERT_ABANDONED_CREATED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const config = loadConfig();
 const storage = openStorageDb(config.dbPath);
 
-// The transport the worker last said this machine is on (pigeon-4ogz.5). Read from SQLite at
-// startup, so a restart during a worker outage still picks the right alarm path; re-asked every
-// 60s once the poller exists.
-const chatTransport = new ChatTransportState({ db: storage.db });
-console.log(`[chat-transport] persisted transport=${chatTransport.get() ?? "(none yet)"}`);
+// Slack is the only chat (Telegram was deleted, pigeon-4ogz.13). This line names the build, so
+// ops can confirm it runs on a host before that host's Telegram secrets are removed. Leftover
+// TELEGRAM_* variables are ignored, never an error: the host's config is cleaned up separately.
+console.log("[chat] Slack only (Telegram removed, pigeon-4ogz.13)");
+{
+  const leftover = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_GROUP_ID"].filter((k) =>
+    process.env[k]?.trim(),
+  );
+  if (leftover.length > 0) {
+    console.log(`[chat] ignoring ${leftover.join("/")} (Telegram removed)`);
+  }
+}
 
 const ingressRouter = config.serveEndpoints.length > 0
   ? new IngressRouter(storage, {
@@ -535,24 +539,21 @@ const remoteLaunchClient = config.workerUrl && config.workerApiKey
   ? new RemoteLaunchClient({ workerUrl: config.workerUrl, apiKey: config.workerApiKey })
   : undefined;
 
-// Launch capability needs an alarm path for the CURRENT transport (pigeon-4ogz.5, see
-// launch-capability.ts): computed per call from the persisted whoami.transport, so a flip needs
-// no restart. A change is logged once.
+// Launch capability needs the Slack alarm webhook (see launch-capability.ts). A change is
+// logged once.
 const launchCapabilityInputs = {
   remoteLaunchFrom: config.remoteLaunchFrom,
   opencodeClient: Boolean(opencodeClient),
   remoteLaunchClient: Boolean(remoteLaunchClient),
-  telegramBotToken: Boolean(config.telegramBotToken),
-  telegramChatId: Boolean(config.telegramChatId),
   slackAlarmWebhook: Boolean(config.slackAlarmWebhookUrl),
 };
 let lastLaunchCapableLog: string | undefined;
 function launchCapableNow(): boolean {
-  const { capable, missing } = launchCapability(launchCapabilityInputs, chatTransport.get());
+  const { capable, missing } = launchCapability(launchCapabilityInputs);
   if (config.remoteLaunchFrom.length > 0) {
     const line = capable
-      ? `[remote-launch] receiving is capable (transport=${chatTransport.get() ?? "unknown"})`
-      : `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: ${missing.join(", ")} (transport=${chatTransport.get() ?? "unknown"})`;
+      ? "[remote-launch] receiving is capable"
+      : `[remote-launch] remoteLaunchFrom is configured but receiving is not capable due to missing: ${missing.join(", ")}`;
     if (line !== lastLaunchCapableLog) {
       lastLaunchCapableLog = line;
       (capable ? console.log : console.warn)(line);
@@ -605,7 +606,7 @@ const launchReceiverDeps: LaunchReceiverDeps | undefined = remoteLaunchClient
   ? {
       storage,
       selfMachineId: config.machineId ?? "",
-      // A getter: read on every launch item, so it follows the current transport.
+      // A getter: read on every launch item.
       get launchFrom() {
         return launchCapableNow() ? config.remoteLaunchFrom : [];
       },
@@ -627,7 +628,6 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
         workerUrl: config.workerUrl,
         apiKey: config.workerApiKey,
         machineId: config.machineId,
-        chatId: config.telegramChatId,
         // Derived from the SAME values the launch handler checks below, so the
         // advertisement cannot drift from what this daemon will actually do.
         // Configuration, never health -- see backends.ts.
@@ -999,13 +999,10 @@ if (poller) {
   void poller.whoami(AbortSignal.timeout(5_000)).then((identity) => {
     const { level, text } = describeWorkerIdentity(identity, config.machineId!);
     console[level](text);
-    chatTransport.observe(identity);
   });
-  // Re-read every 60s: a flip puts or deletes the worker's secret, and nothing else tells us.
-  chatTransport.start(() => poller!.whoami(AbortSignal.timeout(5_000)));
 }
 
-const outboxSender = poller && config.telegramChatId
+const outboxSender = poller
   ? new OutboxSender({
       storage,
       // The arrow wrapper is required: passing `poller.sendNotification` directly
@@ -1016,7 +1013,6 @@ const outboxSender = poller && config.telegramChatId
       unregisterSession: (sessionId) => poller.unregisterSession(sessionId),
       // pigeon-4ogz.23: a stop's files go to R2 before its first send.
       uploadMedia: (key, data, mime, filename, signal) => poller.uploadMedia(key, data, mime, filename, signal),
-      chatId: config.telegramChatId,
       // pigeon-qioa: never post a swarm notice for a session this machine does not have.
       gateSwarmOnLocalSession: true,
       log: (msg, data) => console.log(`[outbox] ${msg}`, data ? JSON.stringify(data) : ""),
@@ -1028,45 +1024,33 @@ if (outboxSender) {
 }
 
 // Operational alerts (chat-transport phase 1, pigeon-lenr): worker first, then the daemon's
-// one direct Bot API path as a visible fallback, so an alarm about a broken worker can still
-// get out (see alert-notifier.ts). Either leg alone also works; with neither there is no
-// notifier and alerts are only recorded.
-// Telegram's Bot API or Slack's #alerts webhook, picked per alert from the persisted transport
-// (direct-alarm.ts, pigeon-4ogz.5).
-const alertDirect = createDirectAlarm({
-  telegram: config.telegramBotToken && config.telegramChatId
-    ? new DirectTelegramAlarm(config.telegramBotToken, config.telegramChatId)
-    : undefined,
-  slack: config.slackAlarmWebhookUrl
-    ? new DirectSlackAlarm(config.slackAlarmWebhookUrl, {
-        ownerUserId: config.slackOwnerUserId,
-        notifyOwner: config.slackNotifyOwner === true,
-      })
-    : undefined,
-  transport: () => chatTransport.get(),
-});
-const alertDelivery = describeAlertDelivery({
-  worker: Boolean(workerMessageClient && config.telegramChatId),
-  direct: Boolean(alertDirect),
-});
-const notifier: StopNotifier | undefined = config.telegramChatId
-  ? createAlertNotifier({
-      chatId: config.telegramChatId,
-      worker: workerMessageClient,
-      direct: alertDirect,
-      transport: () => chatTransport.get(),
-      alerts: storage.alerts,
-      machineId: config.machineId,
-      log: (msg, fields) => console.warn(`[alert] ${msg}`, fields ? JSON.stringify(fields) : ""),
+// one direct path (Slack's #alerts webhook, pigeon-4ogz.5) as a visible fallback, so an alarm
+// about a broken worker can still get out (see alert-notifier.ts). Either leg alone also works;
+// with neither there is no notifier and alerts are only recorded.
+const alertDirect = config.slackAlarmWebhookUrl
+  ? new DirectSlackAlarm(config.slackAlarmWebhookUrl, {
+      ownerUserId: config.slackOwnerUserId,
+      notifyOwner: config.slackNotifyOwner === true,
     })
   : undefined;
+const alertDelivery = describeAlertDelivery({
+  worker: Boolean(workerMessageClient),
+  direct: Boolean(alertDirect),
+});
+const notifier: StopNotifier | undefined = createAlertNotifier({
+  worker: workerMessageClient,
+  direct: alertDirect,
+  alerts: storage.alerts,
+  machineId: config.machineId,
+  log: (msg, fields) => console.warn(`[alert] ${msg}`, fields ? JSON.stringify(fields) : ""),
+});
 console.log(`[pigeon-daemon] alert delivery: ${alertDelivery}`);
 // Never the URL itself: it is a credential. INVALID means the env var is set but is not a Slack
 // incoming-webhook URL, so it is ignored (an empty one counts as unset).
 {
   const raw = process.env.PIGEON_SLACK_ALARM_WEBHOOK_URL?.trim();
   const slack = config.slackAlarmWebhookUrl ? "set" : raw ? "INVALID (ignored)" : "unset";
-  const line = `[alert] direct paths: telegram=${config.telegramBotToken && config.telegramChatId ? "yes" : "no"} slack=${slack}`;
+  const line = `[alert] direct path: slack=${slack}`;
   (slack.startsWith("INVALID") ? console.warn : console.log)(line);
 }
 
@@ -1130,10 +1114,9 @@ if (swarmArbiter) {
   console.log("[pigeon-daemon] swarm arbiter NOT started (no opencodeUrl in config)");
 }
 
-// Operational alert drainer: sends queued operational alerts to Telegram.
+// Operational alert drainer: sends queued operational alerts to the chat.
 // Note on notifier capability gate: sendPlainAlert is optional on StopNotifier. On a host
-// with no TELEGRAM_CHAT_ID, or with neither a worker nor TELEGRAM_BOT_TOKEN, there is no
-// plain-alert notifier (`alertDelivery` UNAVAILABLE). Alerts are still enqueued in DB
+// with neither a worker nor a Slack alarm webhook, there is no plain-alert notifier (`alertDelivery` UNAVAILABLE). Alerts are still enqueued in DB
 // as an honest record of events; they are simply never drained. Do NOT mark them sent when no
 // notifier exists — that would record a configuration fact as a delivery fact.
 const alertDrainer = notifier?.sendPlainAlert
@@ -1411,9 +1394,7 @@ if (deliveryWatchdog) {
 
 const app = createApp(storage, {
   notifier,
-  chatTransport: () => chatTransport.get(),
   tagLookup: tagResolver,
-  chatId: config.telegramChatId,
   machineId: config.machineId,
   router: ingressRouter,
   authToken: config.authToken,

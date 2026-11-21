@@ -39,9 +39,9 @@ export interface TopicInfo {
   messageThreadId: number | null;
   state: "open" | "closed";
   /**
-   * The conversation's link, from a worker that knows it (pigeon-4ogz.5): present only on Slack
-   * rows, `null` when the worker could not build one. Absent means a Telegram row, whose link
-   * the daemon builds itself (`topicUrl`).
+   * The conversation's link, from the worker (pigeon-4ogz.5): `null` when the worker could not
+   * build one. Absent means no link: the daemon builds none itself (the Telegram `t.me` builder
+   * was deleted, pigeon-4ogz.13), so a row with no `url` string gets no button.
    */
   url?: string | null;
 }
@@ -84,24 +84,6 @@ export function parseAlertLinks(raw: unknown): AlertLink[] {
   return out;
 }
 
-/**
- * `https://t.me/c/<internal id>/<thread id>` for a forum topic, or null when the
- * pair cannot form a valid link. Only a supergroup id (`-100<digits>`) has an
- * internal id; a private chat or basic group cannot be linked this way.
- */
-export function topicUrl(chatId: string, messageThreadId: number | null): string | null {
-  const m = /^-100(\d+)$/.exec(chatId);
-  if (!m) return null;
-  if (
-    typeof messageThreadId !== "number" ||
-    !Number.isInteger(messageThreadId) ||
-    messageThreadId <= 0
-  ) {
-    return null;
-  }
-  return `https://t.me/c/${m[1]}/${messageThreadId}`;
-}
-
 function isTopicInfo(v: unknown): v is TopicInfo {
   if (!v || typeof v !== "object") return false;
   const t = v as Record<string, unknown>;
@@ -123,9 +105,7 @@ export function buildAlertKeyboard(links: AlertLink[], topics: TopicMap): UrlKey
       ? topics[link.sessionId]
       : undefined;
     if (!isTopicInfo(topic)) continue;
-    const url = "url" in topic && topic.url !== undefined
-      ? typeof topic.url === "string" && /^https:\/\/\S+$/.test(topic.url) ? topic.url : null
-      : topicUrl(topic.chatId, topic.messageThreadId);
+    const url = typeof topic.url === "string" && /^https:\/\/\S+$/.test(topic.url) ? topic.url : null;
     if (!url) continue;
     rows.push([{ text: link.label, url }]);
   }
