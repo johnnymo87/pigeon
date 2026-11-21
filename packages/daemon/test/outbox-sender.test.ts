@@ -983,13 +983,14 @@ describe("OutboxSender rich messages (pigeon-p909)", () => {
     expect((sendFn.mock.calls[0]![0] as SendNotificationInput).rich).toBeUndefined();
   });
 
-  it("drops rich after a second failed rich attempt, so a persistent upstream 5xx cannot cost the notification", async () => {
+  // pigeon-4ogz.25: "provider_error" is the worker's new name for "Telegram API error"; both are read.
+  it.each(["Telegram API error", "provider_error"])("drops rich after a second failed rich attempt, so a persistent upstream 5xx cannot cost the notification (%s)", async (error) => {
     seed([{ text: "only" }]);
     const provider5xx = {
       ok: false,
       kind: "http_error",
       status: 502,
-      body: { error: "Telegram API error", details: { ok: false, error_code: 500 } },
+      body: { error, details: { ok: false, error_code: 500 } },
     };
     let now = 5_000;
     const sendFn = vi.fn().mockResolvedValue(provider5xx);

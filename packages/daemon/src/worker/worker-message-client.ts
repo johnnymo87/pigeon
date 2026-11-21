@@ -1,9 +1,9 @@
 /**
  * HTTP client for the worker's session-free send route, `POST /messages/send` (chat-transport
  * phase 1, pigeon-lenr). The wire shapes are the worker's (`packages/worker/src`), which is the
- * source of truth. Several wire values still carry Telegram's old names (`telegram:{status,..}`,
- * `/^telegram call /`): they are kept on purpose, so a daemon and a worker of different ages
- * still read each other.
+ * source of truth. The provider's answer is `provider:{status,..}` and the worker's own abort
+ * text starts `provider call `; a worker older than pigeon-4ogz.25 spells them `telegram`, and
+ * both spellings are read, so a daemon and a worker of different ages still read each other.
  *
  * Every answer is reduced to one of three behaviours, and the whole point of the route's
  * shape is that the daemon can tell them apart:
@@ -152,9 +152,9 @@ export class WorkerMessageClient {
     }
 
     const obj = isObject(res.parsed) ? res.parsed : undefined;
-    // `obj.telegram` is the worker's wire name for the provider's answer ({status, description,
-    // retryAfter}); it is kept so daemons and workers of different ages still read each other.
-    const provider = obj && isObject(obj.telegram) ? obj.telegram : undefined;
+    // The provider's answer ({status, description, retryAfter}) is `obj.provider`; a worker older
+    // than pigeon-4ogz.25 names it `obj.telegram`, so both are read.
+    const provider = obj && isObject(obj.provider) ? obj.provider : obj && isObject(obj.telegram) ? obj.telegram : undefined;
     const providerStatus = provider && typeof provider.status === "number" ? provider.status : undefined;
     const providerDesc = provider && typeof provider.description === "string" ? provider.description : undefined;
     const errorClass = obj && typeof obj.errorClass === "string" && /^[a-z_]{1,40}$/.test(obj.errorClass)
@@ -207,11 +207,11 @@ export class WorkerMessageClient {
       reason += ` ${error}`;
       key += `:${error}`;
     } else if (error) {
-      // Free text (the worker's "telegram call timed out after 4000ms" / "telegram call
-      // failed: ...", wire text kept as is). Kept in the reason, sanitised and short, but never in the key, which
+      // Free text (the worker's "provider call timed out after 4000ms" / "provider call
+      // failed: ...", spelled "telegram call" by a worker older than pigeon-4ogz.25). Kept in the reason, sanitised and short, but never in the key, which
       // must stay low-cardinality.
       reason += ` (${sanitise(error, 80)})`;
-      if (res.status === 502 && /^telegram call /.test(error)) {
+      if (res.status === 502 && /^(provider|telegram) call /.test(error)) {
         key += ":chat_unreachable";
         cause = "chat_unreachable";
       }

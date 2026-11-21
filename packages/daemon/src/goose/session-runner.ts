@@ -246,12 +246,12 @@ interface Turn {
   swarmSettled?: boolean;
 }
 
-// "telegram" (a human chat turn) is persisted in goose inflight rows, so the value is kept.
-export type GooseTurnOrigin = "telegram" | "swarm";
+// "chat" is a human chat turn. Never persisted: it is re-derived from the command id (pigeon-4ogz.25).
+export type GooseTurnOrigin = "chat" | "swarm";
 
 export function resolveTurnOrigin(commandId: string, origin?: GooseTurnOrigin): GooseTurnOrigin {
   if (origin) return origin;
-  return commandId.startsWith("swarm:") ? "swarm" : "telegram";
+  return commandId.startsWith("swarm:") ? "swarm" : "chat";
 }
 
 export interface QueuedItem {
@@ -657,7 +657,7 @@ export class GooseSessionRunner {
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(row.commandId)}`,
               message: recoveryUnsupportedNotice(
-                turn.origin ?? "telegram",
+                turn.origin ?? "chat",
                 msgIdFromCommandId(row.commandId),
               ),
               event: "Error",
@@ -1185,7 +1185,7 @@ export class GooseSessionRunner {
               session_id: this.sessionId,
               notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
               message: recoveryUnsupportedNotice(
-                turn.origin ?? "telegram",
+                turn.origin ?? "chat",
                 msgIdFromCommandId(turn.commandId),
               ),
               event: "Error",
@@ -1346,7 +1346,7 @@ export class GooseSessionRunner {
             session_id: this.sessionId,
             notification_id: `s:${this.sessionId}:${sanitiseIdPart(turn.commandId)}`,
             message: recoveredBusyNotice(
-              turn.origin ?? "telegram",
+              turn.origin ?? "chat",
               msgIdFromCommandId(turn.commandId),
             ),
             event: "Error",
@@ -1680,10 +1680,10 @@ export class GooseSessionRunner {
 
     try {
       const partial = turn.text.join("");
-      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdviceNotice(turn.origin ?? "telegram", msgIdFromCommandId(turn.commandId), turn.resent)}`;
+      const honkDetail = `The turn may still be running in honkd. ${honkResumeAdviceNotice(turn.origin ?? "chat", msgIdFromCommandId(turn.commandId), turn.resent)}`;
       const bareDetail =
         "goose cancels a turn once it sees its connection close, so do not wait for this one: "
-        + `no result is coming here. ${resumeAdviceNotice(turn.origin ?? "telegram", msgIdFromCommandId(turn.commandId), turn.resent)}`;
+        + `no result is coming here. ${resumeAdviceNotice(turn.origin ?? "chat", msgIdFromCommandId(turn.commandId), turn.resent)}`;
       this.settleSwarmTurn(turn, { kind: "unconfirmed", reason: `turn stalled: ${reason}` });
       await this.postStop({
         session_id: this.sessionId,
@@ -1806,7 +1806,7 @@ export class GooseSessionRunner {
         // one thing they need to know -- that they should NOT wait for this
         // turn -- is otherwise buried after a close code and a run id.
         const advice = resumeAdviceNotice(
-          turn.origin ?? "telegram",
+          turn.origin ?? "chat",
           msgIdFromCommandId(turn.commandId),
           turn.resent,
         );

@@ -95,7 +95,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
                 session_id: sessionId,
                 notification_id: normalNotifId,
                 message: queuedStaleNotice(
-                  commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                  commandId.startsWith("swarm:") ? "swarm" : "chat",
                   msgIdFromCommandId(commandId),
                 ),
                 event: "Error",
@@ -236,7 +236,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
                 session_id: sessionId,
                 notification_id: normalNotifId,
                 message: recoveryExhaustedNotice(
-                  commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                  commandId.startsWith("swarm:") ? "swarm" : "chat",
                   msgIdFromCommandId(commandId),
                 ),
                 event: "Error",
@@ -295,7 +295,7 @@ export async function recoverGooseTurns(opts: RecoverGooseTurnsOptions): Promise
               session_id: sessionId,
               notification_id: normalNotifId,
               message: recoveryCutoffNotice(
-                commandId.startsWith("swarm:") ? "swarm" : "telegram",
+                commandId.startsWith("swarm:") ? "swarm" : "chat",
                 msgIdFromCommandId(commandId),
               ),
               event: "Error",
