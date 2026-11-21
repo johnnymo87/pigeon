@@ -48,7 +48,9 @@ import {
   MACHINE_ICON_COLORS,
   DEFAULT_ICON_COLOR,
 } from "../src/topics";
-import { buildExecuteMetadata, IN_REPLY_TO_MAX_CHARS, richMessagePlainText } from "../src/webhook";
+import { buildExecuteMetadata, richMessagePlainText } from "../src/webhook";
+import { IN_REPLY_TO_MAX_CHARS, MAX_FILE_SIZE } from "../src/chat/limits";
+import { failureDetails } from "../src/chat/failures";
 import { resolveTopic, RESERVATION_TTL_MS } from "../src/topic-manager";
 import {
   runTopicReaper,
@@ -68,7 +70,6 @@ import {
   resolveCallbackSession,
   generateCommandId,
   extractMedia,
-  MAX_FILE_SIZE,
   handleTelegramWebhook,
   sendTelegramMessage,
   isServiceMessage,
@@ -92,7 +93,6 @@ import {
   sendDocument,
   answerCallbackQuery,
   getFile,
-  getTelegramErrorDetails,
   createTelegramClient,
   createForumTopic,
   editForumTopic,
@@ -1402,7 +1402,7 @@ describe("telegram client module classifier", () => {
       response: undefined,
     });
 
-    const details = getTelegramErrorDetails(res);
+    const details = failureDetails(res);
     expect(details).toEqual({
       ok: false,
       description: undefined,
@@ -1410,9 +1410,9 @@ describe("telegram client module classifier", () => {
     });
   });
 
-  it("getTelegramErrorDetails extracts raw response body when present", () => {
+  it("failureDetails extracts raw response body when present", () => {
     const rawBody = { ok: false, error_code: 400, description: "Bad Request: chat not found" };
-    const details = getTelegramErrorDetails({
+    const details = failureDetails({
       ok: false,
       kind: "error",
       errorCode: 400,

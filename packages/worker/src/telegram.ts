@@ -1,73 +1,18 @@
-export type TgResult<T> =
-  | { ok: true; result: T }
-  | { ok: false; kind: "rate_limited"; retryAfter: number; response?: unknown }
-  | { ok: false; kind: "thread_not_found"; response?: unknown }
-  | { ok: false; kind: "topic_not_modified"; response?: unknown }
-  | { ok: false; kind: "error"; errorCode?: number; description?: string; response?: unknown };
-
-export interface SendMessageOptions {
-  chatId: string | number;
-  text: string;
-  entities?: unknown[];
-  replyMarkup?: unknown;
-  messageThreadId?: number;
-  /** Aborts the call (the fetch rejects). Callers that bound a request use this. */
-  signal?: AbortSignal;
-  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
-  notifyOwner?: boolean;
-  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
-  notifyCategory?: "questions" | "errors";
-}
-
-export interface SendRichMessageOptions {
-  chatId: string | number;
-  /** GFM plus Telegram's extensions; see https://core.telegram.org/bots/api/rich-messages.md */
-  markdown: string;
-  /** Slack only: the plain-text rendering, used as the notification text instead of the raw markdown. */
-  text?: string;
-  replyMarkup?: unknown;
-  messageThreadId?: number;
-  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
-  notifyOwner?: boolean;
-  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
-  notifyCategory?: "questions" | "errors";
-  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
-  signal?: AbortSignal;
-}
-
-export interface EditMessageTextOptions {
-  chatId: string | number;
-  messageId: number;
-  text: string;
-  entities?: unknown[];
-  replyMarkup?: unknown;
-  /** Slack only: keep the owner mention on the edited message (gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
-  notifyOwner?: boolean;
-  /** Slack only: the category of that mention. Telegram ignores it. */
-  notifyCategory?: "questions" | "errors";
-  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
-  signal?: AbortSignal;
-}
-
-export interface SendPhotoOptions {
-  chatId: string | number;
-  photo: Blob;
-  filename: string;
-  replyToMessageId?: number;
-  messageThreadId?: number;
-  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
-  signal?: AbortSignal;
-}
-
-export interface SendDocumentOptions {
-  chatId: string | number;
-  document: Blob;
-  filename: string;
-  replyToMessageId?: number;
-  messageThreadId?: number;
-  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
-  signal?: AbortSignal;
-}
+import type {
+  ChatResult,
+  CloseForumTopicOptions,
+  CreateForumTopicOptions,
+  DeleteForumTopicOptions,
+  EditForumTopicOptions,
+  EditMessageTextOptions,
+  ForumTopic,
+  ReopenForumTopicOptions,
+  SendDocumentOptions,
+  SendMessageOptions,
+  SendPhotoOptions,
+  SendRichMessageOptions,
+  UnpinAllForumTopicMessagesOptions,
+} from "./chat/transport";
 
 export interface AnswerCallbackQueryOptions {
   callbackQueryId: string;
@@ -78,115 +23,7 @@ export interface GetFileOptions {
   fileId: string;
 }
 
-export interface ForumTopic {
-  message_thread_id: number;
-  name: string;
-  icon_color: number;
-  icon_custom_emoji_id?: string;
-  is_name_implicit?: boolean;
-}
-
-export interface CreateForumTopicOptions {
-  chatId: string | number;
-  name: string;
-  iconColor?: number;
-  iconCustomEmojiId?: string;
-  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
-  sessionId?: string;
-  /** Slack only: a named topic's key, which becomes the channel name. */
-  channelKey?: string;
-  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
-  topic?: string;
-}
-
-export interface EditForumTopicOptions {
-  chatId: string | number;
-  messageThreadId: number;
-  name?: string;
-  iconCustomEmojiId?: string;
-  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
-  sessionId?: string;
-  /** Slack only: a named topic's key, which fixes the channel name. Without it or `sessionId`, the channel is not renamed. */
-  channelKey?: string;
-  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
-  topic?: string;
-}
-
-export interface CloseForumTopicOptions {
-  chatId: string | number;
-  messageThreadId: number;
-}
-
-export interface ReopenForumTopicOptions {
-  chatId: string | number;
-  messageThreadId: number;
-}
-
-export interface DeleteForumTopicOptions {
-  chatId: string | number;
-  messageThreadId: number;
-}
-
-export interface UnpinAllForumTopicMessagesOptions {
-  chatId: string | number;
-  messageThreadId: number;
-  signal?: AbortSignal;
-}
-
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
-
-/**
- * Extract or synthesize the `details` field for a 502 response from a failed TgResult.
- * If raw response body is present on the result, returns it directly; otherwise synthesizes an object.
- */
-export function getTelegramErrorDetails(result: TgResult<unknown>): unknown {
-  if (result.ok) return undefined;
-  return (
-    result.response ?? {
-      ok: false,
-      description: result.kind === "error" ? result.description : result.kind,
-      error_code:
-        result.kind === "rate_limited"
-          ? 429
-          : result.kind === "error"
-            ? result.errorCode
-            : 400,
-    }
-  );
-}
-
-/**
- * Is a failed topic send PERMANENT — i.e. is the topic itself unusable, such that retrying into
- * it can only fail again?
- *
- * Only a permanent failure justifies relocating a notification to General. A transient one
- * (5xx, or an outcome we cannot classify) must surface as a 502 so the daemon's outbox retries
- * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
- * General and was never seen (pigeon-bit4).
- *
- * `errorCode === undefined` means a 200 whose body did not parse (telegram.ts parseTgResponse),
- * which most likely means Telegram PROCESSED the send. Treating it as transient risks a
- * duplicate in the correct topic; treating it as permanent guarantees a misfiled copy. The
- * duplicate is the better-placed risk.
- */
-export function isPermanentTopicFailure(result: TgResult<unknown>): boolean {
-  if (result.ok) return false;
-  switch (result.kind) {
-    case "rate_limited":
-      // Never reached (callers exclude it first), but 429 is explicitly transient.
-      return false;
-    case "error":
-      return (
-        typeof result.errorCode === "number" &&
-        result.errorCode >= 400 &&
-        result.errorCode < 500
-      );
-    default:
-      // thread_not_found reaching the fallback means the recreate-and-retry above already
-      // failed; topic_not_modified cannot come from sendMessage. Both are 4xx-class.
-      return true;
-  }
-}
 
 /**
  * A Telegram call at or above this many milliseconds is logged at `warn` rather than `log`.
@@ -250,7 +87,7 @@ async function callTelegram<T>(
   botToken: string,
   method: string,
   init: RequestInit,
-): Promise<TgResult<T>> {
+): Promise<ChatResult<T>> {
   const startedAt = Date.now();
   let outcome = "threw";
   try {
@@ -263,7 +100,7 @@ async function callTelegram<T>(
   }
 }
 
-async function parseTgResponse<T>(res: Response, method?: string): Promise<TgResult<T>> {
+async function parseTgResponse<T>(res: Response, method?: string): Promise<ChatResult<T>> {
   const data = (await res.json().catch(() => null)) as {
     ok?: boolean;
     result?: T;
@@ -336,7 +173,7 @@ async function parseTgResponse<T>(res: Response, method?: string): Promise<TgRes
 export async function sendMessage(
   botToken: string,
   options: SendMessageOptions,
-): Promise<TgResult<{ message_id: number }>> {
+): Promise<ChatResult<{ message_id: number }>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     text: options.text,
@@ -369,7 +206,7 @@ export async function sendMessage(
 export async function sendRichMessage(
   botToken: string,
   options: SendRichMessageOptions,
-): Promise<TgResult<{ message_id: number }>> {
+): Promise<ChatResult<{ message_id: number }>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     rich_message: { markdown: options.markdown },
@@ -391,7 +228,7 @@ export async function sendRichMessage(
 export async function editMessageText(
   botToken: string,
   options: EditMessageTextOptions,
-): Promise<TgResult<{ message_id?: number } | boolean>> {
+): Promise<ChatResult<{ message_id?: number } | boolean>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     message_id: options.messageId,
@@ -414,7 +251,7 @@ export async function editMessageText(
 export async function sendPhoto(
   botToken: string,
   options: SendPhotoOptions,
-): Promise<TgResult<{ message_id: number }>> {
+): Promise<ChatResult<{ message_id: number }>> {
   const form = new FormData();
   form.append("chat_id", String(options.chatId));
   form.append("photo", options.photo, options.filename);
@@ -434,7 +271,7 @@ export async function sendPhoto(
 export async function sendDocument(
   botToken: string,
   options: SendDocumentOptions,
-): Promise<TgResult<{ message_id: number }>> {
+): Promise<ChatResult<{ message_id: number }>> {
   const form = new FormData();
   form.append("chat_id", String(options.chatId));
   form.append("document", options.document, options.filename);
@@ -454,7 +291,7 @@ export async function sendDocument(
 export async function answerCallbackQuery(
   botToken: string,
   options: AnswerCallbackQueryOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   const payload: Record<string, unknown> = {
     callback_query_id: options.callbackQueryId,
   };
@@ -472,7 +309,7 @@ export async function answerCallbackQuery(
 export async function getFile(
   botToken: string,
   options: GetFileOptions,
-): Promise<TgResult<{ file_path: string }>> {
+): Promise<ChatResult<{ file_path: string }>> {
   return callTelegram<{ file_path: string }>(botToken, "getFile", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -483,7 +320,7 @@ export async function getFile(
 export async function createForumTopic(
   botToken: string,
   options: CreateForumTopicOptions,
-): Promise<TgResult<ForumTopic>> {
+): Promise<ChatResult<ForumTopic>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     name: options.name,
@@ -505,7 +342,7 @@ export async function createForumTopic(
 export async function editForumTopic(
   botToken: string,
   options: EditForumTopicOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   const payload: Record<string, unknown> = {
     chat_id: options.chatId,
     message_thread_id: options.messageThreadId,
@@ -527,7 +364,7 @@ export async function editForumTopic(
 export async function closeForumTopic(
   botToken: string,
   options: CloseForumTopicOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   return callTelegram<boolean>(botToken, "closeForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -541,7 +378,7 @@ export async function closeForumTopic(
 export async function reopenForumTopic(
   botToken: string,
   options: ReopenForumTopicOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   return callTelegram<boolean>(botToken, "reopenForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -555,7 +392,7 @@ export async function reopenForumTopic(
 export async function deleteForumTopic(
   botToken: string,
   options: DeleteForumTopicOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   return callTelegram<boolean>(botToken, "deleteForumTopic", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -577,7 +414,7 @@ export async function deleteForumTopic(
 export async function unpinAllForumTopicMessages(
   botToken: string,
   options: UnpinAllForumTopicMessagesOptions,
-): Promise<TgResult<boolean>> {
+): Promise<ChatResult<boolean>> {
   return callTelegram<boolean>(botToken, "unpinAllForumTopicMessages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -591,7 +428,7 @@ export async function unpinAllForumTopicMessages(
 
 /**
  * Downloads a file Telegram is hosting (`file_path` from `getFile`). Not a Bot API method, so it
- * returns the raw Response rather than a TgResult: the caller streams the body into R2.
+ * returns the raw Response rather than a ChatResult: the caller streams the body into R2.
  *
  * It lives here, not at its call site, so that this file stays the only one that knows
  * Telegram's host (the egress guard test enforces that; chat-transport, pigeon-lenr.1).

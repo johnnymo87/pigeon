@@ -35,7 +35,7 @@ import { callSlack, downloadSlackFile } from "./slack";
 import { LAUNCH_USAGE_TEXT } from "./launch-command";
 import { TAG_USAGE_TEXT } from "./tag-command";
 import type { MediaRef } from "./media";
-import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./webhook";
+import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
 
 export type SlackEndpoint = "events" | "commands" | "interactivity";
 

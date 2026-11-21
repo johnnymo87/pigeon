@@ -1,6 +1,7 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
-import { getTelegramErrorDetails, isPermanentTopicFailure, TgResult } from "./telegram";
+import { failureDetails, isPermanentTopicFailure } from "./chat/failures";
+import type { ChatResult } from "./chat/transport";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import { machineSlackWorkspace, resolveWorkerTarget } from "./chat/address";
 import { isAllowedChatId } from "./chat/allowlist";
@@ -52,7 +53,7 @@ export const RICH_MAX_CHARS = 32768;
  * nothing about the markdown, so it is NOT a rejection: it surfaces as a 502 and the outbox
  * retries the rich send.
  */
-function isRichRejection(result: TgResult<unknown>): boolean {
+function isRichRejection(result: ChatResult<unknown>): boolean {
   return (
     !result.ok &&
     result.kind === "error" &&
@@ -309,7 +310,7 @@ type MediaSendResult =
   | { ok: true; result: { message_id: number } }
   | { ok: false; details: unknown };
 
-async function sendTelegramPhoto(
+async function sendPhotoReply(
   tg: ChatTransport,
   chatId: string | number,
   photoBlob: Blob,
@@ -329,10 +330,10 @@ async function sendTelegramPhoto(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false, details: getTelegramErrorDetails(res) };
+  return { ok: false, details: failureDetails(res) };
 }
 
-async function sendTelegramDocument(
+async function sendDocumentReply(
   tg: ChatTransport,
   chatId: string | number,
   documentBlob: Blob,
@@ -352,7 +353,7 @@ async function sendTelegramDocument(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false, details: getTelegramErrorDetails(res) };
+  return { ok: false, details: failureDetails(res) };
 }
 
 /**
@@ -586,7 +587,7 @@ export async function handleSendNotification(
     const callerHasButtons = hasButtons(replyMarkup);
     let linkMarkup: unknown;
     let linkMarkupResolved = false;
-    const sendPlain = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+    const sendPlain = async (threadId: number | undefined): Promise<ChatResult<{ message_id: number }>> => {
       if (!linkMarkupResolved) {
         linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId, env);
         linkMarkupResolved = true;
@@ -602,7 +603,7 @@ export async function handleSendNotification(
       if (linkMarkup && !result.ok && result.kind === "error" && result.errorCode === 400) {
         console.warn("[worker] mention link buttons rejected, resending without them", {
           sessionId,
-          details: getTelegramErrorDetails(result),
+          details: failureDetails(result),
         });
         linkMarkup = undefined;
         return sendPlain(threadId);
@@ -611,7 +612,7 @@ export async function handleSendNotification(
     };
     let richLinkMarkup: unknown;
     let richLinkMarkupResolved = false;
-    const sendText = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+    const sendText = async (threadId: number | undefined): Promise<ChatResult<{ message_id: number }>> => {
       if (richEnabled) {
         if (!richLinkMarkupResolved) {
           richLinkMarkup = callerHasButtons
@@ -637,7 +638,7 @@ export async function handleSendNotification(
           // Try rich once more without them before blaming the markdown.
           console.warn("[worker] mention link buttons rejected on a rich message, resending without them", {
             sessionId,
-            details: getTelegramErrorDetails(result),
+            details: failureDetails(result),
           });
           richLinkMarkup = undefined;
           return sendText(threadId);
@@ -645,7 +646,7 @@ export async function handleSendNotification(
         // Nothing was posted (a 4xx). Fall back once, and loudly: a rich rejection means the
         // daemon produced markdown Telegram would not take, which is a bug to go and look at.
         richEnabled = false;
-        richError = getTelegramErrorDetails(result);
+        richError = failureDetails(result);
         console.warn("[worker] rich message rejected, sending plain", {
           sessionId,
           notificationId,
@@ -772,7 +773,7 @@ export async function handleSendNotification(
         sessionId,
         messageThreadId,
         reason: "send_failed",
-        details: getTelegramErrorDetails(telegramResult),
+        details: failureDetails(telegramResult),
       });
       relocationReason = "send_failed";
       messageThreadId = undefined;
@@ -790,7 +791,7 @@ export async function handleSendNotification(
     }
 
     if (!telegramResult.ok) {
-      const details = getTelegramErrorDetails(telegramResult);
+      const details = failureDetails(telegramResult);
       return json({ error: "Telegram API error", details, ...slackClass(details) }, 502);
     }
 
@@ -812,7 +813,7 @@ export async function handleSendNotification(
           console.warn("[worker] unpinAllForumTopicMessages failed", {
             sessionId,
             messageThreadId,
-            details: getTelegramErrorDetails(unpinRes),
+            details: failureDetails(unpinRes),
           });
         }
       } catch (err) {
@@ -881,8 +882,8 @@ export async function handleSendNotification(
           // The Telegram client ignores the signal; the Slack upload honours it.
           const signal = AbortSignal.timeout(MEDIA_SEND_TIMEOUT_MS);
           const mediaResult = isImage
-            ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
-            : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
+            ? await sendPhotoReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
+            : await sendDocumentReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
 
           if (mediaResult.ok && mediaResult.result) {
             await db
@@ -1007,7 +1008,7 @@ export async function handleEditNotification(
   });
 
   if (!telegramResult.ok) {
-    const details = getTelegramErrorDetails(telegramResult);
+    const details = failureDetails(telegramResult);
     return json(
       {
         error: "Telegram API error",

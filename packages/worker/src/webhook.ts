@@ -2,7 +2,8 @@ import { lookupMessage, lookupMessageByToken } from "./notifications";
 import { maybeAnswerInNamedTopic, getBoundSessionByThread } from "./named-topics";
 import { getBySession, getByThread, topicName, topicsEnabled } from "./topics";
 import { editTopicName } from "./topic-rename";
-import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent } from "./d1-ops";
+import { generateCommandId, queueCommand as d1QueueCommand, isMachineRecent, MAX_QUEUE_PER_MACHINE } from "./d1-ops";
+import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
 import type { MediaRef } from "./media";
 import { createTelegramClient } from "./telegram";
 import { transportForChat } from "./chat";
@@ -326,7 +327,6 @@ interface TelegramUpdate {
   callback_query?: TelegramCallbackQuery;
 }
 
-const MAX_COMMAND_LENGTH = 10_000;
 const OK = () => new Response("ok", { status: 200 });
 
 interface ExtractedMedia {
@@ -336,15 +336,6 @@ interface ExtractedMedia {
   filename: string;
   size: number;
 }
-
-export const MAX_FILE_SIZE = 20 * 1024 * 1024;
-
-/**
- * Max image dimension (px) for inbound photos. Anthropic's API limits images to
- * 2000px per side in many-image requests (21+), and auto-resizes above 1568px
- * adding latency. We pick the largest Telegram variant within this bound.
- */
-export const MAX_IMAGE_DIMENSION = 1568;
 
 export function extractMedia(message: TelegramMessage): ExtractedMedia | null {
   if (message.photo && message.photo.length > 0) {
@@ -447,7 +438,7 @@ async function relayMediaToR2(
 /**
  * Send a message via the Telegram Bot API.
  *
- * Discarding the TgResult is deliberate: these are best-effort user-facing
+ * Discarding the ChatResult is deliberate: these are best-effort user-facing
  * chat messages across 21 call sites, and adding error handling here would
  * change behavior across all of them.
  */
@@ -479,7 +470,7 @@ async function sendTelegramMessage(
 /**
  * Answer a callback query.
  *
- * Discarding the TgResult is deliberate: callback query acknowledgements are
+ * Discarding the ChatResult is deliberate: callback query acknowledgements are
  * best-effort and adding error handling would change existing behavior.
  */
 async function answerCallbackQuery(
@@ -685,8 +676,6 @@ async function resolveSessionMachine(
 
   return { machineId: session.machine_id, label: session.label };
 }
-
-const MAX_QUEUE_PER_MACHINE = 100;
 
 interface QueueCommandOpts {
   machineId: string;
@@ -943,9 +932,6 @@ export function richMessagePlainText(richMessage: unknown): string {
   const blocks = (richMessage as { blocks?: unknown }).blocks;
   return Array.isArray(blocks) ? richBlocksText(blocks) : "";
 }
-
-/** Longest replied-to bot text forwarded as context. */
-export const IN_REPLY_TO_MAX_CHARS = 500;
 
 /**
  * Metadata for a plain-message execute command. Exported for tests.
@@ -1427,4 +1413,4 @@ export async function handleTelegramWebhook(
 }
 
 // Exports for testing
-export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, MAX_COMMAND_LENGTH, MAX_QUEUE_PER_MACHINE, sendTelegramMessage };
+export { verifyWebhookSecret, deduplicateUpdate, resolveMessageSession, resolveCallbackSession, isAllowedChatId, isAllowedTelegramSource, sendTelegramMessage };

@@ -1,5 +1,5 @@
 import type { D1Database } from "@cloudflare/workers-types";
-import { getTelegramErrorDetails, isPermanentTopicFailure } from "./telegram";
+import { failureDetails, isPermanentTopicFailure } from "./chat/failures";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
   deleteBySession,
@@ -363,7 +363,7 @@ export async function resolveTopic(
         };
       }
       const transient = !isPermanentTopicFailure(createRes);
-      const createError = getTelegramErrorDetails(createRes);
+      const createError = failureDetails(createRes);
       // Non-429 failure -> topic resolution failed (pigeon-bit4: say so; this was silent)
       console.warn("[worker] topic creation failed", {
         sessionId: opts.sessionId,

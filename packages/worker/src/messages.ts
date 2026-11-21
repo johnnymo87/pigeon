@@ -32,7 +32,7 @@
 
 import { authenticate } from "./credentials";
 import { unauthorized } from "./auth";
-import { type TgResult } from "./telegram";
+import type { ChatResult } from "./chat/transport";
 import { transportForChat } from "./chat";
 import { authorizeStoredAddress } from "./chat/address";
 import { errorClassOf } from "./slack";
@@ -107,7 +107,7 @@ function descriptionOf(res: { response?: unknown; description?: string }): strin
  * the resolved address on success; Telegram's responses are byte-for-byte what they were.
  */
 function toResponse<T>(
-  res: TgResult<T>,
+  res: ChatResult<T>,
   okBody: (result: T) => Record<string, unknown>,
   slack?: { chatId: string },
 ): Response {

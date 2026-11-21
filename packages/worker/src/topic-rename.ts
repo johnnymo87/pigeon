@@ -1,7 +1,7 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs } from "./credentials";
 import { withD1, StorageError } from "./d1";
-import { getTelegramErrorDetails } from "./telegram";
+import { failureDetails } from "./chat/failures";
 import { transportForChat } from "./chat";
 import {
   getBySession,
@@ -38,7 +38,7 @@ export async function editTopicName(
   // stale — re-issuing the command is the repair, and it only converges if this is
   // not treated as an error.
   if (!editRes.ok && editRes.kind !== "topic_not_modified") {
-    return { ok: false, error: getTelegramErrorDetails(editRes) };
+    return { ok: false, error: failureDetails(editRes) };
   }
 
   await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, chatId: topic.chat_id, name }));

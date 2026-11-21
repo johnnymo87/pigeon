@@ -20,24 +20,132 @@
  *
  * `src/telegram.ts` remains the only file that knows Telegram's host (egress guard test).
  */
-import type {
-  CloseForumTopicOptions,
-  CreateForumTopicOptions,
-  DeleteForumTopicOptions,
-  EditForumTopicOptions,
-  EditMessageTextOptions,
-  ForumTopic,
-  ReopenForumTopicOptions,
-  SendDocumentOptions,
-  SendMessageOptions,
-  SendPhotoOptions,
-  SendRichMessageOptions,
-  TgResult,
-  UnpinAllForumTopicMessagesOptions,
-} from "../telegram";
-
 /** A provider call's outcome. Telegram's shape; other transports map their errors onto it. */
-export type ChatResult<T> = TgResult<T>;
+export type ChatResult<T> =
+  | { ok: true; result: T }
+  | { ok: false; kind: "rate_limited"; retryAfter: number; response?: unknown }
+  | { ok: false; kind: "thread_not_found"; response?: unknown }
+  | { ok: false; kind: "topic_not_modified"; response?: unknown }
+  | { ok: false; kind: "error"; errorCode?: number; description?: string; response?: unknown };
+
+export interface SendMessageOptions {
+  chatId: string | number;
+  text: string;
+  entities?: unknown[];
+  replyMarkup?: unknown;
+  messageThreadId?: number;
+  /** Aborts the call (the fetch rejects). Callers that bound a request use this. */
+  signal?: AbortSignal;
+  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
+  notifyOwner?: boolean;
+  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
+  notifyCategory?: "questions" | "errors";
+}
+
+export interface SendRichMessageOptions {
+  chatId: string | number;
+  /** GFM plus Telegram's extensions; see https://core.telegram.org/bots/api/rich-messages.md */
+  markdown: string;
+  /** Slack only: the plain-text rendering, used as the notification text instead of the raw markdown. */
+  text?: string;
+  replyMarkup?: unknown;
+  messageThreadId?: number;
+  /** Slack only: flag the post for an owner mention (still gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
+  notifyOwner?: boolean;
+  /** Slack only: which `SLACK_NOTIFY_OWNER` category a flagged post is. Absent with `notifyOwner` means `errors`. */
+  notifyCategory?: "questions" | "errors";
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
+}
+
+export interface EditMessageTextOptions {
+  chatId: string | number;
+  messageId: number;
+  text: string;
+  entities?: unknown[];
+  replyMarkup?: unknown;
+  /** Slack only: keep the owner mention on the edited message (gated by `SLACK_NOTIFY_OWNER`). Telegram ignores it. */
+  notifyOwner?: boolean;
+  /** Slack only: the category of that mention. Telegram ignores it. */
+  notifyCategory?: "questions" | "errors";
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
+}
+
+export interface SendPhotoOptions {
+  chatId: string | number;
+  photo: Blob;
+  filename: string;
+  replyToMessageId?: number;
+  messageThreadId?: number;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
+}
+
+export interface SendDocumentOptions {
+  chatId: string | number;
+  document: Blob;
+  filename: string;
+  replyToMessageId?: number;
+  messageThreadId?: number;
+  /** Aborts the Slack calls of this operation. The Telegram client ignores it. */
+  signal?: AbortSignal;
+}
+
+export interface ForumTopic {
+  message_thread_id: number;
+  name: string;
+  icon_color: number;
+  icon_custom_emoji_id?: string;
+  is_name_implicit?: boolean;
+}
+
+export interface CreateForumTopicOptions {
+  chatId: string | number;
+  name: string;
+  iconColor?: number;
+  iconCustomEmojiId?: string;
+  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
+  sessionId?: string;
+  /** Slack only: a named topic's key, which becomes the channel name. */
+  channelKey?: string;
+  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
+  topic?: string;
+}
+
+export interface EditForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+  name?: string;
+  iconCustomEmojiId?: string;
+  /** Slack only: the session this conversation is for (channel name suffix, topic line). */
+  sessionId?: string;
+  /** Slack only: a named topic's key, which fixes the channel name. Without it or `sessionId`, the channel is not renamed. */
+  channelKey?: string;
+  /** Slack only: the channel's topic line, replacing the one derived from `name`. */
+  topic?: string;
+}
+
+export interface CloseForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
+export interface ReopenForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
+export interface DeleteForumTopicOptions {
+  chatId: string | number;
+  messageThreadId: number;
+}
+
+export interface UnpinAllForumTopicMessagesOptions {
+  chatId: string | number;
+  messageThreadId: number;
+  signal?: AbortSignal;
+}
 
 export interface ChatTransport {
   /** Post text (+ entities, + keyboard) into a chat, optionally into a topic/conversation. */

@@ -19,7 +19,7 @@ import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { resolveWorkerTarget } from "./chat/address";
 import { topicsEnabled } from "./topics";
-import { getTelegramErrorDetails } from "./telegram";
+import { failureDetails } from "./chat/failures";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import { topicUrl } from "./mention-links";
 
@@ -159,9 +159,9 @@ export async function resolveNamedTopic(
     }
     console.warn("[worker] named topic creation failed", {
       key: opts.key,
-      details: getTelegramErrorDetails(created),
+      details: failureDetails(created),
     });
-    return { ok: false, kind: "create_failed", details: getTelegramErrorDetails(created) };
+    return { ok: false, kind: "create_failed", details: failureDetails(created) };
   }
 
   const threadId = created.result.message_thread_id;
@@ -285,7 +285,7 @@ export async function maybeAnswerInNamedTopic(
     const text = (await movedTopicHint(db, env, chatId, messageThreadId, row.topic_key)) ?? NAMED_TOPIC_HINT_TEXT;
     const res = await tg.sendMessage({ chatId, messageThreadId, text });
     if (!res.ok) {
-      console.warn("[worker] named topic hint failed", { key: row.topic_key, details: getTelegramErrorDetails(res) });
+      console.warn("[worker] named topic hint failed", { key: row.topic_key, details: failureDetails(res) });
     }
   }
   return true;
