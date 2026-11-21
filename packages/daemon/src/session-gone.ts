@@ -6,6 +6,9 @@
  * channel) stayed open until the 7-day reaper and the next daily close window. The plugin now
  * reports the delete (`POST /session-deleted`) and this decides whether to act on it.
  *
+ * The trigger is any delete through opencode, not only the TUI: the plugin cannot tell them
+ * apart. A session whose origin automation declared gets the janitorial (deferred) topic close.
+ *
  * Two rules make that safe:
  *
  * - **Only an opencode row that is not pinned is torn down.** The plugin speaks for opencode
@@ -37,8 +40,16 @@ export type BackendDeletedOutcome =
 
 export interface SessionGoneDeps {
   getSession: (sessionId: string) => SessionGoneRow | null;
-  /** Deletes the row and runs the explicit-delete teardown (`onSessionDeleted` in index.ts). */
-  teardown: (sessionId: string) => Promise<void>;
+  /**
+   * Whether automation declared this session's origin (`session_origin`, e.g. lgtm, which records
+   * it right before deleting a session). Such a delete is not one a human is watching.
+   */
+  hasAutomationOrigin: (sessionId: string) => boolean;
+  /**
+   * Deletes the row and runs the explicit-delete teardown (`onSessionDeleted` in index.ts).
+   * `immediate` false leaves the topic for the daily close window, as a janitorial unregister does.
+   */
+  teardown: (sessionId: string, opts: { immediate: boolean }) => Promise<void>;
   log?: (message: string) => void;
 }
 
@@ -87,8 +98,13 @@ export class SessionGone {
       return "deferred";
     }
     try {
-      await this.deps.teardown(sessionId);
-      this.log(`tore down ${sessionId}: deleted in its backend`);
+      // The plugin cannot tell a TUI delete from an API one, and automation (lgtm above all)
+      // deletes sessions at every hour. An immediate close posts a service message that marks the
+      // topic unread, which the daily close window exists to batch, so only a session with no
+      // automation origin closes now (pigeon-4890, pigeon-xehy).
+      const immediate = !this.deps.hasAutomationOrigin(sessionId);
+      await this.deps.teardown(sessionId, { immediate });
+      this.log(`tore down ${sessionId}: deleted in its backend (immediate close: ${immediate})`);
       return "torn_down";
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

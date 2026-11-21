@@ -1,15 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { SessionGone, type SessionGoneRow } from "../src/session-gone";
 
-function setup(rows: Record<string, SessionGoneRow>) {
+function setup(rows: Record<string, SessionGoneRow>, automated: string[] = []) {
   const live = new Map(Object.entries(rows));
   const tornDown: string[] = [];
-  const teardown = vi.fn(async (id: string) => {
+  const teardown = vi.fn(async (id: string, _opts: { immediate: boolean }) => {
     live.delete(id);
     tornDown.push(id);
   });
   const gone = new SessionGone({
-    getSession: (id) => live.get(id) ?? null,
+    getSession: (id: string) => live.get(id) ?? null,
+    hasAutomationOrigin: (id: string) => automated.includes(id),
     teardown,
     log: () => {},
   });
@@ -24,6 +25,19 @@ describe("SessionGone.backendDeleted (pigeon-4ogz.21)", () => {
 
     await expect(gone.backendDeleted("ses_a")).resolves.toBe("torn_down");
     expect(tornDown).toEqual(["ses_a"]);
+  });
+
+  it("closes a human's session's topic now, and leaves an automated one's to the close window", async () => {
+    // lgtm and other automation delete sessions through the opencode API around the clock. An
+    // immediate close posts a service message that marks the topic unread, which is what the
+    // daily close window exists to batch (pigeon-4890, pigeon-xehy).
+    const { gone, teardown } = setup({ ses_human: OPENCODE, ses_bot: OPENCODE }, ["ses_bot"]);
+
+    await gone.backendDeleted("ses_human");
+    await gone.backendDeleted("ses_bot");
+
+    expect(teardown).toHaveBeenCalledWith("ses_human", { immediate: true });
+    expect(teardown).toHaveBeenCalledWith("ses_bot", { immediate: false });
   });
 
   it("treats a legacy row with no backend kind as opencode", async () => {
@@ -132,7 +146,8 @@ describe("SessionGone.backendDeleted (pigeon-4ogz.21)", () => {
   it("a teardown failure is logged and reported, never thrown", async () => {
     const live = new Map<string, SessionGoneRow>([["ses_a", OPENCODE]]);
     const gone = new SessionGone({
-      getSession: (id) => live.get(id) ?? null,
+      getSession: (id: string) => live.get(id) ?? null,
+      hasAutomationOrigin: () => false,
       teardown: async () => { throw new Error("worker down"); },
       log: () => {},
     });
