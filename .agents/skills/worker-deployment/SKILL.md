@@ -39,7 +39,7 @@ npm run --workspace @pigeon/worker deploy
 
 ## Chat Transport Runbooks
 
-- Telegram Forum Topics (the Mac, until it flips): `docs/runbooks/telegram-forum-migration.md`
+- Telegram Forum Topics (historical: no machine uses Telegram since 2026-11-21; the rollback path until `pigeon-4ogz.13`): `docs/runbooks/telegram-forum-migration.md`
 - Slack workspace and app setup for a machine, and the flip (`slack-flip.mjs`): `docs/runbooks/slack-workspace-setup.md`
 
 ## R2 Bucket

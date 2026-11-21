@@ -594,7 +594,7 @@ The arbiter therefore stats the directory before sending (`swarm/directory-check
 
 ## Chat Mirroring (Telegram topic / Slack channel)
 
-Every swarm IPC message is mirrored to the **receiver's** chat conversation (its Telegram forum topic, or its Slack session channel on a Slack machine; the daemon just enqueues the outbox row and the worker resolves the conversation) so operators can see why a session started working. The helper keeps its Telegram name (`enqueueSwarmTelegramNotice`, `swarm/telegram-notice.ts`) until Telegram is deleted (`pigeon-4ogz.13`).
+Every swarm IPC message is mirrored to the **receiver's** chat conversation (its Slack session channel, or its Telegram forum topic for a machine rolled back to Telegram; the daemon just enqueues the outbox row and the worker resolves the conversation) so operators can see why a session started working. The helper keeps its Telegram name (`enqueueSwarmTelegramNotice`, `swarm/telegram-notice.ts`) until Telegram is deleted (`pigeon-4ogz.13`).
 
 ### Hook Sites & Guarantees
 - **Hooked at insert, not delivery**: Swarm rows route through `bankOrInsertSwarmMessage()` and enqueue a Telegram outbox notice at creation time across four insertion sites (`POST /swarm/send`, `POST /swarm/schedule`, `notifySenderOfFailure`, and `delivery-watchdog` nudges). For banked pull messages, Telegram notices are still enqueued on fresh inserts, but arbiter delivery is skipped. Cancellations (`POST /swarm/scheduled/:msgId/cancel`) post a `🚫 cancelled <msg_id>` retraction notice.

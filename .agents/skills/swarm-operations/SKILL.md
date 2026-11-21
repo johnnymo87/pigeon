@@ -90,7 +90,7 @@ If you ever see two `delivered` events for the same target with timestamps close
 
 ## Tracing Chat Swarm Posts (Slack channel / Telegram topic)
 
-Swarm IPC messages are mirrored to the **receiver's** chat conversation (Slack session channel on devbox/cloudbox, Telegram topic on the Mac) at insert time. Post delivery is best-effort via the daemon's outbox and independent of swarm IPC arbiter delivery — a missing or backlogged chat post does **not** mean the swarm message itself failed to reach the target's transcript.
+Swarm IPC messages are mirrored to the **receiver's** chat conversation (Slack session channel on every machine; a Telegram topic only after a rollback) at insert time. Post delivery is best-effort via the daemon's outbox and independent of swarm IPC arbiter delivery — a missing or backlogged chat post does **not** mean the swarm message itself failed to reach the target's transcript.
 
 ### Outbox Querying
 

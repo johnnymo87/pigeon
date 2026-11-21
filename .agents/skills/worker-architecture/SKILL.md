@@ -17,12 +17,12 @@ Use this skill when you need system-level understanding before debugging, deploy
 - D1 operations: `packages/worker/src/d1-ops.ts`
 - D1 schema: `packages/worker/src/d1-schema.sql`
 - Runtime state: D1 database `pigeon-router`
-- Chat transports: Slack (`src/slack.ts` the only door to Slack's API, `src/slack-inbound.ts` ingress, `src/chat/slack-*.ts` config/render/transport/verify) and Telegram (`src/telegram.ts`, `src/webhook.ts`), behind the `ChatTransport` seam in `src/chat/`. Which one a machine uses is decided by the worker: Slack iff a `SLACK_WORKSPACE_<MACHINE>` secret exists for it (`GET /whoami` reports `transport: "slack"`); see AGENTS.md "Which transport a machine is on". devbox and cloudbox are on Slack; the Mac is on Telegram until it flips (`pigeon-4ogz.11`).
+- Chat transports: Slack (`src/slack.ts` the only door to Slack's API, `src/slack-inbound.ts` ingress, `src/chat/slack-*.ts` config/render/transport/verify) and Telegram (`src/telegram.ts`, `src/webhook.ts`), behind the `ChatTransport` seam in `src/chat/`. Which one a machine uses is decided by the worker: Slack iff a `SLACK_WORKSPACE_<MACHINE>` secret exists for it (`GET /whoami` reports `transport: "slack"`); see AGENTS.md "Which transport a machine is on". All three machines (devbox, cloudbox, macbook) are on Slack since 2026-11-21 (`pigeon-4ogz.11`); the Telegram code remains only as the rollback path (`slack-flip.mjs <machine> off`) until `pigeon-4ogz.13` deletes it.
 
 ## Core Flow
 
 1. Session registers (`/sessions/register`) with `sessionId -> machineId`
-2. Notification sent (`/notifications/send`) to the chat (Slack, or Telegram on the Mac) and mapped as `chat_id + message_id -> sessionId + token` (on Slack both ids are handles, below)
+2. Notification sent (`/notifications/send`) to the chat (Slack; Telegram only after a rollback) and mapped as `chat_id + message_id -> sessionId + token` (on Slack both ids are handles, below)
 3. User replies or types: Slack Events API / slash command / button (`POST /slack/<machine>/{events,commands,interactivity}`), or the Telegram webhook (`/webhook/telegram/...`)
 4. Worker resolves session, queues command in D1 `commands` table
 5. Daemon polls `GET /machines/:id/next`, receives command, delivers to plugin

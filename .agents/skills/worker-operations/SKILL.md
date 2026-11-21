@@ -73,7 +73,7 @@ After deploy:
 
 ## Where To Look When A Slack Post Is Missing
 
-1. `GET /whoami` with the machine's key: `transport: "slack"` or not. No field means the worker sees no valid secret for that machine and is posting to Telegram.
+1. `GET /whoami` with the MACHINE key (`/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac): `transport: "slack"` or not. `"credential":"shared"` means the wrong key. A machine answer with no `transport` means the worker sees no valid secret for that machine and would post to Telegram (rolled back, or a broken secret).
 2. `wrangler tail` for `[worker] slack ...` and the `[worker] request outcome` lines (status >= 400) on `/notifications/send` and `/messages/send`; read the response `errorClass`.
 3. D1: the chat id is `slack:<teamId>`. `SELECT * FROM topics WHERE chat_id LIKE 'slack:%' AND session_id = '<sid>'` gives the session's channel handle, and `slack_conversations` maps that handle to the Slack channel id (`slack_posts` maps post handles to channel + `ts`). Apply the schema (`slack_conversations`, `slack_posts`, `slack_seen_events`) before creating any secret; a missing table shows as a quiet `retention skipped: table missing` log line in the cron.
 4. No mention or push is expected by default: `SLACK_NOTIFY_OWNER` is deliberately unset (empty means no owner mention at all).
