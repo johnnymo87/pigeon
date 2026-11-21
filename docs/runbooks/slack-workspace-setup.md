@@ -1,7 +1,7 @@
 # Runbook: Slack workspace and app setup (one per machine)
 
 Creates the personal Slack workspace and the pigeon app for one machine (devbox, cloudbox,
-macbook), and stages its credentials, so that the machine can later be flipped from Telegram to
+macbook), and stages its credentials, so that the machine can later be put on
 Slack (chat-transport phase 2, epic `pigeon-4ogz`). Spec:
 `docs/plans/2026-11-20-slack-transport-design.md` (§2 workspaces and apps, §3 Muting). Bead that
 runs this: `pigeon-4ogz.7`.
@@ -15,7 +15,7 @@ Slack resource beyond the ones listed here is created without asking Jonathan.
 | | devbox | cloudbox | macbook |
 |---|---|---|---|
 | Machine id (`CCR_MACHINE_ID`, used in the manifest and the secret names) | `devbox` | `cloudbox` | `macbook` |
-| Workspace name (the Telegram group's name) | `pigeon devbox` | `pigeon cloudbox` | `pigeon <mac name>`: the Mac Telegram group's title as Jonathan sees it; ask him if no note records it, and use `pigeon macbook` if he has no preference. Do not call the Bot API for it (`getChat` puts the bot token in the URL) |
+| Workspace name | `pigeon devbox` | `pigeon cloudbox` | `pigeon macbook` unless Jonathan names it otherwise |
 | Workspace owner | `jonathan.mohrbacher@gmail.com` | same | same |
 | Preferred URL | `pigeon-devbox.slack.com` | `pigeon-cloudbox.slack.com` | `pigeon-macbook.slack.com` |
 | Channels created here | `#alerts`, `#em-alerts` | `#alerts` | `#alerts` |
@@ -300,8 +300,7 @@ the app settings page, so sign in again in a fresh throwaway profile under the s
    devbox age key, wrangler logged in, and `~/projects/workstation` current (`--sops-file` to point
    elsewhere). It checks the D1 Slack tables exist, puts `SLACK_WORKSPACE_<M>` on stdin, waits for
    the worker to see it, and creates every bound coordinator's channel. It exits 1 if a binding was
-   left behind; re-running is safe. Rollback: `... <m> off` (add `--telegram-chat <id>` if it reports
-   a binding `unplaced`).
+   left behind; re-running is safe. There is no `off` and no way back to Telegram.
 2. App settings → *Event Subscriptions* → **Retry** next to the request URL. It must turn
    *Verified*. If it does not, either the worker is refusing Slack's signature (check the
    `signingSecret` in the staged config) or it is applying the `team_id`/`api_app_id` check to

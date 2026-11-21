@@ -19,7 +19,8 @@ from (pigeon-k0qn.8). Cross-machine swarm delivery (Phase 2) depends on this. De
 - `GET /whoami` says which principal a key resolves to. The daemon logs that once at startup
   as `[worker-identity] ...`.
 - If the worker refuses 12 polls in a row (about a minute) with 401 or 403, the daemon sends
-  a Telegram alert straight to Telegram, bypassing the worker.
+  an alert to `#alerts`: the worker first, and when it refuses that too, straight to Slack's `#alerts`
+  incoming webhook (`PIGEON_SLACK_ALARM_WEBHOOK_URL`), bypassing the worker.
 
 Revocation takes up to 60s (the worker caches each resolved key per isolate). Registration
 takes effect at once.
@@ -135,7 +136,7 @@ delete `~/pigeon-worker-key.<m>`.
   The success line goes to `out.log` and warnings to `err.log`, so read both.
 
 Expect `[worker-identity] credential=machine machine=<m>` and no `Poll failed: 401/403`.
-Then send a Telegram message to a session on that machine and confirm it arrives. Only then
+Then send a Slack message to a session on that machine and confirm it arrives. Only then
 move on to the next machine.
 
 ## Rollback (one machine)
@@ -198,4 +199,4 @@ retired.
 | `owned_by_other_machine` (409) on register | another machine holds that session and has been active within 7 days; it must unregister it first. Fixed ids registered from more than one machine (pull lanes, `ses_stallwatch_*`) hit this once both machines use their own keys |
 | no `[worker-identity]` line at all | `CCR_API_KEY` is empty, so no poller started: the start script's secret read failed |
 | `[worker-identity] credential=shared` after switching | the start script did not pick up the machine key: the secret is missing or the rollback marker exists |
-| Telegram alert "the worker has refused its last 12 polls" | any of the above, the machine was retired from the shared key while still using it, or the worker was rolled back |
+| `#alerts` alert "the worker has refused its last 12 polls" | any of the above, the machine was retired from the shared key while still using it, or the worker was rolled back |

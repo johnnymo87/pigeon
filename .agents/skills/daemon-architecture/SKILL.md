@@ -20,18 +20,18 @@ Use this skill before changing daemon routes, storage schema, worker integration
 ## Route Surface
 
 - `GET /health`
-- `POST /session-start` -- register a session. Accepts optional `pull_sources: string[]` (`"telegram-reply"`, `"swarm"`) for pull sessions (`goose-pull`). Defaults to `["telegram-reply"]` when omitted on a fresh session, and RESETS to default when omitted on re-registration. Gates only swarm banking; invalid values return 400.
+- `POST /session-start` -- register a session. Accepts optional `pull_sources: string[]` (`"telegram-reply"` (a historical name for the human-reply source), `"swarm"`) for pull sessions (`goose-pull`). Defaults to `["telegram-reply"]` when omitted on a fresh session, and RESETS to default when omitted on re-registration. Gates only swarm banking; invalid values return 400.
 - `POST /session-origin` -- declared provenance write (insert-or-upgrade, `source` hardcoded `declared`; precedence `inferred < declared`).
 - `GET /session-origin?session_id=` -- ops read: "why is this session silent?". A 404 means no row: the deliver-default applies.
 - `DELETE /session-origin?session_id=` -- ops hard reset, idempotent. Clears provenance so the session returns to default delivery policy. Afterwards declared writers may re-quiet the session later, but with no title layer, DELETE now makes a session louder, full stop.
 - `GET /sessions`, `GET /sessions/:id`, `DELETE /sessions/:id`
 - `POST /goose/turn-event` -- receive `turn.started` and `turn.ended` events from honkd turn hooks for goose sessions. Mirrors prompts to the chat (`kind='mirror'`) and posts completion receipts (`kind='stop'`). Skips own turns via in-flight/outbox records; idempotent on `h-<upstream_id>`.
 - `POST /stop`
-- `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers the chat notification (Slack or Telegram) with option buttons
+- `POST /question-asked` -- plugin reports AI asked a question; daemon stores pending question in outbox, returns 202 immediately; background OutboxSender delivers the chat notification with option buttons
 - `POST /question-answered` -- plugin reports question was answered locally; daemon clears the pending question
 - `POST /swarm/send` -- enqueue a cross-session swarm message. Banking and the 413 payload limit apply only to an opted-in pull target (`pull_sources` contains `"swarm"`): banks in `pull_inbox` (refusing with 413 if payload > 4000 code points), bypasses arbiter, and returns 202 with `banked: true`. Otherwise writes to `swarm_messages` and returns 202 with `msg_id` for background `SwarmArbiter` delivery. See `swarm-architecture` skill.
 - `POST /swarm/schedule` -- schedule a swarm message for future delivery. Refuses with 409 if target is an opted-in pull session (pull sessions have no delivery clock).
-- `POST /pull/drain` -- claim and drain unread messages for a pull session. Messages returned ordered `telegram-reply` before `swarm`, then `created_at`, `msg_id`. Each message includes `kind` and `reply_to` (`null` for telegram rows).
+- `POST /pull/drain` -- claim and drain unread messages for a pull session. Messages returned ordered `telegram-reply` before `swarm`, then `created_at`, `msg_id`. Each message includes `kind` and `reply_to` (`null` for `telegram-reply` rows).
 - `POST /pull/ack` -- acknowledge claimed message IDs from `pull_inbox`.
 - `GET /pull/pending?session=<id>` -- check unread message count for a pull session; returns `pending` total, `by_source` breakdown (`{"telegram-reply": n, "swarm": m}`), plus additive `swarm_pending` metadata list and `swarm_pending_truncated` flag (consumer: stall-watch's coordinator-mail wake, eng-agent-platform bead g3y2).
 - `GET /swarm/inbox?session=<id>[&since=<msg_id>]` -- read messages already delivered (`state='handed_off'`) to a target session, optionally cursor-paginated.
@@ -43,7 +43,7 @@ Use this skill before changing daemon routes, storage schema, worker integration
 - `session_tokens`: reply/command token validation state
 - `reply_tokens`: message reply-key to token mapping
 - `inbox`: durable local command ingest queue
-- `pull_inbox`: durable message queue for pull sessions (`goose-pull`) that cannot receive pushed prompts. Banks `telegram-reply` rows (replies in bound topics or channels; the source name is Telegram's but Slack replies use it too, until the cross-repo rename after `pigeon-4ogz.13`) and `swarm` rows (messages to sessions opted into `"swarm"` via `pull_sources`). Drained via `POST /pull/drain`, confirmed via `POST /pull/ack`. Expired unread swarm rows notify `ses_` senders (without human alert); unacked rows alert after 30 minutes.
+- `pull_inbox`: durable message queue for pull sessions (`goose-pull`) that cannot receive pushed prompts. Banks `telegram-reply` rows (replies in bound topics or channels; the name is historical, Slack replies use it, until the cross-repo rename `pigeon-4ogz.14`) and `swarm` rows (messages to sessions opted into `"swarm"` via `pull_sources`). Drained via `POST /pull/drain`, confirmed via `POST /pull/ack`. Expired unread swarm rows notify `ses_` senders (without human alert); unacked rows alert after 30 minutes.
 - `pending_questions`: one pending question per session (PRIMARY KEY on `session_id`, 4h TTL). Stores the question's `request_id`, `options[]`, and `token` so the daemon can translate button presses (e.g. `q0`) back to option labels and route the answer to the correct plugin endpoint. Wizard columns: `current_step`, `answers_json_v2`, `version` for multi-question flows.
 - `outbox`: durable notification delivery queue for stop, question, and swarm mirror notifications. Keyed by `notification_id`, `kind` field (`"question"`, `"stop"`, `"swarm"`, or reserved `"mirror"`), state machine: queued → sending → sent (or failed). Background sender processes every 5s. Terminal entries cleaned after 1 hour (24h TTL for `"swarm"` kind). Outbox `getReady` sorts by session rank → per-row tier (conversational vs record) → `created_at`, with `SWARM_SUB_BUDGET = 6`/60s rate governance.
 - `model_override`: nullable TEXT column on `sessions` table. Stores `provider/model` string (e.g. `anthropic/claude-sonnet-4-20250514`). Read by `command-ingest.ts` and passed through the adapter to the plugin.
@@ -77,25 +77,25 @@ Adapters also support `deliverQuestionReply(session, input)` for routing questio
 
 - **Stop notifications**: plain text with inline "reply" button. May include outbound media (see Media Relay below). Routed through the durable outbox (same as questions).
 - **Question notifications (single)**: formatted with the question text + inline keyboard buttons. Each option becomes a button with `callback_data: "cmd:TOKEN:q0"`, `"cmd:TOKEN:q1"`, etc.
-- **Question notifications (multi/wizard)**: when multiple questions exist, rendered one at a time in a single chat message (the worker maps the buttons to a Slack `actions` block on Slack). Buttons use versioned callback data (`cmd:TOKEN:v{version}:q{index}`). As the user answers each step, the message is edited in-place via `POST /notifications/edit` to show the next question. On completion, the message is edited to "All answers submitted".
-- **Message splitting**: when a notification body exceeds 4096 characters (Telegram's limit; Slack accepts it, so the split is kept), `splitTelegramMessage()` splits it into multiple messages at natural boundaries (paragraph, line, sentence). Reply markup is attached only to the last chunk.
-- **Rich tables**: when the persisted `whoami.transport` is Slack the daemon writes standard GFM (`dialect: "slack"`, no Telegram escapes or `tg-button`; `rich-markdown.ts`) and the worker sends it as a Slack markdown block; with no `dialect` the worker never sends `rich` to Slack. A stop whose body has a GFM pipe table also gets `rich: {markdown}` (`buildRichMarkdown`, `rich-markdown.ts`) in its outbox payload. The outbox sends it on chunk 0; on the worker's `rich: "sent"` the remaining chunks are skipped, otherwise they go out as before (pigeon-p909, see AGENTS.md "Tables render natively").
+- **Question notifications (multi/wizard)**: when multiple questions exist, rendered one at a time in a single chat message (the worker maps the buttons to a Slack `actions` block). Buttons use versioned callback data (`cmd:TOKEN:v{version}:q{index}`). As the user answers each step, the message is edited in-place via `POST /notifications/edit` to show the next question. On completion, the message is edited to "All answers submitted".
+- **Message splitting**: when a notification body exceeds 4096 characters (the chunk size, kept from Telegram's limit; Slack accepts it), `splitChatMessage()` splits it into multiple messages at natural boundaries (paragraph, line, sentence). Reply markup is attached only to the last chunk.
+- **Rich tables**: the daemon writes standard GFM (`dialect: "slack"` is always set; `rich-markdown.ts`) and the worker sends it as a Slack markdown block; with no `dialect` (a row queued by an older daemon) the worker never sends `rich`. A stop whose body has a GFM pipe table, or any goose-acp stop, also gets `rich: {markdown, dialect}` (`buildRichMarkdown`) in its outbox payload. The outbox sends it on chunk 0; on the worker's `rich: "sent"` the remaining chunks are skipped, otherwise they go out as before (pigeon-p909, see AGENTS.md "Tables and goose markdown render natively").
 
 Both notification types display a session ID on its own line for easy copy-paste in the chat.
 
-### Which transport the daemon is on (pigeon-4ogz.5)
+### The daemon and the chat (pigeon-4ogz.5, .13)
 
-The worker decides where everything is posted; the daemon only learns which transport it is on from `GET /whoami` (`transport: "slack"`, absent = Telegram), via `ChatTransportState` (`chat-transport-state.ts`): re-read every 60 s, persisted in SQLite `daemon_kv` (key `whoami.transport`), and an unreadable answer keeps the last value. It is used for exactly three things: which direct alarm to use (`direct-alarm.ts`), which markdown dialect to write, and launch capability (`launch-capability.ts`, per poll). A flip (`packages/worker/scripts/slack-flip.mjs`) needs no daemon restart. Slack channels and posts are opaque integer handles (>= 2^40) in every `messageThreadId`/`messageId` field the daemon stores. The daemon's own env for Slack: `PIGEON_SLACK_ALARM_WEBHOOK_URL` (the `#alerts` incoming webhook for the direct alarm), `PIGEON_SLACK_OWNER_USER_ID` and `PIGEON_SLACK_NOTIFY_OWNER=1` (direct alarm mentions the owner on error alerts; off by default), and `PIGEON_PULL_ALLOWED_USER_IDS`, which is compared with the inbound `senderId` and so must hold the owner's Slack user id (alongside the Telegram id while a machine can still flip back).
+Slack is the only chat, and the worker decides where everything is posted. The daemon keeps no transport state: `GET /whoami` reports `transport: "slack"` only informationally (it is read once at startup for the `[worker-identity]` line, nothing branches on it; `chat-transport-state.ts` and its persisted `whoami.transport` were deleted with Telegram). It logs `[chat] Slack only (Telegram removed, pigeon-4ogz.13)` at startup, and ignores leftover `TELEGRAM_*` env with a `[chat] ignoring ...` line. It needs no chat id. Slack channels and posts are opaque integer handles (>= 2^40) in every `messageThreadId`/`messageId` field the daemon stores. The daemon's own env for Slack: `PIGEON_SLACK_ALARM_WEBHOOK_URL` (the `#alerts` incoming webhook for the direct alarm), `PIGEON_SLACK_OWNER_USER_ID` and `PIGEON_SLACK_NOTIFY_OWNER=1` (direct alarm mentions the owner on error alerts; off by default), and `PIGEON_PULL_ALLOWED_USER_IDS`, which is compared with the inbound `senderId` and so must hold the owner's Slack user id.
 
 ### Chat egress (chat-transport phase 1, pigeon-lenr; Slack phase 2, pigeon-4ogz)
 
-The worker is the only normal caller of the Telegram Bot API and of Slack's API. Design:
+The worker is the only normal caller of Slack's API. Design:
 `docs/plans/2026-11-20-telegram-single-egress-design.md`.
 
 - **Session notifications** (stop, question, swarm, mirror) go through the durable outbox to the worker's `/notifications/send`, as before.
 - **Slash-command replies** (`worker/command-reply.ts`) go to the worker's session-free `POST /messages/send` through `WorkerMessageClient`, with a 30s worker-side abort and no fallback. A worker 404 (worker older than the daemon) is logged as an **error**.
-- **Operational alerts** (`sendPlainAlert`: `/alert`, the alert drainer, the reconciler, flap detector, watchdog) go through `createAlertNotifier` (`alert-notifier.ts`): worker first (capped at 5s), and when the *worker* fails (not when Telegram says 400/429) they are re-sent through the direct alarm for the current transport (`DirectTelegramAlarm`, or `DirectSlackAlarm` posting to the `#alerts` incoming webhook) with a `· sent direct; worker: <reason>` suffix, and one `worker-health-fallback` alert per failure kind per hour is recorded. Under 2s of budget a host with a direct path goes direct only. `unpinTopic` is worker-only.
-- `direct-telegram-alarm.ts` is the only `daemon/src` file allowed to contain `api.telegram.org` (guard: `test/telegram-egress-guard.test.ts`); `direct-slack-alarm.ts` is the only one allowed to contain the incoming-webhook host (`hooks.slack.com`). The Slack alarm can post to that one channel only (a thread is ignored, link buttons become `<url|label>` lines). `direct-alarm.ts` picks per alert from the persisted transport, and before any `whoami` answer tries Telegram first, then Slack.
+- **Operational alerts** (`sendPlainAlert`: `/alert`, the alert drainer, the reconciler, flap detector, watchdog) go through `createAlertNotifier` (`alert-notifier.ts`): worker first (capped at 5s), and when the *worker* fails (not when the provider says 400/429) they are re-sent through the direct alarm (`DirectSlackAlarm`, posting to the `#alerts` incoming webhook) with a `· sent direct; worker: <reason>` suffix, and one `worker-health-fallback` alert per failure kind per hour is recorded. Under 2s of budget a host with a direct path goes direct only.
+- `direct-slack-alarm.ts` is the only `daemon/src` file allowed to contain the incoming-webhook host (`hooks.slack.com`). The Slack alarm can post to that one channel only (a thread is ignored, link buttons become `<url|label>` lines). Startup also logs `[alert] direct path: slack=set|unset|INVALID (ignored)`.
 - Startup line `[pigeon-daemon] alert delivery: worker+direct-fallback | worker-only | direct-only | UNAVAILABLE`.
 - Rollout rule: once a daemon runs this code, the worker must not be rolled back below the `/messages/send` version, or every command reply is lost.
 
@@ -103,7 +103,7 @@ The worker is the only normal caller of the Telegram Bot API and of Slack's API.
 
 The daemon mediates bidirectional media relay between the worker's R2 bucket and OpenCode sessions.
 
-### Inbound (Telegram or Slack -> OpenCode)
+### Inbound (Slack -> OpenCode)
 
 When a worker command includes a `media: { key, mime, filename, size }` field:
 
@@ -112,7 +112,7 @@ When a worker command includes a `media: { key, mime, filename, size }` field:
 3. Passes `{ mime, filename, url }` through the adapter chain to the plugin's `/pigeon/direct/execute` endpoint.
 4. On fetch failure, throws to skip ack -- the command lease expires and retries.
 
-### Outbound (OpenCode -> Telegram or Slack)
+### Outbound (OpenCode -> Slack)
 
 When a stop notification includes media (files captured by the plugin):
 
@@ -195,8 +195,8 @@ Full details in the `swarm-architecture` skill (schema columns, route bodies, ar
 7. Background OutboxSender (5s interval) reads queued entries, sends via worker's `/notifications/send` with `notificationId` for idempotency.
 8. On success: marks `sent`. On failure: retries with backoff (5s, 10s, 30s, 60s, 120s). Terminal failure after 10 attempts or 15 minutes.
 9. Worker deduplicates by `notificationId` -- if already delivered, returns `{ok: true, deduplicated: true}` without calling the chat provider again.
-10. User taps a button (`cmd:TOKEN:q0`) or swipe-replies with custom text (Slack: replies in a thread under the question's post).
-11. The chat ingress (Telegram webhook, or Slack `/slack/<machine>/interactivity` for a button or `/events` for a typed answer) hits the worker, which resolves session and queues command in D1.
+10. User taps a button (`cmd:TOKEN:q0`) or replies with custom text (in a thread under the question's post).
+11. The Slack ingress (`/slack/<machine>/interactivity` for a button, `/events` for a typed answer) hits the worker, which resolves session and queues command in D1.
 12. Daemon polls, receives command. Command-ingest detects a pending question for the session:
     - Button press (`q0`, `q1`, ...): translates index to the original option label.
     - Custom text: uses the raw text as the answer.

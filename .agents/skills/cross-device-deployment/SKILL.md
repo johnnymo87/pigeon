@@ -54,7 +54,7 @@ including the unattended nightly one on devbox/cloudbox, runs it. The script say
 fetches its binary for whichever `node` is first on PATH (its install scripts call `node`, so
 naming the `npm` binary alone is not enough). If that is a different Node major than the one the
 service runs, the daemon dies at the next restart with a `NODE_MODULE_VERSION` mismatch and takes
-the host's chat notifications (Slack or Telegram) and swarm relay with it. Every host's service runs a pinned nix node:
+the host's chat notifications and swarm relay with it. Every host's service runs a pinned nix node:
 
 | Machine | Daemon's node comes from |
 |---------|--------------------------|

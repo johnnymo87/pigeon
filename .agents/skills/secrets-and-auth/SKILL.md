@@ -1,6 +1,6 @@
 ---
 name: secrets-and-auth
-description: Use when configuring or troubleshooting secrets, sops injection, and auth boundaries across daemon, worker, Slack, and Telegram
+description: Use when configuring or troubleshooting secrets, sops injection, and auth boundaries across daemon, worker, and Slack
 ---
 
 # Secrets And Auth
@@ -18,13 +18,10 @@ Use this for secret setup, auth failures, or token rotation.
 - `CCR_API_KEY` (shared worker key; still accepted, see below)
 - `pigeon_worker_key` / Keychain `pigeon-worker-key` (per-machine worker key, once rotated)
 - `PIGEON_DAEMON_AUTH_TOKEN`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_WEBHOOK_SECRET`
-- `TELEGRAM_CHAT_ID` / `TELEGRAM_GROUP_ID`
 - `CLOUDFLARE_API_TOKEN`
 - `PIGEON_SLACK_ALARM_WEBHOOK_URL` (daemon env; sops `pigeon_slack_alarm_webhook`, Keychain `pigeon-slack-alarm-webhook` on the Mac): the `#alerts` incoming-webhook URL for the daemon's direct Slack alarm. It is a credential (never print it); anything that is not an `https://hooks.slack.com/...` URL is ignored
 - `PIGEON_SLACK_OWNER_USER_ID`, `PIGEON_SLACK_NOTIFY_OWNER` (daemon env, optional): the owner's Slack user id and an `=1` switch for the direct alarm's owner mention (off by default)
-- `SLACK_WORKSPACE_<MACHINE>` (a **worker** secret, one per machine, machine id upper-cased with `-` as `_`): JSON `{teamId, appId, domain, botToken, userToken, signingSecret, ownerUserId}`. Its presence is what puts that machine on Slack. Staged in workstation sops `secrets/devbox.yaml` as `pigeon_slack_workspace_<machine>` and put into the worker only by `packages/worker/scripts/slack-flip.mjs` (never printed; `node packages/worker/scripts/slack-manifest.mjs check-config <file>` checks a staged file's shape). Setup: `docs/runbooks/slack-workspace-setup.md`
+- `SLACK_WORKSPACE_<MACHINE>` (a **worker** secret, one per machine, machine id upper-cased with `-` as `_`): JSON `{teamId, appId, domain, botToken, userToken, signingSecret, ownerUserId}`. Its presence is what lets that machine post (a machine without one gets `503 no_transport`). Staged in workstation sops `secrets/devbox.yaml` as `pigeon_slack_workspace_<machine>` and put into the worker only by `packages/worker/scripts/slack-flip.mjs` (never printed; `node packages/worker/scripts/slack-manifest.mjs check-config <file>` checks a staged file's shape). Setup: `docs/runbooks/slack-workspace-setup.md`
 
 ## Auth Boundaries
 
@@ -33,10 +30,9 @@ Use this for secret setup, auth failures, or token rotation.
 - daemon poller authenticates via `Authorization: Bearer $CCR_API_KEY`; the daemon's start script decides whether that variable holds the shared key or the machine key
 - Minting, registering, rotating, revoking and retiring: **`docs/runbooks/per-machine-credentials.md`**. Never print a key; `packages/worker/scripts/machine-key.mjs` writes keys to a 0600 file and prints only the hash.
 - daemon API routes (`http://127.0.0.1:4731`): require `Authorization: Bearer <PIGEON_DAEMON_AUTH_TOKEN>` when `PIGEON_DAEMON_AUTH_TOKEN` is set, EXCEPT `GET /health` which remains anonymous by design
-- Telegram webhook requires `X-Telegram-Bot-Api-Secret-Token`
 - Slack routes (`POST /slack/<machine>/{events,commands,interactivity}`) take no bearer: the v0 `X-Slack-Signature` is checked on the raw body against that machine's `signingSecret` (+-5 min, else 401), then `team_id`/`api_app_id` against the same secret (403), then the sender must be `ownerUserId` (anyone else is dropped with a silent 200). A machine with no valid `SLACK_WORKSPACE_<MACHINE>` secret gets 404. A `slack:<teamId>` chat address needs a machine key (the shared key is refused); another machine's key is honoured for a stored Slack address only with a recent `commands` row for that channel addressed to it
-- `ALLOWED_USER_IDS` (optional): comma-separated Telegram user IDs. If set, only these users can interact with the bot within allowed chats. If unset, all users in allowed chats are permitted. It does not apply to Slack, where the single allowed sender is the workspace secret's `ownerUserId`, and `ALLOWED_CHAT_IDS` does not govern `slack:` addresses either.
-- Daemon `PIGEON_PULL_ALLOWED_USER_IDS` (comma list) is compared with each inbound message's `senderId`, which on Slack is the Slack user id: for a machine on Slack it must contain the owner's Slack user id (`ownerUserId`), or goose-pull banking and topic/channel-bound goose sessions refuse the owner's replies. Empty means nobody for those sessions.
+- The single allowed sender is the workspace secret's `ownerUserId`. The former `ALLOWED_CHAT_IDS` / `ALLOWED_USER_IDS` worker vars were removed with Telegram (any deployed leftovers are inert).
+- Daemon `PIGEON_PULL_ALLOWED_USER_IDS` (comma list) is compared with each inbound message's `senderId`, which on Slack is the Slack user id: it must contain the owner's Slack user id (`ownerUserId`), or goose-pull banking and topic/channel-bound goose sessions refuse the owner's replies. Empty means nobody for those sessions.
 - opencode serve (`http://127.0.0.1:4096`): **no auth** -- localhost-only, single-user machine; password was intentionally removed as marginal security value
 
 ## Calling the Daemon

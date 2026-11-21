@@ -20,7 +20,7 @@ Use this when daemon behavior regresses in production or parity tests.
 
 ```bash
 systemctl status pigeon-daemon.service --no-pager
-journalctl --namespace=pigeon -u pigeon-daemon.service -n 120 --no-pager
+journalctl --namespace=pigeon -u pigeon-daemon.service -n 120 --no-pager   # on devbox: sudo journalctl --namespace=pigeon ...
 curl -s http://127.0.0.1:4731/health
 ```
 
@@ -39,7 +39,7 @@ curl -s http://127.0.0.1:4731/health
 
 ## Question Reply Failures
 
-- **"Unable to connect" on a chat button press / reply (Telegram swipe-reply; Slack thread reply)**
+- **"Unable to connect" on a chat button press / reply (a Slack thread reply)**
   - The plugin's `onQuestionReply` must use the SDK client's in-process fetch, not `globalThis.fetch`. In TUI mode, no HTTP server listens on `ctx.serverUrl` (`localhost:4096`). See `opencode-plugin-architecture` skill for the `internalFetch` pattern.
   - If the plugin was recently changed, ensure `internalFetch` is extracted from `(ctx.client as any)._client?.getConfig?.().fetch`.
 - **"Session expired" on a button press** (Slack: an ephemeral note in the channel)
@@ -58,7 +58,7 @@ curl -s http://127.0.0.1:4731/health
   - opencode serve rejected the session creation. Check the directory exists and opencode-serve logs: `journalctl -u opencode-serve.service -n 50`.
 - **"Failed to kill session: deleteSession failed: ..."**
   - Session may already be terminated, or opencode serve is down. Check opencode-serve logs.
-- **Launch succeeds but no chat notifications from the session (no Slack channel / Telegram topic appears)**
+- **Launch succeeds but no chat notifications from the session (no Slack channel appears)**
   - The pigeon plugin in opencode-serve must detect and register the session. Check that the plugin symlink is intact: `ls -la ~/.config/opencode/plugins/opencode-pigeon.ts`.
   - Check opencode-serve logs for plugin initialization errors.
 - **`/kill` returns "Session not found" from worker**
@@ -68,11 +68,11 @@ curl -s http://127.0.0.1:4731/health
 
 The worker owns the Slack call, so start there, then the daemon:
 
-1. Is the machine really on Slack? `curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_worker_key)" https://ccr-router.jonathan-mohrbacher.workers.dev/whoami` (the MACHINE key: `/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac) must show `"transport":"slack"`. `"credential":"shared"` means you used the wrong key. A machine answer with no `transport` means the worker sees no valid `SLACK_WORKSPACE_<MACHINE>` secret and would post to Telegram (rolled back, or a broken secret). The daemon logs its persisted view at startup: `[chat-transport] persisted transport=...`.
+1. Does the worker know the machine's workspace? `curl -s -H "Authorization: Bearer $(cat /run/secrets/pigeon_worker_key)" https://ccr-router.jonathan-mohrbacher.workers.dev/whoami` (the MACHINE key: `/run/secrets/pigeon_worker_key` on devbox/cloudbox, Keychain `pigeon-worker-key` on the Mac) must show `"transport":"slack"`. `"credential":"shared"` means you used the wrong key. A machine answer with no `transport` means the worker sees no valid `SLACK_WORKSPACE_<MACHINE>` secret (missing or broken), and `/notifications/send` answers `503 no_transport`. The daemon logs `[chat] Slack only (Telegram removed, pigeon-4ogz.13)` at startup (a daemon that logs anything else is an old build) and does not track the transport (`whoami.transport` is informational).
 2. Outbox: the notification is queued, retrying or dropped? Look at the daemon's `outbox` row (`notification_id`, `state`, `attempts`) as in `swarm-operations` "Outbox Querying". A `topic_unavailable` 502 is a deliberate per-session hold (channel creation failed or was rate-limited), not an outage.
-3. The worker's answer carries a top-level `errorClass` on Slack failures: `rate_limited`, `conversation_gone` (channel missing or archived: the worker unarchives, joins or recreates it once), `rejected_format` (Slack refused the blocks: for a plain `sendMessage` the WORKER retries once with no blocks, logging `[worker] slack rejected the blocks, retrying as plain text`, so the daemon never sees it; only if the plain retry also fails does the worker answer 502 with `errorClass: rejected_format`, which the daemon's outbox handles by resending without entities, `delivery-policy.ts` rule 6), `upstream` (a dead token, scope or Slack trouble: retried, never relocated). Read them in `wrangler tail` (see `worker-operations`; worker log lines are prefixed `[worker] slack ...`).
+3. The worker's answer carries a top-level `errorClass` on provider failures: `rate_limited`, `conversation_gone` (channel missing or archived: the worker unarchives, joins or recreates it once), `rejected_format` (Slack refused the blocks: for a plain `sendMessage` the WORKER retries once with no blocks, logging `[worker] slack rejected the blocks, retrying as plain text`, so the daemon never sees it; only if the plain retry also fails does the worker answer 502 with `errorClass: rejected_format`, which the daemon's outbox handles by resending without entities, `delivery-policy.ts` rule 6), `upstream` (a dead token, scope or Slack trouble: retried, never relocated). Read them in `wrangler tail` (see `worker-operations`; worker log lines are prefixed `[worker] slack ...`).
 4. A conversation lives in D1 `topics` (`chat_id = 'slack:<teamId>'`, `message_thread_id` = a handle >= 2^40) and `slack_conversations` (handle to Slack channel id). A channel that was archived by hand or by the nightly orphan-closer is reopened on the next post.
-5. Operational alerts that skip the worker (worker down) go direct to `#alerts` through `PIGEON_SLACK_ALARM_WEBHOOK_URL`; startup logs `[alert] direct paths: telegram=... slack=set|unset|INVALID (ignored)`. No pushes are expected: `SLACK_NOTIFY_OWNER` is unset by default, so nothing mentions the owner and a post only shows as an unread badge.
+5. Operational alerts that skip the worker (worker down) go direct to `#alerts` through `PIGEON_SLACK_ALARM_WEBHOOK_URL`; startup logs `[alert] direct path: slack=set|unset|INVALID (ignored)`. No pushes are expected: `SLACK_NOTIFY_OWNER` is unset by default, so nothing mentions the owner and a post only shows as an unread badge.
 
 ## Nvim Adapter Failures
 

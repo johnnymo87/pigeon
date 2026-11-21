@@ -17,13 +17,13 @@ Use this skill when you need system-level understanding before debugging, deploy
 - D1 operations: `packages/worker/src/d1-ops.ts`
 - D1 schema: `packages/worker/src/d1-schema.sql`
 - Runtime state: D1 database `pigeon-router`
-- Chat transports: Slack (`src/slack.ts` the only door to Slack's API, `src/slack-inbound.ts` ingress, `src/chat/slack-*.ts` config/render/transport/verify) and Telegram (`src/telegram.ts`, `src/webhook.ts`), behind the `ChatTransport` seam in `src/chat/`. Which one a machine uses is decided by the worker: Slack iff a `SLACK_WORKSPACE_<MACHINE>` secret exists for it (`GET /whoami` reports `transport: "slack"`); see AGENTS.md "Which transport a machine is on". All three machines (devbox, cloudbox, macbook) are on Slack since 2026-11-21 (`pigeon-4ogz.11`); the Telegram code remains only as the rollback path (`slack-flip.mjs <machine> off`) until `pigeon-4ogz.13` deletes it.
+- Chat transport: Slack, the only one (Telegram was deleted, `pigeon-4ogz.13`): `src/slack.ts` the only door to Slack's API, `src/slack-inbound.ts` ingress, `src/chat/slack-*.ts` config/render/transport/verify, behind the `ChatTransport` seam in `src/chat/`. A machine can post when a `SLACK_WORKSPACE_<MACHINE>` secret exists for it, else `/notifications/send` answers it `503 no_transport` (`GET /whoami` reports `transport: "slack"`, informational); see AGENTS.md "Which workspace a machine is in". All three machines (devbox, cloudbox, macbook) are on Slack.
 
 ## Core Flow
 
 1. Session registers (`/sessions/register`) with `sessionId -> machineId`
-2. Notification sent (`/notifications/send`) to the chat (Slack; Telegram only after a rollback) and mapped as `chat_id + message_id -> sessionId + token` (on Slack both ids are handles, below)
-3. User replies or types: Slack Events API / slash command / button (`POST /slack/<machine>/{events,commands,interactivity}`), or the Telegram webhook (`/webhook/telegram/...`)
+2. Notification sent (`/notifications/send`) to the chat (Slack) and mapped as `chat_id + message_id -> sessionId + token` (on Slack both ids are handles, below)
+3. User replies or types: Slack Events API / slash command / button (`POST /slack/<machine>/{events,commands,interactivity}`)
 4. Worker resolves session, queues command in D1 `commands` table
 5. Daemon polls `GET /machines/:id/next`, receives command, delivers to plugin
 6. Daemon acks via `POST /commands/:id/ack`, command marked `done`
@@ -36,7 +36,7 @@ If no `cmd:TOKEN:action` pattern is found in the `replyMarkup` (e.g. plain text 
 
 ## R2 Media Bucket
 
-The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional media relay between the chat (Slack or Telegram) and OpenCode sessions.
+The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional media relay between the chat and OpenCode sessions.
 
 - Binding: `env.MEDIA` (configured in `wrangler.toml`)
 - Key format: `{direction}/{timestamp}-{id}/{filename}` where direction is `inbound` or `outbound`
@@ -48,40 +48,31 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `POST /media/upload` (Bearer) -- multipart form with `key`, `mime`, `filename`, `file` fields. Returns `{ ok, key }`.
 - `GET /media/<key>` (Bearer) -- returns raw binary with `Content-Type` and `Content-Disposition` from R2 metadata.
 
-### Inbound Flow (Telegram -> R2)
+### Inbound Flow (Slack -> R2)
 
-This is the Telegram path. On Slack, `slack-inbound.ts` takes up to 10 `files[]` of a message, downloads each `url_private_download` from `files.slack.com` with the bot token (20 MB each, no redirects) in `ctx.waitUntil` after the ack, stores it in R2 under the same key shape and queues one command per file; a failure is posted in the channel.
+`slack-inbound.ts` takes up to 10 `files[]` of a message, downloads each `url_private_download` from `files.slack.com` with the bot token (20 MB each, no redirects) in `ctx.waitUntil` after the ack, stores it in R2 as `inbound/<ts>-<id>/<filename>` and queues one command per file; a failure is posted in the channel. A photo with either dimension above `MAX_IMAGE_DIMENSION` (1568px) is replaced by the largest Slack thumbnail within it, and skipped if none fits (the text command still goes through); this avoids Anthropic's 2000px multi-image limit and the latency penalty for larger images (`pickSlackFile`). A `MediaRef { key, mime, filename, size }` is serialized as `media_json` in the `commands` row, and the poll response includes `media: { key, mime, filename, size }` in the command payload. See `docs/plans/2026-03-08-inbound-image-sizing-design.md` for the original sizing reasoning (written for Telegram's photo variants).
 
-1. `extractMedia()` in `webhook.ts` detects photo/document/audio/video/voice on incoming messages.
-2. For photos: picks the largest Telegram variant where both dimensions are <= `MAX_IMAGE_DIMENSION` (1568px). If no variant fits, the media is skipped entirely (text command still goes through). This avoids Anthropic's 2000px multi-image limit and the latency penalty for images above 1568px.
-3. `relayMediaToR2()` calls Telegram `getFile` API, downloads the binary, stores in R2 with key `inbound/<ts>-<fileUniqueId>/<filename>`.
-4. A `MediaRef { key, mime, filename, size }` is serialized as `media_json` in the `commands` row.
-5. Poll response includes `media: { key, mime, filename, size }` in the command payload.
-
-**Image sizing trade-offs:** We rely on Telegram's pre-generated photo variants (~90px, ~320px, ~800px, ~1280px) rather than resizing ourselves. The ~1280px variant is typically selected, which is high quality for most use cases. If finer control is ever needed, daemon-side resizing with `sharp` (after R2 fetch) or worker-side WASM resizing can be layered on. See `docs/plans/2026-03-08-inbound-image-sizing-design.md`.
-
-### Outbound Flow (R2 -> Telegram, or Slack)
+### Outbound Flow (R2 -> Slack)
 
 1. Daemon uploads media via `POST /media/upload` with key `outbound/<ts>-<uuid>/<filename>`.
 2. `POST /notifications/send` accepts an optional `media: Array<{ key, mime, filename }>` field.
-3. Worker fetches each key from R2, sends as `sendPhoto` (images) or `sendDocument` (other types), each as a reply to the text notification message.
-4. Media messages are stored in the `messages` table for reply routing. On Slack the files are uploaded (`files.getUploadURLExternal` / `files.completeUploadExternal`) into the text post's thread instead.
+3. Worker fetches each key from R2 and uploads it (`files.getUploadURLExternal` / `files.completeUploadExternal`) into the text post's thread (the transport's `sendPhoto` for images, `sendDocument` for other types).
+4. Media posts are stored in the `messages` table for reply routing.
 
 ## D1 Tables
 
 - `commands`: command delivery queue with lease-based polling (pending/leased/done lifecycle)
 - `sessions`: session-to-machine registry
-- `messages`: Telegram message mapping for reply routing. Includes `notification_id TEXT` (nullable, unique index where not null) for idempotent notification delivery -- if a `notificationId` is provided on `/notifications/send` and already exists in this table, the request is deduplicated without calling Telegram again.
-- `seen_updates`: Telegram update deduplication
+- `messages`: chat message mapping for reply routing (`chat_id + message_id -> session + token`). Includes `notification_id TEXT` (nullable, unique index where not null) for idempotent notification delivery -- if a `notificationId` is provided on `/notifications/send` and already exists in this table, the request is deduplicated without calling the provider again.
 - `machines`: daemon last-poll-at tracking for online detection
 - `machine_credentials`: hashed per-machine keys (pigeon-k0qn.8)
 - `swarm_relay`: cross-machine swarm relay items, message and failure (pigeon-k0qn.5)
 - `machine_relay_accept`: which senders each machine accepts relays from, from its poll header
 - `remote_launch`: cross-machine remote launch items and result receipts (pigeon-k0qn.17)
 - `machine_launch_accept`: which machines a target accepts remote launches from, from its poll header
-- `slack_conversations`, `slack_posts`: Slack handles (>= 2^40) to channel / channel + ts, per team (pigeon-4ogz.3). `slack_posts` rows live 30 days (swept hourly). Apply the schema before creating any `SLACK_WORKSPACE_<MACHINE>` secret; with no secret none of the Slack behaviour below exists.
+- `slack_conversations`, `slack_posts`: Slack handles (>= 2^40) to channel / channel + ts, per team (pigeon-4ogz.3). `slack_posts` rows live 30 days (swept hourly). Apply the schema before creating any `SLACK_WORKSPACE_<MACHINE>` secret.
 - `slack_seen_events`: Slack `event_id` dedup for the Events API (pigeon-4ogz.4), 48 h, swept by the Slack-gated cron. Inserted in one `db.batch` with the command, so a retried event is a 200 duplicate.
-- Slack rows also live in the shared tables (`topics`, `named_topics`, `named_topic_bindings`, `messages`, `commands`) under `chat_id = 'slack:<teamId>'`; the integer `message_thread_id` / `message_id` columns hold handles that `slack_conversations` / `slack_posts` map to Slack ids. So a "topic" on a Slack machine is a channel, and General is that workspace's `#alerts` (a `named_topics` row with the reserved key `_alerts`).
+- Slack rows also live in the shared tables (`topics`, `named_topics`, `named_topic_bindings`, `messages`, `commands`) under `chat_id = 'slack:<teamId>'`; the integer `message_thread_id` / `message_id` columns hold handles that `slack_conversations` / `slack_posts` map to Slack ids. So a "topic" is a channel, and the unthreaded target is that workspace's `#alerts` (a `named_topics` row with the reserved key `_alerts`).
 
 ## Endpoint Contracts
 
@@ -95,20 +86,19 @@ This is the Telegram path. On Slack, `slack-inbound.ts` takes up to 10 `files[]`
 - `POST /sessions/unregister` (Bearer) -> remove session
 - `POST /topics/lookup` (Bearer) `{sessionIds: string[]}` (0-50) -> `{topics: {[sessionId]: {chatId, messageThreadId, state, url?} | null}}` (`url` only on Slack rows: the channel's archive link, `null` if unbuildable). Read-only view of the `topics` table; `null` = no topic (topics are created lazily). Used by the daemon's `/alert` link buttons.
 - `POST /topics/rename` on a Slack row renames the channel and its topic line (the edit carries the row's session id); `POST /topics/named*` on Slack creates channels (`channelKey` becomes the name) and refuses `_`-prefixed keys.
-- `POST /topics/named` (Bearer) `{chatId, key, name, staleThreadId?}` -> `{chatId, messageThreadId, created}`. Find-or-create a caller-keyed forum topic (D1 `named_topics`, exempt from the orphan-closer and reaper). `staleThreadId` reports a thread deleted out of band and gets a new topic. Every non-200 means "post to General" to the daemon.
+- `POST /topics/named` (Bearer) `{chatId, key, name, staleThreadId?}` -> `{chatId, messageThreadId, created}`. Find-or-create a caller-keyed channel (D1 `named_topics`, exempt from the orphan-closer and reaper). `staleThreadId` reports a thread deleted out of band and gets a new topic. Every non-200 means "post to `#alerts`" to the daemon.
 - `POST /topics/named/bind` (Bearer) `{chatId, key, name, sessionId}` -> `{chatId, messageThreadId, created, bound: true, sessionId}`; `409 session not registered` when `sessions` has no row. Plain messages typed in the bound topic route to that session (D1 `named_topic_bindings`; slash commands do not follow bindings).
 - `POST /topics/named/unbind` (Bearer) `{sessionId}` -> `{unbound: n}` (0 is success).
-- `POST /notifications/send` (Bearer) -> send Telegram message (a machine on Slack goes to its own `slack:<team>` whatever `chatId` it sent: one channel per session, `#alerts` unthreaded; optional `notifyOwner` (flags the post; the owner mention is applied only when its category, `questions` for a `q:` notificationId else `errors`, is listed in the `SLACK_NOTIFY_OWNER` var, default none; named channels and `#alerts` follow the `named`/`alerts` categories; never a broadcast); `rich.dialect: "slack"` for a markdown block; Slack failures add top-level `errorClass`) + store mapping; optional `media[]` sends photos/documents as replies; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling Telegram)
-- `POST /notifications/edit` (Bearer) -> edit an existing Telegram message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions. A Slack row is editable only by a machine of that team (403 otherwise); with the team's secret deleted it is a transient failure with no Slack call.
-- `GET /whoami` adds `transport: "slack"` for a machine on Slack (absent = Telegram). `POST /messages/send` and `/topics/unpin` route by the stored address; `/messages/send` returns `chatId` on Slack.
+- `POST /notifications/send` (Bearer) -> send a chat message (a machine goes to its own `slack:<team>` whatever `chatId` it sent, which is optional: one channel per session, `#alerts` unthreaded; a machine with no workspace gets `503 no_transport`; optional `notifyOwner` (flags the post; the owner mention is applied only when its category, `questions` for a `q:` notificationId else `errors`, is listed in the `SLACK_NOTIFY_OWNER` var, default none; named channels and `#alerts` follow the `named`/`alerts` categories; never a broadcast); `rich.dialect: "slack"` for a markdown block; every provider failure adds top-level `errorClass`) + store mapping; optional `media[]` uploads files into the post's thread; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling the provider)
+- `POST /notifications/edit` (Bearer) -> edit an existing chat message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions. A Slack row is editable only by a machine of that team (403 otherwise); with the team's secret deleted it is a transient failure with no Slack call.
+- `GET /whoami` adds `transport: "slack"` for a machine with a workspace (informational). `POST /messages/send` routes by the stored address and returns `chatId`; `POST /topics/unpin` is a constant `200 {ok:true}`, kept only for old daemons.
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
 - `GET /media/<key>` (Bearer) -> download file from R2
-- `POST /webhook/telegram/{path}` (`X-Telegram-Bot-Api-Secret-Token`) -> process replies/callbacks
 - `POST /slack/<machine>/events`, `/commands`, `/interactivity` (no bearer: Slack's v0 `X-Slack-Signature`, checked against that machine's `signingSecret` on the raw body, +-5 min, else 401; then `team_id`/`api_app_id` (403; skipped for `url_verification`), then the owner: anyone but `ownerUserId` gets a silent 200). A machine with no `SLACK_WORKSPACE_<MACHINE>` secret gets the router's ordinary 404. Events: only `message` with no subtype, `file_share` or `thread_broadcast`, no `bot_id`; session resolution is thread parent (`slack_posts` -> `messages`) -> the channel's `topics` row -> a bound named channel; an unbound named channel (incl. `#alerts`) gets a rate-limited hint. `src/slack-inbound.ts`.
 
 ## Chat Commands
 
-Where a command is typed: on Telegram, as a reply to a session notification or in the session's topic; on Slack, in the session's channel (or anywhere, with an explicit session id). Slack app slash commands do not work inside a thread. `/rename` is a Slack built-in, so on Slack it is `/retitle` (`SLACK_APP_COMMANDS` in `slack-inbound.ts`); the parsers are shared (`src/chat/commands.ts`). `/kill /interrupt /compact /mcp /model` take an optional session id (full id, or a unique prefix of at least 8 characters after `ses_`/`gse_`; ambiguous is refused with the candidates), which is how they work from `#alerts`. Where this section says "reply to a notification", on Slack read "typed in the session's channel".
+Where a command is typed: in the session's Slack channel (or anywhere, with an explicit session id). Slack app slash commands do not work inside a thread. `/rename` is a Slack built-in, so it is `/retitle` (`SLACK_APP_COMMANDS` in `slack-inbound.ts`); the parsers are shared (`src/chat/commands.ts`). `/kill /interrupt /compact /mcp /model` take an optional session id (full id, or a unique prefix of at least 8 characters after `ses_`/`gse_`; ambiguous is refused with the candidates), which is how they work from `#alerts`. Where this section says "reply to a notification", read "typed in the session's channel".
 
 ### `/launch <machine> <directory> [--tag <tag>] <prompt>`
 
@@ -140,7 +130,7 @@ Terminates a running OpenCode session.
 
 Summarizes a session's conversation to reduce context.
 
-1. User replies `/compact` to any session notification in Telegram (on Slack: types it in the session's channel, or `/compact <session-id>`).
+1. User types `/compact` in the session's channel, or `/compact <session-id>`.
 2. Worker resolves the session from the replied-to message via `messages` table lookup.
 3. Queues a `"compact"` type command in D1.
 4. Daemon's `compact-ingest.ts` fetches session messages, finds the last user message's model, and calls `OpencodeClient.summarize()`.
@@ -167,7 +157,7 @@ The override is applied on subsequent command deliveries -- `command-ingest.ts` 
 ### `/tag [args]`
 
 Tags opencode sessions for the `oc-tags` list-price chart. Parsing lives in `tag-command.ts`
-(`parseTagArgs`), which is a pure module so the grammar is testable without the webhook.
+(`parseTagArgs`), which is a pure module so the grammar is testable without the ingress.
 
 - `/tag` (or `/tag top`, the oc-tags CLI's own name for it) -> `tag_top`: the untagged
   backlog, ranked by dollars.
@@ -204,7 +194,7 @@ answer the user actually chose.
 
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set"` (in `webhook.ts`)
+`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set"` (the `commands.command_type` values; the session ones are `SessionCommandType` in `src/chat/commands.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt
@@ -245,7 +235,6 @@ Cross-machine remote session launching (`docs/plans/2026-10-29-remote-launch-des
 - Handler: `scheduled()` in `index.ts` calls:
   - `cleanupExpiredMedia(env)` -- deletes R2 objects older than 24 hours
   - `cleanupCommands(env.DB)` -- deletes old acked and stuck commands from D1
-  - `cleanupSeenUpdates(env.DB)` -- deletes old Telegram dedup entries from D1
   - `runRelayExpiry(env.DB)` -- expires uncollected relays and prunes past retention
   - `runLaunchExpiry(env.DB)` -- expires overdue remote launches and prunes past retention
   - `sweepSlackPosts(env.DB)` and `sweepSlackSeenEvents(env.DB)` -- delete `slack_posts` older than 30 days (5000 per tick, never the `_seed` row) and `slack_seen_events` older than 48 h; run only when some `SLACK_WORKSPACE_*` secret exists, best-effort

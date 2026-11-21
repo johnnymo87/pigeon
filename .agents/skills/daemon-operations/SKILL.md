@@ -95,7 +95,7 @@ systemctl status opencode-serve.service --no-pager
 ## Automated Sessions Suddenly Spamming the Chat
 
 Symptom: lgtm (or other automated) PR-review sessions start posting `Stop` notifications into
-the chat again (new Slack channels, or Telegram topics, per session).
+the chat again (new Slack channels per session).
 
 **There is no feature flag to flip.** The legacy quiet-title regex was deleted in `pigeon-ycjg`
 (2026-08-20) after a 9-day soak, and `PIGEON_QUIET_TITLE_LAYER=on` is now a silent no-op — the code
@@ -124,11 +124,11 @@ per-machine redeploy (`git pull`, `npm install`, restart) — not an environment
 
 ## Media Relay Diagnostics
 
-If media isn't arriving in the chat (Slack or Telegram) or OpenCode:
+If media isn't arriving in the chat or OpenCode:
 
 1. **Check worker R2 bucket exists**: `npx wrangler r2 bucket list` should show `pigeon-media`.
 2. **Check worker deploy has MEDIA binding**: deploy output should show `env.MEDIA (pigeon-media)`.
-3. **Inbound (Telegram/Slack→OpenCode)**: daemon logs will show media fetch errors if the worker URL or API key is wrong.
+3. **Inbound (Slack→OpenCode)**: daemon logs will show media fetch errors if the worker URL or API key is wrong.
 4. **Outbound (OpenCode→chat)**: daemon uploads silently skip failures — check worker `/media/upload` auth if media never appears in the chat. On Slack the file is uploaded into the text post's thread.
 5. **Cron cleanup**: if media disappears before delivery, check that the 24h TTL in `cleanupExpiredMedia` is sufficient.
 
