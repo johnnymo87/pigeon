@@ -92,9 +92,3 @@ The worker owns the Slack call, so start there, then the daemon:
 
 ## Verify
 
-Use parity harness for full-path validation:
-
-```bash
-cd ~/projects/pigeon
-npm run --workspace @pigeon/daemon parity:harness
-```

@@ -77,22 +77,7 @@ To verify end-to-end media in notifications, attach an image to a message in a s
 2. Queue the command (with media) in D1 for the daemon's poll
 3. Daemon fetches from R2, converts to data URI, delivers to the plugin
 
-## Plugin-Direct Variant
-
-For OpenCode sessions using the direct command channel (`backend_kind: "opencode-plugin-direct"`),
-use the daemon parity harness with `PARITY_MODE=direct`:
-
-```bash
-cd ~/projects/pigeon/packages/daemon
-PARITY_MODE=direct npm run parity:harness
-```
-
-This variant:
-- Spins up a `startDirectChannelServer`
-- Registers the session with `backend_kind`, `backend_protocol_version`, `backend_endpoint`, `backend_auth_token`
-- Verifies that reply commands are delivered directly to the plugin server's `onExecute` callback
-
-### Manual Plugin-Direct Registration
+## Manual Plugin-Direct Registration
 
 To register a plugin-direct session manually via curl:
 
@@ -113,4 +98,3 @@ curl -s -X POST -H "Authorization: Bearer $(cat /run/secrets/pigeon_daemon_auth_
 ## Verify
 
 Run the Slack Machine steps and confirm each.
-For plugin-direct, also run `PARITY_MODE=direct npm run parity:harness` and confirm it passes.

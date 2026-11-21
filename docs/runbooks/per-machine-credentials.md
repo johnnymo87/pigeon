@@ -99,7 +99,7 @@ changed for the daemon yet.
   The key only appears in that command's argv, briefly. Do not run it with `set -x`.
 
 Then change **only the daemon start script** to prefer the machine key, keeping an instant
-rollback switch that needs no rebuild. On the Linux hosts:
+rollback switch that needs no rebuild (dead now: see "Rollback" below). On the Linux hosts:
 
 ```sh
 if [ -s /run/secrets/pigeon_worker_key ] && [ ! -e "$HOME/.config/pigeon/use-shared-worker-key" ]; then
@@ -139,7 +139,12 @@ Expect `[worker-identity] credential=machine machine=<m>` and no `Poll failed: 4
 Then send a Slack message to a session on that machine and confirm it arrives. Only then
 move on to the next machine.
 
-## Rollback (one machine)
+## Rollback (one machine): DEAD since Telegram's deletion
+
+**Do not use this.** Every machine is in `SHARED_KEY_REFUSED_MACHINES`, and since pigeon-4ogz.13
+the shared key cannot post anywhere either (`/notifications/send` answers 403, which the outbox
+retries silently). A refused or broken machine key is recovered by minting and registering a new
+one (above). The steps are kept only as a record of what the marker file does:
 
 1. `mkdir -p ~/.config/pigeon && touch ~/.config/pigeon/use-shared-worker-key`
 2. Restart the daemon (as above) and check for `[worker-identity] credential=shared`.
@@ -152,8 +157,8 @@ stays retired. Confirm the deployed value (Cloudflare dashboard, or `npx wrangle
 on the new version) before restarting the daemon on the shared key.
 
 **Worker rollback.** Rolling the worker back to a version before per-machine keys makes every
-machine key fail with 401 everywhere. Before such a rollback, put every machine-keyed daemon
-on the shared key with the marker file above.
+machine key fail with 401 everywhere, and the shared key no longer posts anywhere: do not roll
+the worker back past per-machine keys.
 
 ## Revoking or rotating a machine key
 

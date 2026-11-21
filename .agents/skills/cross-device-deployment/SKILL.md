@@ -109,6 +109,10 @@ The script runs these; they are listed for the manual path.
 > daemon that mints its own, and it revokes the flag. No pool restart is required after a
 > rollback, but a restart is still the fastest way to a known state.
 
+> **Version floor (pigeon-4ogz.13):** never roll a daemon back below `7f4554f` (PR #246) once
+> its host no longer exports `TELEGRAM_CHAT_ID` (workstation #891). Older daemons build no outbox
+> and no alert notifier without it, so every notification is queued and silently never sent.
+
 ### Restart opencode-serve (only when you actually need it — see below)
 
 > **⚠️ `opencode-serve.service` no longer exists on devbox or cloudbox.** Both now run a

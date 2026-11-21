@@ -43,7 +43,7 @@ export function isPlaceholderTitle(title: string | null | undefined): boolean {
  * True when a stored topic NAME was built from the placeholder title — i.e. it looks like
  * `New session - <ISO> · ~/path`.
  *
- * Only rows marked provisional by the one-off backfill (see the forum-migration runbook) can look
+ * Only rows marked provisional by the one-off backfill (Telegram-era, long done) can look
  * like this; a name minted by current code never can, because the placeholder is stripped before
  * `topicName` sees it. It matters because the upgrade path may reuse a provisional name AS the
  * directory when a notification carries no dir, and that reuse is only sound for a name that
