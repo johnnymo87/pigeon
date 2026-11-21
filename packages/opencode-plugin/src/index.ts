@@ -4,7 +4,7 @@ import {
   ResultErrorCode,
   type ExecuteCommandEnvelope,
 } from "../../daemon/src/opencode-direct/contracts"
-import { registerSession, notifyQuestionAnswered, sendQuestionAsked, sendStop, postMirror } from "./daemon-client"
+import { registerSession, notifyQuestionAnswered, sendQuestionAsked, sendStop, postMirror, reportSessionDeleted } from "./daemon-client"
 import { QuestionDeliveryQueue } from "./question-queue"
 import { StopDeliveryQueue, StopKeyMinter } from "./stop-queue"
 import { detectEnvironment, type EnvironmentInfo } from "./env-detect"
@@ -343,6 +343,14 @@ const plugin: Plugin = async (ctx) => {
       const outcome = await sendStop({ ...entry, daemonUrl, log })
       if (outcome !== "unregistered") return outcome
 
+      // The daemon forgot this session because opencode deleted it and the daemon tore it down
+      // (pigeon-4ogz.21). Re-registering would reopen its topic or channel for a stop about a
+      // session that no longer exists, so the stop is dropped.
+      if (sessionManager.isDeleted(entry.sessionId)) {
+        log("dropping a stop for a deleted session", { sessionId: entry.sessionId })
+        return "terminal"
+      }
+
       log("stop delivery hit an unknown session; re-registering", {
         sessionId: entry.sessionId,
       })
@@ -362,6 +370,9 @@ const plugin: Plugin = async (ctx) => {
     // register the session when we first see its ID in any event.
     const lateDiscoverSession = async (sessionID: string) => {
       if (sessionManager.isKnown(sessionID)) return
+      // A deleted session is never rediscovered: its daemon row was torn down on delete, and
+      // re-registering it would reopen the topic or channel that closed (pigeon-4ogz.21).
+      if (sessionManager.isDeleted(sessionID)) return
 
       let promise = sessionManager.getDiscoveryPromise(sessionID)
       if (promise) {
@@ -379,6 +390,9 @@ const plugin: Plugin = async (ctx) => {
           const parentID = session.data?.parentID
           const title = session.data?.title
 
+          // Deleted while `session.get` was in flight.
+          if (sessionManager.isDeleted(sessionID)) return
+
           sessionManager.onSessionCreated(sessionID, parentID, title)
 
           if (!parentID) {
@@ -392,6 +406,7 @@ const plugin: Plugin = async (ctx) => {
           // can only resolve this ONE way: if the session is really a subagent it is
           // demoted, while a genuine main session stays unconfirmed and never mirrors
           // again (`pigeon-nwrt`). See `pigeon-kq6h`.
+          if (sessionManager.isDeleted(sessionID)) return
           log("session.get failed, registering with unknown parentage", serializeError(err))
           sessionManager.onSessionCreated(sessionID, undefined, undefined, "unknown")
           doRegisterSession(sessionID, envInfo)
@@ -633,13 +648,26 @@ const plugin: Plugin = async (ctx) => {
         }
 
         if (eventType === "session.deleted") {
-          const sessionInfo = props?.info as { id?: string } | undefined
+          const sessionInfo = props?.info as { id?: string; parentID?: string } | undefined
           const sessionID = sessionInfo?.id
 
           if (sessionID) {
-            sessionManager.onDeleted(sessionID)
+            // Judged before markDeleted wipes what this plugin knew. A session this plugin never
+            // saw (deleted through another serve) is reported too: the daemon ignores an id it
+            // has no opencode row for, so a subagent costs one no-op request at most.
+            const subagent =
+              Boolean(sessionInfo?.parentID) ||
+              (sessionManager.isKnown(sessionID) && !sessionManager.isMainSession(sessionID))
+
+            sessionManager.markDeleted(sessionID)
             messageTail.clear(sessionID)
             tokenTracker.clear(sessionID)
+
+            // Not awaited: the daemon's answer waits on the worker (bounded at 15s), and this
+            // handler must not stall the event stream behind it (pigeon-4ogz.21).
+            if (!subagent) {
+              reportSessionDeleted({ sessionId: sessionID, daemonUrl, log }).catch(() => {})
+            }
           }
 
           return

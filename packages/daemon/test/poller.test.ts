@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type TagMessage } from "../src/worker/poller";
+import { Poller, UNREGISTER_TIMEOUT_MS, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type TagMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -1531,6 +1531,32 @@ describe("Poller: unregisterSession immediate flag (pigeon-xehy)", () => {
     await poller.unregisterSession("sess-kill", { immediate: true });
 
     expect(bodies[0]).toEqual({ sessionId: "sess-kill", immediate: true });
+  });
+});
+
+describe("Poller: unregisterSession timeout (pigeon-4ogz.21)", () => {
+  it("defaults to a bounded wait", () => {
+    expect(UNREGISTER_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(UNREGISTER_TIMEOUT_MS).toBeLessThanOrEqual(20_000);
+  });
+
+  it("gives up on a hung worker call and reports a transport error instead of hanging", async () => {
+    let seenSignal: AbortSignal | undefined;
+    const fetchFn = vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      seenSignal = init.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      });
+    });
+    const poller = new Poller(BASE_CONFIG, makeCallbacks(), {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      unregisterTimeoutMs: 20,
+    });
+
+    const result = await poller.unregisterSession("sess-hung", { immediate: true });
+
+    expect(seenSignal).toBeDefined();
+    expect(result).toMatchObject({ ok: false, kind: "transport_error" });
   });
 });
 

@@ -218,6 +218,47 @@ export async function registerSession(opts: RegisterSessionOpts): Promise<Daemon
   }
 }
 
+type ReportSessionDeletedOpts = {
+  sessionId: string
+  daemonUrl?: string
+  log: LogFn
+}
+
+/**
+ * Tell the daemon opencode deleted a session (`POST /session-deleted`, pigeon-4ogz.21), so it
+ * closes the session's topic or Slack channel now rather than after the 7-day reaper. The daemon
+ * decides whether to act (only an opencode row, not pinned, not mid-/kill).
+ *
+ * Best-effort and outside the breaker in both directions. Deletes are human-paced, so a down
+ * daemon costs one failed fetch per delete; and the daemon awaits the worker's unregister (bounded
+ * at 15s) before answering, so a slow answer here says nothing about whether the daemon is
+ * reachable and must not open the breaker for every other session. An old daemon answers 404,
+ * which is the old behaviour: the reaper collects the row.
+ */
+export async function reportSessionDeleted(opts: ReportSessionDeletedOpts): Promise<boolean> {
+  const url = getDaemonUrl(opts.daemonUrl)
+  try {
+    const res = await fetchDaemon(`${url}/session-deleted`, {
+      method: "POST",
+      body: JSON.stringify({ session_id: opts.sessionId }),
+      signal: AbortSignal.timeout(20_000),
+    })
+    if (!res.ok) {
+      opts.log("session-deleted report refused", { sessionId: opts.sessionId, status: res.status })
+      return false
+    }
+    const data = (await res.json().catch(() => null)) as { outcome?: string } | null
+    opts.log("session-deleted reported", { sessionId: opts.sessionId, outcome: data?.outcome })
+    return true
+  } catch (err) {
+    opts.log("session-deleted report failed", {
+      sessionId: opts.sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    })
+    return false
+  }
+}
+
 /**
  * Outcome of one stop delivery attempt.
  *

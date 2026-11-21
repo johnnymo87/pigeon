@@ -1,4 +1,5 @@
 import { describeWorkerIdentity, formatPollAuthAlert } from "./worker/worker-identity";
+import { SessionGone } from "./session-gone";
 import { createApp } from "./app";
 import type { SessionRecord } from "./storage/types";
 import { loadConfig } from "./config";
@@ -409,6 +410,18 @@ async function onSessionDeleted(sessionId: string): Promise<void> {
     await poller.unregisterSession(sessionId, { immediate: true });
   }
 }
+
+/**
+ * A session deleted in its backend (the opencode TUI) gets the same teardown as an explicit
+ * delete, unless a /kill for it is in flight, which owns the teardown (pigeon-4ogz.21).
+ */
+const sessionGone = new SessionGone({
+  getSession: (sessionId) => storage.sessions.get(sessionId),
+  teardown: async (sessionId) => {
+    storage.sessions.delete(sessionId);
+    await onSessionDeleted(sessionId);
+  },
+});
 
 /**
  * The worker's session-free send route (chat-transport phase 1, pigeon-lenr). Used for
@@ -823,7 +836,9 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             console.warn(`[index] onKill: session ${msg.sessionId} not routable (no opencodeClient/healthy serve)`);
             return;
           }
-          await ingestKillCommand({
+          // Holding the kill guard makes the plugin's session.deleted report (fired by this kill's
+          // own delete) wait, so the reply lands before the channel is archived (pigeon-4ogz.21).
+          await sessionGone.runKill(msg.sessionId, () => ingestKillCommand({
             commandId: msg.commandId,
             sessionId: msg.sessionId,
             chatId: msg.chatId,
@@ -837,7 +852,7 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
               storage.sessions.delete(sessionId);
               await onSessionDeleted(sessionId);
             },
-          });
+          }));
         },
         onInterrupt: async (msg) => {
           if (await handleGooseControl("interrupt", msg)) return;
@@ -1440,6 +1455,7 @@ const app = createApp(storage, {
     }
   },
   onSessionDelete: onSessionDeleted,
+  onBackendSessionDeleted: (sessionId) => sessionGone.backendDeleted(sessionId),
 });
 appHandler = app;
 resolveAppReady?.(app);
