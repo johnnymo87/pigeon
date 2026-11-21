@@ -38,7 +38,7 @@ sudo nixos-rebuild switch --flake .#devbox
 
 1. revert workstation service config to known-good commit (never past workstation #891 for the
    pigeon secrets: the `telegram_*` sops keys are deleted, and re-declaring them fails
-   activation; and never run a daemon older than pigeon `7f4554f` without `TELEGRAM_CHAT_ID`)
+   activation; and never run a daemon older than pigeon `5016db9` (#250) against the current worker, see `cross-device-deployment`)
 2. `sudo nixos-rebuild switch --flake .#devbox`
 3. verify health/routes
 4. document incident + regression cause

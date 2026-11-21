@@ -359,7 +359,7 @@ describe("POST /topics/rename", () => {
     expect(topic?.name_provisional).toBe(0);
   });
 
-  it("returns 502 telegram_failed and leaves D1 untouched when the provider fails", async () => {
+  it("returns 502 provider_failed and leaves D1 untouched when the provider fails", async () => {
     const sessionId = "ses_tg_fail";
     const { handle } = await slackThread();
     await seedSession(sessionId, MACHINE_A);
@@ -380,7 +380,7 @@ describe("POST /topics/rename", () => {
 
     expect(res.status).toBe(502);
     const body = await res.json() as Record<string, unknown>;
-    expect(body.error).toBe("telegram_failed");
+    expect(body.error).toBe("provider_failed");
     expect(body.detail).toBeDefined();
 
     // D1 topic untouched

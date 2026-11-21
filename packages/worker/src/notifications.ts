@@ -728,7 +728,7 @@ export async function handleSendNotification(
 
     if (!chatResult.ok) {
       const details = failureDetails(chatResult);
-      return json({ error: "Telegram API error", details, ...slackClass(details) }, 502);
+      return json({ error: "provider_error", details, ...slackClass(details) }, 502);
     }
 
     const messageId = chatResult.result.message_id;
@@ -925,7 +925,7 @@ export async function handleEditNotification(
     const details = failureDetails(chatResult);
     return json(
       {
-        error: "Telegram API error",
+        error: "provider_error",
         details,
         errorClass: errorClassOf(details) ?? "upstream",
       },

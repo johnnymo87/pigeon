@@ -16,7 +16,7 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import { sha256Hex } from "../src/credentials";
 import { SLACK_HANDLE_MIN, slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
 import { handleEditNotification, handleSendNotification } from "../src/notifications";
-import { handleSendMessage, handleUnpinTopic } from "../src/messages";
+import { handleSendMessage } from "../src/messages";
 import { handleNamedTopic, handleNamedTopicBind } from "../src/named-topics";
 import { resolveTopic } from "../src/topic-manager";
 import { finalize, getBySession, reserve } from "../src/topics";
@@ -648,7 +648,7 @@ describe("errorClass on Slack failures", () => {
   });
 });
 
-// ─── /messages/send and /topics/unpin ──────────────────────────────────────
+// ─── /messages/send ──────────────────────────────────────
 
 describe("/messages/send authorization", () => {
   const send = (e: Env, key: string, body: Record<string, unknown>) =>
@@ -734,30 +734,17 @@ describe("/messages/send authorization", () => {
     expect(res.status).toBe(403);
   });
 
-  it("a numeric chatId with no thread from a Slack machine posts to its #alerts", async () => {
-    const m = await mkMachine({ slack: true });
-    const alerts = await seedAlerts(m.ws!);
-    slack("chat.postMessage", posted(alerts));
-    const res = await send(envFor([m]), m.key, { chatId: "123456" });
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { chatId: string }).chatId).toBe(slackChatId(m.ws!));
-    expect(slackOf("chat.postMessage")[0]?.params.get("channel")).toBe(alerts);
-  });
-
-  it("a numeric chatId with a Slack handle (>= 2^40) goes to that conversation in its own workspace", async () => {
+  // pigeon-4ogz.25: the numeric-chatId mapping is gone. Every daemon >= 7f4554f omits chatId or
+  // echoes a command's `slack:` one, so a numeric address from a Slack machine is refused like
+  // any other unknown address, with no provider call.
+  it("a numeric chatId from a Slack machine is 403, with or without a thread, and no provider call", async () => {
     const m = await mkMachine({ slack: true });
     const handle = await seedChannel(m.ws!.teamId, "CHANDLE1");
-    slack("chat.postMessage", posted("CHANDLE1"));
-    const res = await send(envFor([m]), m.key, { chatId: ALLOWED, messageThreadId: handle });
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { chatId: string }).chatId).toBe(slackChatId(m.ws!));
-  });
-
-  it("a numeric chatId with a Telegram-era thread (< 2^40) is 403, with no provider call", async () => {
-    const m = await mkMachine({ slack: true });
-    const res = await send(envFor([m]), m.key, { chatId: ALLOWED, messageThreadId: 55 });
-    expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: "chat_not_allowed" });
+    for (const body of [{ chatId: "123456" }, { chatId: ALLOWED, messageThreadId: handle }, { chatId: ALLOWED, messageThreadId: 55 }]) {
+      const res = await send(envFor([m]), m.key, body);
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: "chat_not_allowed" });
+    }
     expect(slackCalls).toHaveLength(0);
   });
 
@@ -806,58 +793,29 @@ describe("/messages/send authorization", () => {
     const chat = slackChatId(m.ws!);
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    // unknown handle -> thread_not_found -> 200 {ok:false, telegram:{status:400}}
+    // unknown handle -> thread_not_found -> 200 {ok:false, provider:{status:400}}
     const unknown = await send(e, m.key, { chatId: chat, messageThreadId: handle + 100000 });
     expect(unknown.status).toBe(200);
-    expect(await unknown.json()).toMatchObject({ ok: false, telegram: { status: 400 }, errorClass: "conversation_gone" });
+    expect(await unknown.json()).toMatchObject({ ok: false, provider: { status: 400 }, errorClass: "conversation_gone" });
 
     // rate limited -> 200 status 429
     slack("chat.postMessage", { ok: false, error: "ratelimited" }, 429, { "retry-after": "3" });
     const limited = await send(e, m.key, { chatId: chat, messageThreadId: handle });
     expect(limited.status).toBe(200);
-    expect(await limited.json()).toMatchObject({ ok: false, telegram: { status: 429, retryAfter: 3 }, errorClass: "rate_limited" });
+    expect(await limited.json()).toMatchObject({ ok: false, provider: { status: 429, retryAfter: 3 }, errorClass: "rate_limited" });
 
     // rejected -> 200 status 400
     slack("chat.postMessage", { ok: false, error: "msg_too_long" });
     slack("chat.postMessage", { ok: false, error: "msg_too_long" }); // the plain retry
     const rejected = await send(e, m.key, { chatId: chat, messageThreadId: handle });
     expect(rejected.status).toBe(200);
-    expect(await rejected.json()).toMatchObject({ ok: false, telegram: { status: 400 }, errorClass: "rejected_format" });
+    expect(await rejected.json()).toMatchObject({ ok: false, provider: { status: 400 }, errorClass: "rejected_format" });
 
     // upstream -> 502
     slack("chat.postMessage", { ok: false, error: "internal_error" });
     const upstream = await send(e, m.key, { chatId: chat, messageThreadId: handle });
     expect(upstream.status).toBe(502);
-    expect(await upstream.json()).toMatchObject({ ok: false, errorClass: "upstream" });
-  });
-});
-
-describe("/topics/unpin", () => {
-  const unpin = (e: Env, key: string, body: Record<string, unknown>) => handleUnpinTopic(e, request("/topics/unpin", key, body));
-
-  it("is a constant {ok:true} with no provider call, whoever asks and whatever is named", async () => {
-    const m = await mkMachine({ slack: true });
-    const bare = await mkMachine();
-    const e = envFor([m, bare]);
-    const chat = slackChatId(m.ws!);
-    for (const [key, body] of [
-      [m.key, { chatId: chat, messageThreadId: 99 }],
-      [m.key, { chatId: ALLOWED, messageThreadId: SLACK_HANDLE_MIN + 5 }],
-      [m.key, { chatId: ALLOWED, messageThreadId: 12 }], // a Telegram-era thread
-      [bare.key, { chatId: ALLOWED, messageThreadId: 12 }],
-      [SHARED, { chatId: chat, messageThreadId: 99 }],
-      [m.key, {}],
-    ] as Array<[string, Record<string, unknown>]>) {
-      const res = await unpin(e, key, body);
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true });
-    }
-    expect(slackCalls).toHaveLength(0);
-  });
-
-  it("still needs a credential", async () => {
-    const res = await handleUnpinTopic(envFor([]), request("/topics/unpin", "not-a-key", { chatId: ALLOWED, messageThreadId: 12 }));
-    expect(res.status).toBe(401);
+    expect(await upstream.json()).toMatchObject({ ok: false, error: expect.stringMatching(/^provider_(error|unparseable)$/), errorClass: "upstream" });
   });
 });
 

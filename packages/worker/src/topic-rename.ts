@@ -149,7 +149,7 @@ export async function handleTopicRename(
     const name = topicName(dir || currentDirSuffix(topic), title);
     const editRes = await editTopicName(db, env, topic, name);
     if (!editRes.ok) {
-      return Response.json({ error: "telegram_failed", detail: editRes.error }, { status: 502 });
+      return Response.json({ error: "provider_failed", detail: editRes.error }, { status: 502 });
     }
 
     return Response.json({ renamed: true, name });
