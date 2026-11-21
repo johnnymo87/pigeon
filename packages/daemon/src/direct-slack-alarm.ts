@@ -12,7 +12,7 @@
  * link buttons become `<url|label>` lines.
  *
  * It is the only file under `daemon/src` allowed to contain the webhook host; a guard test
- * enforces that, as it does `api.telegram.org` for the Telegram file.
+ * enforces that, as it does the Bot API host for the Telegram file.
  *
  * Pushes (D7, off by default): the owner is mentioned only when `PIGEON_SLACK_NOTIFY_OWNER=1`
  * and `PIGEON_SLACK_OWNER_USER_ID` is set. pigeon never emits a broadcast: `<` is escaped (so no

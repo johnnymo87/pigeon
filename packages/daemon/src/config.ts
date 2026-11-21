@@ -72,7 +72,7 @@ export interface DaemonConfig {
    * The incoming-webhook URL of this machine's Slack `#alerts` (`PIGEON_SLACK_ALARM_WEBHOOK_URL`,
    * pigeon-4ogz.5): the direct alarm path once the machine is on Slack. Empty counts as unset (the
    * start script exports "" when the secret file is unreadable), and so does anything that is
-   * not an `https://hooks.slack.com/` URL.
+   * not a Slack incoming-webhook URL.
    */
   slackAlarmWebhookUrl?: string;
   /** The owner's Slack user id (`PIGEON_SLACK_OWNER_USER_ID`), for the direct alarm's mention. */

@@ -922,7 +922,8 @@ export class Poller {
     return {
       messageThreadId: body.messageThreadId,
       created: body.created === true,
-      ...(typeof body.chatId === "string" && body.chatId.length > 0 ? { chatId: body.chatId } : {}),
+      // Only a Slack address is surfaced: a Telegram topic is in our configured chat.
+      ...(typeof body.chatId === "string" && body.chatId.startsWith("slack:") ? { chatId: body.chatId } : {}),
     };
   }
 
@@ -961,7 +962,8 @@ export class Poller {
     }
     return {
       messageThreadId: body.messageThreadId,
-      ...(typeof body.chatId === "string" && body.chatId.length > 0 ? { chatId: body.chatId } : {}),
+      // Only a Slack address is surfaced: a Telegram topic is in our configured chat.
+      ...(typeof body.chatId === "string" && body.chatId.startsWith("slack:") ? { chatId: body.chatId } : {}),
     };
   }
 
