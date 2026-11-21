@@ -63,6 +63,23 @@ const NOT_FOUND = () => Response.json({ error: "Not found" }, { status: 404 });
 // ─── text ──────────────────────────────────────────────────────────────────
 
 /**
+ * The app's slash commands (packages/worker/slack/manifest.template.json). Slack intercepts a
+ * message starting with one of them, so a message EVENT whose text starts with one is Slack's
+ * echo of a command we answered `in_channel`: Slack posts the typed command as an ordinary owner
+ * message. The command already ran; injecting the echo would hand the session its own command as
+ * a prompt (live check pigeon-4ogz.8), and in an unbound named channel it drew the digest hint.
+ */
+export const SLACK_APP_COMMANDS = ["/launch", "/kill", "/interrupt", "/compact", "/retitle", "/mcp", "/model", "/tag"] as const;
+
+function isSlashCommandEcho(event: SlackMessageEvent): boolean {
+  if (event.subtype !== undefined || (Array.isArray(event.files) && event.files.length > 0)) return false;
+  if (event.thread_ts && event.thread_ts !== event.ts) return false; // commands cannot run in threads
+  // Lower-cased: Slack matches command names case-insensitively, so `/Retitle x` echoes as typed.
+  const text = typeof event.text === "string" ? event.text.toLowerCase() : "";
+  return SLACK_APP_COMMANDS.some((c) => text === c || text.startsWith(c + " ") || text.startsWith(c + "\n"));
+}
+
+/**
  * Slack's message text as the human typed it. Slack escapes `&`, `<`, `>` and wraps links and
  * mentions in `<...>`: `<https://x.io|x.io>`, `<mailto:a@b|a@b>`, `<@U123>`, `<#C123|general>`.
  * A prompt must not carry that markup (`a &lt; b` is not what was typed). Links become their URL
@@ -318,6 +335,7 @@ async function handleEvents(
   if (typeof eventId !== "string" || !eventId || !event || event.type !== "message") return OK();
   if (event.bot_id || !ROUTED_SUBTYPES.has(event.subtype)) return OK();
   if (event.user !== ws.ownerUserId) return OK(); // owner only, silently (D5)
+  if (isSlashCommandEcho(event)) return OK();
   const channelId = event.channel;
   if (typeof channelId !== "string" || !channelId) return OK();
 
@@ -566,7 +584,10 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
   const channelId = form.get("channel_id") ?? "";
   // `/rename` is a Slack built-in, so the app's rename command is `/retitle` (spec §2).
   const cmdName = name === "/retitle" ? "/rename" : name;
-  const args = slackTextToPlain(form.get("text") ?? "").trim();
+  // Taken as typed: with `should_escape: false` (the manifest) Slack sends command text raw, with
+  // no `&lt;` escaping and no `<url|label>` markup, so message decoding would eat `<b ... >` as a
+  // link (live check pigeon-4ogz.8). Slack's client may still turn straight quotes into curly ones.
+  const args = (form.get("text") ?? "").trim();
   const parsed = parseChatCommand(args ? `${cmdName} ${args}` : cmdName);
   if (!parsed || !channelId) return commandReply(`Unknown command ${name}.`, false);
 
