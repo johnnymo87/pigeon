@@ -156,7 +156,7 @@ it says "General", read `#alerts`; the Slack section lists the differences. Seve
 Telegram-era spelling because they are wire or persisted values: the `telegram:{status,…}` object
 and `"Telegram API error"` in worker answers, `telegram_error` and friends, the Telegram-shaped
 request fields (`entities`, `replyMarkup.inline_keyboard`, `callback_data`, `messageThreadId`,
-`retryAfter`, `details.error_code`), the `telegram-reply` and `telegram-callback` opencode-direct execute-envelope sources (still sent; the plugin already accepts `chat-reply`/`chat-callback`) and
+`retryAfter`, `details.error_code`), the `telegram-reply` and `telegram-callback` opencode-direct execute-envelope sources (still sent; a plugin loaded after `pigeon-4ogz.14` also accepts `chat-reply`/`chat-callback`, so switching is safe only once every serve has restarted onto it) and
 `GooseTurnOrigin "telegram"`. Old daemons match some of them literally, so they stay until a
 follow-up renames them (the envelope sources: a follow-up of `pigeon-4ogz.14`).
 
