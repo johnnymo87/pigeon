@@ -1,3 +1,4 @@
+import { handleNamedTopicRehome } from "./named-topic-rehome";
 import { handleSendMessage, handleUnpinTopic } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
@@ -104,6 +105,9 @@ export default {
         }
         if (path === "/topics/named/bind" && method === "POST") {
           return handleNamedTopicBind(db, env, request);
+        }
+        if (path === "/topics/named/rehome" && method === "POST") {
+          return handleNamedTopicRehome(db, env, request);
         }
         if (path === "/topics/named/unbind" && method === "POST") {
           return handleNamedTopicUnbind(db, env, request);

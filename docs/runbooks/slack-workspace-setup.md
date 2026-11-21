@@ -7,7 +7,7 @@ Slack (chat-transport phase 2, epic `pigeon-4ogz`). Spec:
 runs this: `pigeon-4ogz.7`.
 
 **This runbook changes nothing in pigeon.** It ends with credentials staged in sops. Nothing goes
-into the worker until the flip (`scripts/slack-flip.ts <machine> on`, `pigeon-4ogz.6`), and no
+into the worker until the flip (`packages/worker/scripts/slack-flip.mjs <machine> on`, `pigeon-4ogz.6`), and no
 Slack resource beyond the ones listed here is created without asking Jonathan.
 
 ## What you end up with, per machine
@@ -294,7 +294,14 @@ These need the worker holding the workspace's config, so they cannot be done at 
 the app settings page, so sign in again in a fresh throwaway profile under the same safeguards
 (code through `gws`), and sign out and delete it afterwards.
 
-1. `scripts/slack-flip.ts <m> on` (the only way to put the secret).
+1. On devbox (all three configs are in its sops), first
+   `node packages/worker/scripts/slack-flip.mjs <m> on --dry-run` (lists the coordinators that will
+   move), then without `--dry-run`. It is the only way to put the secret. It needs `sudo` for the
+   devbox age key, wrangler logged in, and `~/projects/workstation` current (`--sops-file` to point
+   elsewhere). It checks the D1 Slack tables exist, puts `SLACK_WORKSPACE_<M>` on stdin, waits for
+   the worker to see it, and creates every bound coordinator's channel. It exits 1 if a binding was
+   left behind; re-running is safe. Rollback: `... <m> off` (add `--telegram-chat <id>` if it reports
+   a binding `unplaced`).
 2. App settings → *Event Subscriptions* → **Retry** next to the request URL. It must turn
    *Verified*. If it does not, either the worker is refusing Slack's signature (check the
    `signingSecret` in the staged config) or it is applying the `team_id`/`api_app_id` check to

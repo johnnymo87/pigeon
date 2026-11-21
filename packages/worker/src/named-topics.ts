@@ -345,6 +345,27 @@ export async function getBindingForSession(
   }
 }
 
+/**
+ * Bind `(chatId, key)` to `sessionId` in one batch: drop the session's other binding (one topic
+ * per session) and take the key (one session per topic). Shared by bind and the flip's rehome.
+ */
+export async function writeBinding(db: D1Database, chatId: string, key: string, sessionId: string, now = Date.now()) {
+  await db.batch([
+    db
+      .prepare("DELETE FROM named_topic_bindings WHERE session_id = ? AND NOT (chat_id = ? AND topic_key = ?)")
+      .bind(sessionId, chatId, key),
+    db
+      .prepare(
+        `INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(chat_id, topic_key) DO UPDATE SET
+           session_id = excluded.session_id,
+           bound_at = excluded.bound_at`,
+      )
+      .bind(chatId, key, sessionId, now),
+  ]);
+}
+
 export async function unbindSession(db: D1Database, sessionId: string): Promise<number> {
   const r = await db.prepare("DELETE FROM named_topic_bindings WHERE session_id = ?").bind(sessionId).run();
   return r.meta?.changes ?? 0;
@@ -415,21 +436,7 @@ export async function handleNamedTopicBind(
     return Response.json({ error: "create_failed", details: res.details }, { status: 502 });
   }
 
-  const now = Date.now();
-  await db.batch([
-    db
-      .prepare("DELETE FROM named_topic_bindings WHERE session_id = ? AND NOT (chat_id = ? AND topic_key = ?)")
-      .bind(sessionId, chatId, key),
-    db
-      .prepare(
-        `INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(chat_id, topic_key) DO UPDATE SET
-           session_id = excluded.session_id,
-           bound_at = excluded.bound_at`,
-      )
-      .bind(chatId, key, sessionId, now),
-  ]);
+  await writeBinding(db, chatId, key, sessionId);
 
   return Response.json({
     chatId,
