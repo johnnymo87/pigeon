@@ -17,7 +17,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { sha256Hex } from "../src/credentials";
 import { slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
-import type { ChatTransport } from "../src/chat/transport";
+import type { ChatResult, ChatTransport } from "../src/chat/transport";
 import { finalize, reserve } from "../src/topics";
 
 let counter = 0;
@@ -142,7 +142,16 @@ export async function seedSlackTopic(sessionId: string, machineId: string, ws: S
 
 // ─── Fake transport ────────────────────────────────────────────────────────
 
-type Handler = (o: any) => any; // eslint-disable-line @typescript-eslint/no-explicit-any
+type Method = keyof ChatTransport;
+type Options<M extends Method> = Parameters<ChatTransport[M]>[0];
+type Result<M extends Method> = Awaited<ReturnType<ChatTransport[M]>>;
+/**
+ * Typed against ChatTransport, so a renamed method or option field, or a missing required result
+ * field, fails `typecheck`. An extra or misspelled field in an inline returned literal does not
+ * (no excess-property check on a return): use the `results` helpers below for failures.
+ */
+type Handler<M extends Method> = (o: Options<M>) => Result<M> | Promise<Result<M>>;
+type Handlers = { [M in Method]: Handler<M> };
 
 const METHODS = [
   "sendMessage",
@@ -155,18 +164,21 @@ const METHODS = [
   "archiveConversation",
   "unarchiveConversation",
   "deleteConversation",
-] as const;
+] as const satisfies readonly Method[];
+// Every ChatTransport method must be faked: a method added to the interface fails here.
+const _allMethodsFaked: Exclude<Method, (typeof METHODS)[number]> extends never ? true : never = true;
+void _allMethodsFaked;
 
 /**
  * A scripted ChatTransport. A method with no handler succeeds (a create answers thread 1; a send
  * answers an incrementing message id); a handler returns the ChatResult (or a promise of one),
  * and may throw. `calls` records each method's options in order.
  */
-export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number], Handler>> = {}) {
-  const calls: Record<string, any[]> = {}; // eslint-disable-line @typescript-eslint/no-explicit-any
+export function fakeTransport(handlers: Partial<Handlers> = {}) {
+  const calls = {} as { [M in Method]: Options<M>[] };
   for (const m of METHODS) calls[m] = [];
   let nextMessageId = 1;
-  const defaults: Record<(typeof METHODS)[number], Handler> = {
+  const defaults: Handlers = {
     sendMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     sendRichMessage: () => ({ ok: true, result: { message_id: nextMessageId++ } }),
     editMessage: () => ({ ok: true, result: true }),
@@ -178,25 +190,36 @@ export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number],
     unarchiveConversation: () => ({ ok: true, result: true }),
     deleteConversation: () => ({ ok: true, result: true }),
   };
-  const client = {} as Record<string, Handler>;
+  // The per-method types are enforced at the boundary (handlers, defaults, calls); inside the loop
+  // the method is a union, which TypeScript cannot correlate, so it is erased here.
+  const client = {} as Record<Method, (o: unknown) => Promise<unknown>>;
   for (const m of METHODS) {
+    const handler = (handlers[m] ?? defaults[m]) as (o: unknown) => unknown;
+    const recorded = calls[m] as unknown[];
     client[m] = async (o: unknown) => {
-      calls[m]!.push(o);
-      return (handlers[m] ?? defaults[m])(o);
+      recorded.push(o);
+      return handler(o);
     };
   }
   return { client: client as unknown as ChatTransport, calls };
 }
 
-/** Results a fake transport answers with, in the ChatResult shapes the real transports produce. */
+type Failure<K> = Extract<ChatResult<never>, { kind: K }>;
+
+/**
+ * Results a fake transport answers with, in the ChatResult shapes the real transports produce.
+ * Prefer these to an inline literal in a handler: a function's returned literal escapes
+ * TypeScript's excess-property check, so `{ kind: "error", status: 500 }` would compile with no
+ * errorCode, while each helper here is checked against its ChatResult variant.
+ */
 export const results = {
-  ok: <T>(result: T) => ({ ok: true as const, result }),
-  threadNotFound: () => ({ ok: false as const, kind: "thread_not_found" as const }),
-  notModified: () => ({ ok: false as const, kind: "topic_not_modified" as const }),
-  rateLimited: (retryAfter: number) => ({ ok: false as const, kind: "rate_limited" as const, retryAfter }),
-  error: (errorCode: number, description: string, response?: unknown) => ({
-    ok: false as const,
-    kind: "error" as const,
+  ok: <T>(result: T): { ok: true; result: T } => ({ ok: true, result }),
+  threadNotFound: (): Failure<"thread_not_found"> => ({ ok: false, kind: "thread_not_found" }),
+  notModified: (): Failure<"topic_not_modified"> => ({ ok: false, kind: "topic_not_modified" }),
+  rateLimited: (retryAfter: number): Failure<"rate_limited"> => ({ ok: false, kind: "rate_limited", retryAfter }),
+  error: (errorCode: number, description: string, response?: unknown): Failure<"error"> => ({
+    ok: false,
+    kind: "error",
     errorCode,
     description,
     response: response ?? { ok: false, error_code: errorCode, description },

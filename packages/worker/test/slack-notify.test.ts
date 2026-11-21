@@ -309,7 +309,7 @@ describe("pigeon never emits a broadcast mention", () => {
 
   it("markdown: literal broadcasts are defused, ordinary markdown and e-mails are untouched", () => {
     const m = buildSlackMessage({ text: "fb", markdown: `**hi** ${hostile}\nping me@here.com or @channelz`, ownerUserId: "U0OWNER" });
-    const md = (m.blocks[0] as { text: string }).text;
+    const md = (m.blocks[0] as unknown as { text: string }).text;
     expect(md).not.toMatch(BROADCAST);
     expect(md.replace("me@here.com", "")).not.toMatch(/@(?:channel|here|everyone)\b/i);
     expect(md).toContain(`@${ZWJ}channel`);

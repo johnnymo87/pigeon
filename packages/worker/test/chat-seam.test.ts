@@ -6,7 +6,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
-import { fakeTransport } from "./slack-harness";
+import { fakeTransport, results } from "./slack-harness";
 import { isSlackChatId, transportForChat, type ChatTransport } from "../src/chat";
 import { failureDetails, isPermanentTopicFailure } from "../src/chat/failures";
 import { parseChatCommand, SESSION_REF_RE } from "../src/chat/commands";
@@ -167,7 +167,6 @@ describe("topic CAS scoped to chat_id", () => {
       chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
-      botToken: "unused",
       transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);
@@ -184,7 +183,7 @@ describe("topic CAS scoped to chat_id", () => {
     const { client: tg } = fakeTransport({
       createConversation: async () => {
         await supersede(sessionId, SLACK_CHAT);
-        return { ok: false, kind: "error", errorCode: 500, description: "boom" };
+        return results.error(500, "boom");
       },
     });
     await resolveTopic(env.DB, {
@@ -193,7 +192,6 @@ describe("topic CAS scoped to chat_id", () => {
       chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
-      botToken: "unused",
       transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);
