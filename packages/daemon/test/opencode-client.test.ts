@@ -284,6 +284,19 @@ describe("OpencodeClient", () => {
         "deleteSession failed: 404 Not Found",
       );
     });
+
+    it("throws an OpencodeHttpError carrying the status, so /kill can tell a gone session (404)", async () => {
+      fetchMock.mockResolvedValueOnce(new Response(null, { status: 404, statusText: "Not Found" }));
+
+      const client = new OpencodeClient({
+        baseUrl: "http://localhost:4320",
+        fetchFn: fetchMock as unknown as typeof fetch,
+      });
+
+      const err = await client.deleteSession("sess-abc").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(OpencodeHttpError);
+      expect((err as OpencodeHttpError).status).toBe(404);
+    });
   });
 
   describe("abortSession", () => {

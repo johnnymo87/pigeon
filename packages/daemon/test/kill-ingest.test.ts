@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { ingestKillCommand, type KillCommandInput } from "../src/worker/kill-ingest";
+import { OpencodeHttpError } from "../src/opencode-client";
 
 describe("ingestKillCommand", () => {
   function makeInput(overrides?: Partial<KillCommandInput>): KillCommandInput {
@@ -9,6 +10,7 @@ describe("ingestKillCommand", () => {
       chatId: "12345",
       opencodeClient: {
         deleteSession: vi.fn().mockResolvedValue(undefined),
+        abortSession: vi.fn().mockResolvedValue(undefined),
       } as any,
       sendTelegramReply: vi.fn().mockResolvedValue(undefined),
       ...overrides,
@@ -117,5 +119,59 @@ describe("ingestKillCommand", () => {
     expect(input.sendTelegramReply).toHaveBeenCalledWith("12345", expect.stringContaining("terminated"), expect.anything());
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("teardown failed"));
     warn.mockRestore();
+  });
+
+  // A busy session's prompt loop is not stopped by DELETE alone; its next event would make the
+  // plugin re-register the session and reopen the topic just closed (pigeon-4ogz.20 review).
+  it("aborts the session before deleting it", async () => {
+    const callOrder: string[] = [];
+    const input = makeInput({
+      opencodeClient: {
+        abortSession: vi.fn(async () => { callOrder.push("abort"); }),
+        deleteSession: vi.fn(async () => { callOrder.push("delete"); }),
+      } as any,
+    });
+
+    await ingestKillCommand(input);
+
+    expect(callOrder).toEqual(["abort", "delete"]);
+  });
+
+  it("still deletes and tears down when the abort fails", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const onTerminated = vi.fn(async () => {});
+    const input = makeInput({
+      opencodeClient: {
+        abortSession: vi.fn().mockRejectedValue(new Error("abortSession failed: 500")),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      } as any,
+      onTerminated,
+    });
+
+    await ingestKillCommand(input);
+
+    expect(input.opencodeClient.deleteSession).toHaveBeenCalledWith("sess-abc");
+    expect(onTerminated).toHaveBeenCalledWith("sess-abc");
+    warn.mockRestore();
+  });
+
+  // A kill whose delete timed out after landing is redelivered and then gets a 404, as does a
+  // session already deleted in the TUI. Either way it is gone, and pigeon's side should go too.
+  it("treats a 404 from deleteSession as already gone: tears down and says so", async () => {
+    const onTerminated = vi.fn(async () => {});
+    const input = makeInput({
+      opencodeClient: {
+        abortSession: vi.fn().mockRejectedValue(new OpencodeHttpError(404, "Not Found")),
+        deleteSession: vi.fn().mockRejectedValue(new OpencodeHttpError(404, "Not Found", "deleteSession failed: 404 Not Found")),
+      } as any,
+      onTerminated,
+    });
+
+    await ingestKillCommand(input);
+
+    expect(onTerminated).toHaveBeenCalledWith("sess-abc");
+    const [, text] = (input.sendTelegramReply as ReturnType<typeof vi.fn>).mock.calls[0] as [string, string];
+    expect(text).toContain("already gone");
+    expect(text).not.toContain("Failed");
   });
 });

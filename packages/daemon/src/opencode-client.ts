@@ -398,7 +398,11 @@ export class OpencodeClient {
       { method: "DELETE" },
       (response) => {
         if (!response.ok) {
-          throw new Error(`deleteSession failed: ${response.status} ${response.statusText}`);
+          throw new OpencodeHttpError(
+            response.status,
+            response.statusText,
+            `deleteSession failed: ${response.status} ${response.statusText}`,
+          );
         }
       },
     );
