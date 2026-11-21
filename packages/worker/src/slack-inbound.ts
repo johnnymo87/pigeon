@@ -49,6 +49,9 @@ export const PARENT_FETCH_TIMEOUT_MS = 1_000;
 export const FILE_DOWNLOAD_TIMEOUT_MS = 25_000;
 
 /** `slack_seen_events` retention: past Slack's 24 h of Delayed Events retries, with room. */
+/** Files relayed from one message at most (Slack allows 10 per message). */
+export const MAX_FILES_PER_MESSAGE = 10;
+
 export const SLACK_SEEN_EVENT_TTL_MS = 48 * 60 * 60 * 1000;
 
 /** Message subtypes that are a human writing. Everything else (edits, joins, topic changes) is noise. */
@@ -366,9 +369,9 @@ async function handleEvents(
   };
 
   const command = slackTextToPlain(event.text ?? "");
-  const file = Array.isArray(event.files) && event.files.length > 0 ? event.files[0]! : undefined;
+  const files = Array.isArray(event.files) ? event.files.slice(0, MAX_FILES_PER_MESSAGE) : [];
 
-  if (!command.trim() && !file) return refuse("Nothing to send — that message had no text.");
+  if (!command.trim() && files.length === 0) return refuse("Nothing to send — that message had no text.");
   if (command.length > MAX_COMMAND_LENGTH) {
     return refuse(`Command too long (${command.length} chars, max ${MAX_COMMAND_LENGTH})`);
   }
@@ -406,16 +409,11 @@ async function handleEvents(
     messageThreadId: replyHandle,
   };
 
-  if (file) {
-    const picked = pickSlackFile(file);
-    if (!picked) return refuse("Could not download file from Slack");
-    if (picked.size > MAX_FILE_SIZE) {
-      return refuse(`File too large (${(picked.size / 1024 / 1024).toFixed(1)}MB, max 20MB)`);
-    }
+  if (files.length > 0) {
     if (!(await markSeen(db, eventId))) return OK();
-    // The download can take longer than Slack's 3 s ack allows, so it runs after the response.
-    // The event is already marked seen, so a failure here is reported in the channel instead.
-    const work = relayFileAndQueue(env, db, ws, replyHandle, picked, file.id ?? "f", base, touch);
+    // Downloads can take longer than Slack's 3 s ack allows, so they run after the response. The
+    // event is already marked seen, so a failure there is reported in the channel instead.
+    const work = relayFilesAndQueue(env, db, ws, replyHandle, files, base, touch);
     if (waitUntil) waitUntil(work);
     else await work;
     return OK();
@@ -431,45 +429,85 @@ async function handleEvents(
   return OK();
 }
 
-async function relayFileAndQueue(
+/**
+ * Downloads each file into R2 and queues one command per file, in order. The message's text rides
+ * on the first file that arrives (as a Telegram caption does); the others carry only their media.
+ * A file that cannot be fetched is reported in the channel and the rest still go; if none does,
+ * the text is queued on its own so it is not lost with them.
+ */
+async function relayFilesAndQueue(
   env: Env,
   db: D1Database,
   ws: SlackWorkspace,
   replyHandle: number | null,
-  picked: { url: string; mime: string; filename: string; size: number },
-  fileId: string,
+  files: SlackFile[],
   base: Parameters<typeof queueCommand>[1],
   touch: D1PreparedStatement,
 ): Promise<void> {
   const say = (text: string) => (replyHandle !== null ? postInChannel(env, db, ws, replyHandle, text) : Promise.resolve());
-  try {
-    const dl = await downloadSlackFile(ws.botToken, picked.url, picked.mime === "text/html", {
-      signal: AbortSignal.timeout(FILE_DOWNLOAD_TIMEOUT_MS),
+  let textSent = false;
+  let touched = false;
+  const enqueue = async (mediaJson: string | null): Promise<boolean> => {
+    if (!touched) {
+      await touch.run();
+      touched = true;
+    }
+    const commandId = await queueCommand(db, {
+      ...base,
+      command: textSent ? "" : base.command,
+      ...(mediaJson ? { mediaJson } : {}),
     });
-    if (!dl.ok || !dl.body) {
-      console.warn("[slack-inbound] file download failed", { error: dl.ok ? "no_body" : dl.error });
-      await say("Could not download file from Slack");
-      return;
+    if (commandId === null) {
+      await say(`Queue full (${MAX_QUEUE_PER_MACHINE} commands pending).`);
+      return false;
     }
-    const safeId = fileId.replace(/[^A-Za-z0-9_-]/g, "");
-    const key = `inbound/${Date.now()}-${safeId}/${picked.filename}`;
-    try {
-      await env.MEDIA.put(key, dl.body, {
-        httpMetadata: { contentType: picked.mime },
-        customMetadata: { filename: picked.filename },
+    textSent = true;
+    return true;
+  };
+  try {
+    for (const file of files) {
+      const name = typeof file.name === "string" && file.name ? file.name : "a file";
+      const picked = pickSlackFile(file);
+      if (!picked) {
+        await say(`Could not download ${name} from Slack`);
+        continue;
+      }
+      if (picked.size > MAX_FILE_SIZE) {
+        await say(`${name}: file too large (${(picked.size / 1024 / 1024).toFixed(1)}MB, max 20MB)`);
+        continue;
+      }
+      const dl = await downloadSlackFile(ws.botToken, picked.url, picked.mime === "text/html", {
+        signal: AbortSignal.timeout(FILE_DOWNLOAD_TIMEOUT_MS),
       });
-    } catch (err) {
-      console.warn("[slack-inbound] media storage failed", { err: String(err) });
-      await say("Media storage failed, please try again");
-      return;
+      if (!dl.ok) {
+        console.warn("[slack-inbound] file download failed", { error: dl.error });
+        await say(`Could not download ${name} from Slack`);
+        continue;
+      }
+      // Buffered rather than streamed: R2 needs a known length, and Slack may answer chunked.
+      if (dl.bytes.byteLength > MAX_FILE_SIZE) {
+        await say(`${name}: file too large (max 20MB)`);
+        continue;
+      }
+      const safeId = (file.id ?? "f").replace(/[^A-Za-z0-9_-]/g, "");
+      const key = `inbound/${Date.now()}-${safeId}/${picked.filename}`;
+      try {
+        await env.MEDIA.put(key, dl.bytes, {
+          httpMetadata: { contentType: picked.mime },
+          customMetadata: { filename: picked.filename },
+        });
+      } catch (err) {
+        console.warn("[slack-inbound] media storage failed", { err: String(err) });
+        await say("Media storage failed, please try again");
+        continue;
+      }
+      const mediaRef: MediaRef = { key, mime: picked.mime, filename: picked.filename, size: dl.bytes.byteLength };
+      if (!(await enqueue(JSON.stringify(mediaRef)))) return;
     }
-    const mediaRef: MediaRef = { key, mime: picked.mime, filename: picked.filename, size: picked.size };
-    await touch.run();
-    const commandId = await queueCommand(db, { ...base, mediaJson: JSON.stringify(mediaRef) });
-    if (commandId === null) await say(`Queue full (${MAX_QUEUE_PER_MACHINE} commands pending).`);
+    if (!textSent && base.command.trim()) await enqueue(null);
   } catch (err) {
     console.error("[slack-inbound] file relay failed", { err: String(err) });
-    await say("Could not deliver that file, please try again");
+    await say("Could not deliver that message, please try again");
   }
 }
 
@@ -516,6 +554,8 @@ async function namedSession(db: D1Database, ref: string): Promise<Resolved | str
 
 async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: string): Promise<Response> {
   const form = new URLSearchParams(raw);
+  // Slack's periodic certificate check of a command URL: no team, no user, nothing to do.
+  if (form.get("ssl_check") === "1") return OK();
   if (teamMismatch(ws, form.get("team_id"), form.get("api_app_id"))) {
     console.warn("[slack-inbound] command for another team or app refused");
     return new Response("Forbidden", { status: 403 });
@@ -531,7 +571,9 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
   if (!parsed || !channelId) return commandReply(`Unknown command ${name}.`, false);
 
   const chat = slackChatId(ws);
-  const handle = await channelHandle(db, ws, channelId, true);
+  // A handle only for a public channel (C…): a DM or private channel is one the bot is not in and
+  // cannot post to, so a reply addressed there would be lost. With no handle it goes to #alerts.
+  const handle = await channelHandle(db, ws, channelId, channelId.startsWith("C"));
   const queue = async (opts: {
     machineId: string;
     sessionId: string | null;
@@ -558,6 +600,19 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     if (!tag) {
       const ctx = await channelContext(db, chat, handle);
       if (ctx.kind === "found" && ctx.machineId === machineId) inheritFromSessionId = ctx.sessionId;
+      // A coordinator's channel is a bound named channel, not a session topic. Telegram reaches the
+      // coordinator by swipe-reply, which a slash command cannot do, so the binding stands in for it
+      // here: inheritance is only a candidate the daemon validates (its program, not a destructive act).
+      if (ctx.kind === "none" && handle !== null) {
+        const bound = await getBoundSessionByThread(db, chat, handle);
+        if (bound) {
+          const row = await db
+            .prepare("SELECT machine_id FROM sessions WHERE session_id = ?")
+            .bind(bound)
+            .first<{ machine_id: string }>();
+          if (row?.machine_id === machineId) inheritFromSessionId = bound;
+        }
+      }
     }
     const ok = await queue({
       machineId,

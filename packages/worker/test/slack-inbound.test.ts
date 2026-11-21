@@ -546,8 +546,10 @@ describe("events", () => {
       text: "x",
       files: [{ id: "F2", name: "a.txt", mimetype: "text/plain", size: 1, url_private_download: "https://evil.example/a.txt" }],
     });
-    expect(await commandsFor(box.machineId)).toEqual([]);
-    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("Could not download file from Slack");
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("Could not download a.txt from Slack");
+    // The text is not lost with the file.
+    const rows = await commandsFor(box.machineId);
+    expect(rows.map((r) => [r.command, r.media_json])).toEqual([["x", null]]);
   });
 
   it("a file over 20MB is refused in the channel", async () => {
@@ -559,7 +561,55 @@ describe("events", () => {
       subtype: "file_share",
       files: [{ id: "F3", name: "big.bin", size: 21 * 1024 * 1024, url_private_download: "https://files.slack.com/x" }],
     });
-    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("File too large");
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("big.bin: file too large");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("several files queue one command each, in order, the text riding on the first; a retry fetches nothing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    for (const n of ["a", "b"]) {
+      fetchMock
+        .get("https://files.slack.com")
+        .intercept({ method: "GET", path: `/f/${n}.png` })
+        .reply(200, `bytes-${n}`, { headers: { "content-type": "image/png" } });
+    }
+    const mk = (n: string) => ({
+      id: `F${n}`,
+      name: `${n}.png`,
+      mimetype: "image/png",
+      size: 7,
+      original_w: 10,
+      original_h: 10,
+      url_private_download: `https://files.slack.com/f/${n}.png`,
+    });
+    const body = eventBody(box, { channel: ch.channelId, subtype: "file_share", text: "what's wrong", files: [mk("a"), mk("b")] });
+    const waits: Waits = [];
+    await call(box, await signed(box, "events", body, "application/json"), waits);
+    await Promise.all(waits);
+    // The retry: already seen, so no download is attempted (an unexpected fetch would fail the test).
+    const again: Waits = [];
+    await call(box, await signed(box, "events", body, "application/json"), again);
+    expect(again).toEqual([]);
+    const rows = await commandsFor(box.machineId);
+    expect(rows.map((r) => [r.command, JSON.parse(r.media_json!).filename])).toEqual([
+      ["what's wrong", "a.png"],
+      ["", "b.png"],
+    ]);
+  });
+
+  it("a failed download is reported in the channel", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    fetchMock.get("https://files.slack.com").intercept({ method: "GET", path: "/f/gone" }).reply(404, "no");
+    slack("chat.postMessage", { ok: true, ts: "1700000012.000100", channel: ch.channelId });
+    await sendEvent(box, {
+      channel: ch.channelId,
+      subtype: "file_share",
+      text: "",
+      files: [{ id: "F9", name: "gone.txt", mimetype: "text/plain", size: 3, url_private_download: "https://files.slack.com/f/gone" }],
+    });
+    expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("Could not download gone.txt from Slack");
     expect(await commandsFor(box.machineId)).toEqual([]);
   });
 
@@ -678,6 +728,28 @@ describe("slash commands", () => {
     const row = (await commandsFor(box.machineId))[0]!;
     expect(row).toMatchObject({ command_type: "launch", command: "say hello", chat_id: box.chat, message_thread_id: ch.handle });
     expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ch.sessionId });
+  });
+
+  it("/launch in a coordinator's bound channel inherits from the coordinator", async () => {
+    const box = await mkBox();
+    const coord = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:prog2");
+    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)")
+      .bind(box.chat, "stallwatch:prog2", coord, Date.now())
+      .run();
+    await sendCommand(box, "/launch", `${box.machineId} pigeon go`, named.channelId);
+    const row = (await commandsFor(box.machineId))[0]!;
+    expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: coord });
+  });
+
+  it("a command from a DM gets no handle (its reply goes to #alerts); ssl_check is a plain 200", async () => {
+    const box = await mkBox();
+    const sessionId = await seedSession(box.machineId);
+    await sendCommand(box, "/kill", sessionId, "D0SELFDM");
+    expect((await commandsFor(box.machineId))[0]!.message_thread_id).toBeNull();
+    const ssl = new URLSearchParams({ ssl_check: "1", token: "legacy" }).toString();
+    const res = await call(box, await signed(box, "commands", ssl, "application/x-www-form-urlencoded"));
+    expect(res.status).toBe(200);
   });
 
   it("/launch to a machine not recently seen is refused; a malformed one answers with usage", async () => {

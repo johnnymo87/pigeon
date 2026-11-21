@@ -248,14 +248,16 @@ export async function downloadSlackFile(
   url: string,
   expectHtml: boolean,
   opts: DownloadSlackFileOptions = {},
-): Promise<{ ok: true; body: ReadableStream | null } | { ok: false; error: string }> {
+): Promise<{ ok: true; bytes: ArrayBuffer } | { ok: false; error: string }> {
   if (!isSlackFileUrl(url)) return { ok: false, error: "not_a_slack_file_url" };
   const startedAt = Date.now();
   let outcome = "threw";
   try {
     const doFetch = opts.fetchFn ?? ((u, init) => fetch(u, init));
+    // Redirects are not followed: the bearer token must not travel to wherever one points.
     const res = await doFetch(url, {
       headers: { Authorization: `Bearer ${token}` },
+      redirect: "manual",
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (!res.ok) {
@@ -266,8 +268,9 @@ export async function downloadSlackFile(
       outcome = "html_instead_of_file";
       return { ok: false, error: outcome };
     }
+    const bytes = await res.arrayBuffer();
     outcome = "ok";
-    return { ok: true, body: res.body };
+    return { ok: true, bytes };
   } finally {
     logSlackCall("file_download", Date.now() - startedAt, outcome);
   }
