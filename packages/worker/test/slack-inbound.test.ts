@@ -13,7 +13,8 @@ import worker from "../src/index";
 import { slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
 import { slackSignature, verifySlackSignature } from "../src/chat/slack-verify";
 import { finalize, reserve } from "../src/topics";
-import { handleSlackRequest, pickSlackFile, slackTextToPlain, sweepSlackSeenEvents } from "../src/slack-inbound";
+import { handleSlackRequest, pickSlackFile, SLACK_APP_COMMANDS, slackTextToPlain, sweepSlackSeenEvents } from "../src/slack-inbound";
+import manifestRaw from "../slack/manifest.template.json?raw";
 
 beforeAll(async () => {
   for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
@@ -341,6 +342,21 @@ describe("events", () => {
     expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ senderId: OWNER });
   });
 
+  it("Slack's in-channel echo of one of our slash commands is not injected as a prompt", async () => {
+    // A command answered `in_channel` makes Slack post the typed command as an ordinary owner
+    // message, which arrives as a message event. The command itself already ran.
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    for (const text of ["/retitle Live check retitled", "/kill", "/launch devbox pigeon hi", "/tag  x"]) {
+      expect((await sendEvent(box, { channel: ch.channelId, text })).status).toBe(200);
+    }
+    expect(await commandsFor(box.machineId)).toEqual([]);
+    // Text that merely starts with a slash is still a prompt.
+    await sendEvent(box, { channel: ch.channelId, text: "/tmp/x is full" });
+    await sendEvent(box, { channel: ch.channelId, text: "/launchpad is broken" });
+    expect((await commandsFor(box.machineId)).map((r) => r.command)).toEqual(["/tmp/x is full", "/launchpad is broken"]);
+  });
+
   it("a retried event (same event_id) queues once", async () => {
     const box = await mkBox();
     const ch = await seedSessionChannel(box);
@@ -633,6 +649,11 @@ describe("events", () => {
     ).toMatchObject({ url: "https://files.slack.com/o", original: true });
   });
 
+  it("SLACK_APP_COMMANDS is exactly the manifest's slash commands", () => {
+    const manifest = JSON.parse(manifestRaw) as { features: { slash_commands: Array<{ command: string }> } };
+    expect([...SLACK_APP_COMMANDS].sort()).toEqual(manifest.features.slash_commands.map((c) => c.command).sort());
+  });
+
   it("slackTextToPlain decodes Slack markup", () => {
     expect(slackTextToPlain("a &lt; b &amp;&amp; c &gt; d")).toBe("a < b && c > d");
     expect(slackTextToPlain("<https://example.com|example.com> and <https://x.io/p>")).toBe("https://example.com and https://x.io/p");
@@ -728,6 +749,15 @@ describe("slash commands", () => {
     const row = (await commandsFor(box.machineId))[0]!;
     expect(row).toMatchObject({ command_type: "launch", command: "say hello", chat_id: box.chat, message_thread_id: ch.handle });
     expect(JSON.parse(row.metadata_json!)).toEqual({ inheritFromSessionId: ch.sessionId });
+  });
+
+  it("slash-command text is taken as typed: Slack does not escape it (should_escape false), so <, > and & survive", async () => {
+    // Live check pigeon-4ogz.8: `/launch ... a<b && "q" > c` arrived raw, and decoding it as
+    // message markup ate `<b && "q" >` as if it were a link.
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await sendCommand(box, "/launch", `${box.machineId} pigeon echo a<b && "q" > c &lt;kept&gt;`, ch.channelId);
+    expect((await commandsFor(box.machineId))[0]).toMatchObject({ command: 'echo a<b && "q" > c &lt;kept&gt;' });
   });
 
   it("/launch in a coordinator's bound channel inherits from the coordinator", async () => {
