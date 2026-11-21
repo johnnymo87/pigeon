@@ -84,7 +84,7 @@ beforeAll(async () => {
   }
   machine = await mkSlackMachine();
   CHAT = slackChatId(machine.ws);
-  topicsEnv = envWith([machine], { TELEGRAM_TOPICS_ENABLED: "true" });
+  topicsEnv = envWith([machine]);
 });
 
 beforeEach(async () => {
@@ -212,16 +212,19 @@ describe("POST /topics/rename", () => {
     expect(await res.json()).toEqual({ error: "bound_session" });
   });
 
-  it("returns 200 renamed: false, reason: 'topics_disabled' when topics are disabled in env", async () => {
-    const sessionId = "ses_topics_off";
-    await seedSession(sessionId, MACHINE_A);
+  it("returns 404 unknown_session for a topic row in a numeric (Telegram-era) chat, with no provider call", async () => {
+    for (const threadId of [4321, null]) {
+      const sessionId = `ses_numeric_row_${threadId}`;
+      await seedSession(sessionId, MACHINE_A);
+      await seedTopic({ sessionId, chatId: "-1001234567890", threadId, name: "old · ~/p", provisional: 0 });
 
-    const res = await callRename(
-      { sessionId, title: "Title", dir: "~/project" },
-      { envOverride: { TELEGRAM_TOPICS_ENABLED: "false" } },
-    );
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ renamed: false, reason: "topics_disabled" });
+      const res = await callRename({ sessionId, title: "Title", dir: "~/project" });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "unknown_session" });
+      // The row is left as it was: renaming is not what removes it.
+      expect((await getBySession(env.DB, sessionId))?.name).toBe("old · ~/p");
+    }
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("returns 200 renamed: false, reason: 'no_topic' when session has no topic row", async () => {

@@ -16,8 +16,11 @@ bucket_name = "pigeon-media"
 crons = ["0 * * * *"]
 
 [vars]
-ALLOWED_CHAT_IDS = "8248645256,-1004391832753,-1004232934695,-1003983501132"
-TELEGRAM_TOPICS_ENABLED = "true"
+# Removed with Telegram (pigeon-4ogz.13): ALLOWED_CHAT_IDS, TELEGRAM_TOPICS_ENABLED,
+# TELEGRAM_RICH_MESSAGES, TELEGRAM_BOT_TOKEN (and the webhook secret, bot username and allowed user
+# ids). keep_vars = true keeps whatever is deployed, so the deployed values are inert leftovers:
+# delete them one by one in the Cloudflare dashboard. Do NOT flip keep_vars off, it would wipe the
+# dashboard-set SLACK_* vars.
 # Retire the shared CCR_API_KEY for these machines (pigeon-k0qn.8): it can no longer poll, ack,
 # register or unregister as them, which only their own per-machine keys may do. Other routes
 # still accept it. To un-retire a machine, EDIT this list and redeploy; never delete the line,

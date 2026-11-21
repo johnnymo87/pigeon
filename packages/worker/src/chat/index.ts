@@ -3,7 +3,6 @@
  * See `./transport.ts` for the interface and why it is Telegram-shaped.
  */
 import type { D1Database } from "@cloudflare/workers-types";
-import { createTelegramClient } from "../telegram";
 import { parseNotifyCategories } from "./slack-notify";
 import { slackWorkspaceForTeam, teamIdOfChat } from "./slack-config";
 import { createSlackTransport } from "./slack-transport";
@@ -11,7 +10,7 @@ import type { ChatResult, ChatTransport } from "./transport";
 
 export type { ChatResult, ChatTransport } from "./transport";
 
-/** Slack workspace chat ids are `slack:<teamId>`; Telegram chat ids are numeric. */
+/** Slack workspace chat ids are `slack:<teamId>`. Anything else is a numeric Telegram-era id. */
 export const SLACK_CHAT_PREFIX = "slack:";
 
 export function isSlackChatId(chatId: string | number): boolean {
@@ -22,8 +21,8 @@ export function isSlackChatId(chatId: string | number): boolean {
  * The failure every call to a Slack address gets when no Slack transport can be built for it: the
  * caller passed no env/db, or no `SLACK_WORKSPACE_*` secret is configured for the address's team
  * (the secret was deleted, or never existed). It is a guard, not a path: it makes sure a Slack
- * address can never be handed to the Telegram Bot API. It is classified transient (no 4xx code),
- * so a caller holds and retries rather than relocating to General.
+ * address is never answered as if it were a refusal. It is classified transient (no 4xx code), so
+ * a caller holds and retries rather than relocating to #alerts.
  */
 function slackUnavailable<T>(method: string): Promise<ChatResult<T>> {
   console.warn("[worker] slack transport not available", { method });
@@ -41,7 +40,30 @@ const SLACK_UNAVAILABLE: ChatTransport = {
   closeForumTopic: () => slackUnavailable("closeForumTopic"),
   reopenForumTopic: () => slackUnavailable("reopenForumTopic"),
   deleteForumTopic: () => slackUnavailable("deleteForumTopic"),
-  unpinAllForumTopicMessages: () => slackUnavailable("unpinAllForumTopicMessages"),
+};
+
+/**
+ * The failure every call to a non-Slack address gets (a numeric chat id: the Telegram days are
+ * over, so no provider can take it). Unlike `SLACK_UNAVAILABLE` it is permanent, and it is
+ * distinct on purpose: `no_transport` never reaches a response body (see `ChatResult`), each
+ * caller maps it to its own answer.
+ */
+function noTransport<T>(method: string): Promise<ChatResult<T>> {
+  console.warn("[worker] no transport for address", { method });
+  return Promise.resolve({ ok: false, kind: "no_transport" });
+}
+
+const NO_TRANSPORT: ChatTransport = {
+  sendMessage: () => noTransport("sendMessage"),
+  sendRichMessage: () => noTransport("sendRichMessage"),
+  editMessageText: () => noTransport("editMessageText"),
+  sendPhoto: () => noTransport("sendPhoto"),
+  sendDocument: () => noTransport("sendDocument"),
+  createForumTopic: () => noTransport("createForumTopic"),
+  editForumTopic: () => noTransport("editForumTopic"),
+  closeForumTopic: () => noTransport("closeForumTopic"),
+  reopenForumTopic: () => noTransport("reopenForumTopic"),
+  deleteForumTopic: () => noTransport("deleteForumTopic"),
 };
 
 /** What a Slack address needs beyond the address itself: the workspace secrets and the handle tables. */
@@ -56,30 +78,26 @@ export interface SlackContext {
  * The transport for a chat address.
  *
  * `transport` replaces whatever the address would pick (tests inject fakes this way, through the
- * `transport` options of the topic modules), for a Slack address as much as a numeric one. `slack`
- * is what a Slack address needs: without it, or when no workspace is configured for the address's
- * team, the address gets the `SLACK_UNAVAILABLE` guard. A numeric address ignores it, so with no
- * Slack secret every call behaves exactly as before Slack existed.
+ * `transport` options of the topic modules), for any address. A `slack:<team>` address with a
+ * configured workspace gets the Slack transport; without `ctx`, or with no workspace for the team,
+ * it gets the `SLACK_UNAVAILABLE` guard (transient). Any other address gets `NO_TRANSPORT`.
  */
 export function transportForChat(
   chatId: string | number,
-  botToken: string,
+  ctx?: SlackContext,
   transport?: ChatTransport,
-  slack?: SlackContext,
 ): ChatTransport {
   if (transport) return transport;
-  if (isSlackChatId(chatId)) {
-    const team = teamIdOfChat(chatId);
-    const ws = slack && team ? slackWorkspaceForTeam(slack.env, team) : null;
-    if (slack && ws) {
-      return createSlackTransport({
-        db: slack.db,
-        ws,
-        notifyCategories: parseNotifyCategories(slack.env.SLACK_NOTIFY_OWNER),
-        ...(slack.fetchFn ? { fetchFn: slack.fetchFn } : {}),
-      });
-    }
-    return SLACK_UNAVAILABLE;
+  if (!isSlackChatId(chatId)) return NO_TRANSPORT;
+  const team = teamIdOfChat(chatId);
+  const ws = ctx && team ? slackWorkspaceForTeam(ctx.env, team) : null;
+  if (ctx && ws) {
+    return createSlackTransport({
+      db: ctx.db,
+      ws,
+      notifyCategories: parseNotifyCategories(ctx.env.SLACK_NOTIFY_OWNER),
+      ...(ctx.fetchFn ? { fetchFn: ctx.fetchFn } : {}),
+    });
   }
-  return createTelegramClient(botToken);
+  return SLACK_UNAVAILABLE;
 }

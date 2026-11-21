@@ -1,7 +1,7 @@
 /**
  * Transport-neutral readings of a failed `ChatResult`: the `details` body a 502 carries to the
- * daemon, and whether a failed topic send is permanent. Both transports (Telegram's client and
- * Slack's, whose errors `../slack.ts` maps onto the same result union) go through these.
+ * daemon, and whether a failed topic send is permanent. Slack's errors are mapped onto the result
+ * union by `../slack.ts`.
  */
 import type { ChatResult } from "./transport";
 
@@ -12,6 +12,9 @@ import type { ChatResult } from "./transport";
  */
 export function failureDetails(result: ChatResult<unknown>): unknown {
   if (result.ok) return undefined;
+  // `no_transport` is internal and never serialized as a refusal: no `error_code`, so it cannot be
+  // read as a 4xx from the provider (callers map it before it reaches a body; this is the backstop).
+  if (result.kind === "no_transport") return { ok: false, description: "no_transport" };
   return (
     result.response ?? {
       ok: false,
@@ -35,14 +38,17 @@ export function failureDetails(result: ChatResult<unknown>): unknown {
  * into the RIGHT topic. Relocating on a transient error is how a user's answer ended up in
  * General and was never seen (pigeon-bit4).
  *
- * `errorCode === undefined` means a 200 whose body did not parse (the Telegram client's
- * parseTgResponse), which most likely means the provider PROCESSED the send. Treating it as
+ * `errorCode === undefined` means a 200 whose body did not parse, which most likely means the
+ * provider PROCESSED the send. Treating it as
  * transient risks a duplicate in the correct topic; treating it as permanent guarantees a
  * misfiled copy. The duplicate is the better-placed risk.
  */
 export function isPermanentTopicFailure(result: ChatResult<unknown>): boolean {
   if (result.ok) return false;
   switch (result.kind) {
+    case "no_transport":
+      // No provider can ever take this address: retrying cannot help.
+      return true;
     case "rate_limited":
       // Never reached (callers exclude it first), but 429 is explicitly transient.
       return false;

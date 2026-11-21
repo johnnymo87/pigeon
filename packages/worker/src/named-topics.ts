@@ -18,14 +18,13 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { resolveWorkerTarget } from "./chat/address";
-import { topicsEnabled } from "./topics";
 import { failureDetails } from "./chat/failures";
-import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
+import { transportForChat, type ChatTransport } from "./chat";
 
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
 
-/** Telegram's limit on a forum topic name. */
+/** Telegram's limit on a forum topic name, kept as the bound on a conversation's name. */
 export const MAX_TOPIC_NAME_CHARS = 128;
 
 /** How often an existing named topic is re-opened, at most. A closed topic still accepts posts. */
@@ -103,7 +102,6 @@ export async function resolveNamedTopic(
     key: string;
     name: string;
     staleThreadId?: number;
-    botToken: string;
     now?: number;
     /** Replaces the transport for ANY address, Slack included (tests). */
     transport?: ChatTransport;
@@ -112,7 +110,7 @@ export async function resolveNamedTopic(
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.transport, opts.env ? { env: opts.env, db } : undefined);
+  const tg = transportForChat(opts.chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 
@@ -149,8 +147,7 @@ export async function resolveNamedTopic(
   }
 
   const name = truncateName(opts.name.trim() || opts.key);
-  // `channelKey` and `topic` are Slack's: the key becomes the channel's name and the human name
-  // its topic line. Telegram's client reads neither.
+  // `channelKey` and `topic`: the key becomes the channel's name and the human name its topic line.
   const created = await tg.createForumTopic({ chatId: opts.chatId, name, channelKey: opts.key, topic: name });
   if (!created.ok) {
     if (created.kind === "rate_limited") {
@@ -189,7 +186,7 @@ export async function resolveNamedTopic(
 /**
  * POST /topics/named  {chatId, key, name, staleThreadId?}
  *   200 {chatId, messageThreadId, created}
- *   400 bad input · 403 chat not allowed · 409 topics disabled · 429 rate limited · 502 create failed
+ *   400 bad input · 403 no workspace for the caller · 429 rate limited · 502 create failed
  *
  * Every non-200 is a fail-open signal to the daemon: it posts the alert to General instead.
  */
@@ -211,14 +208,13 @@ export async function handleNamedTopic(
     return Response.json({ error: "invalid body" }, { status: 400 });
   }
 
-  const requestedChatId = typeof body.chatId === "string" || typeof body.chatId === "number" ? String(body.chatId) : "";
   const key = typeof body.key === "string" ? body.key : "";
   const name = typeof body.name === "string" ? body.name : "";
   const stale = body.staleThreadId;
-  // A machine on Slack needs no chat id: its target is its workspace.
-  const target = resolveWorkerTarget(env, principal, requestedChatId);
-  if ((!requestedChatId && !target.ok) || !NAMED_TOPIC_KEY_RE.test(key)) {
-    return Response.json({ error: "chatId and a valid key are required" }, { status: 400 });
+  // A machine needs no chat id: its target is its workspace, whatever it sent.
+  const target = resolveWorkerTarget(env, principal);
+  if (!NAMED_TOPIC_KEY_RE.test(key)) {
+    return Response.json({ error: "a valid key is required" }, { status: 400 });
   }
   if (stale !== undefined && !(typeof stale === "number" && Number.isInteger(stale) && stale > 0)) {
     return Response.json({ error: "staleThreadId must be a positive integer" }, { status: 400 });
@@ -226,13 +222,10 @@ export async function handleNamedTopic(
   if (!target.ok) {
     return Response.json({ error: "Chat ID not allowed" }, { status: 403 });
   }
-  const chatId = String(target.chatId);
-  if (target.slack && key.startsWith("_")) {
-    // `_`-prefixed keys are the worker's own (`_alerts`), so a caller may not take one on Slack.
+  const chatId = target.chatId;
+  if (key.startsWith("_")) {
+    // `_`-prefixed keys are the worker's own (`_alerts`), so a caller may not take one.
     return Response.json({ error: "keys starting with _ are reserved" }, { status: 400 });
-  }
-  if (!topicsEnabled(env)) {
-    return Response.json({ error: "topics disabled" }, { status: 409 });
   }
 
   const res = await resolveNamedTopic(db, {
@@ -240,7 +233,6 @@ export async function handleNamedTopic(
     key,
     name,
     staleThreadId: stale as number | undefined,
-    botToken: env.TELEGRAM_BOT_TOKEN,
     env,
   });
   if (res.ok) {
@@ -267,8 +259,7 @@ export async function maybeAnswerInNamedTopic(
   messageThreadId: number | undefined,
   now: number = Date.now(),
 ): Promise<boolean> {
-  // TELEGRAM_TOPICS_ENABLED is Telegram's switch; a Slack channel is always a conversation.
-  if ((!isSlackChatId(chatId) && !topicsEnabled(env)) || messageThreadId === undefined) return false;
+  if (messageThreadId === undefined) return false;
   const row = await getNamedTopicByThread(db, chatId, messageThreadId);
   if (!row) return false;
 
@@ -280,7 +271,7 @@ export async function maybeAnswerInNamedTopic(
     .bind(now, chatId, row.topic_key, now - NAMED_TOPIC_HINT_INTERVAL_MS)
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+    const tg = transportForChat(chatId, { env, db });
     const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
       console.warn("[worker] named topic hint failed", { key: row.topic_key, details: failureDetails(res) });
@@ -375,7 +366,7 @@ export async function unbindSession(db: D1Database, sessionId: string): Promise<
 /**
  * POST /topics/named/bind  {chatId, key, name, sessionId}
  *   200 {chatId, messageThreadId, created, bound: true, sessionId}
- *   400 bad input · 403 chat not allowed · 409 topics disabled · 409 session not registered · 429/502
+ *   400 bad input · 403 no workspace for the caller · 409 session not registered · 429/502
  */
 export async function handleNamedTopicBind(
   db: D1Database,
@@ -395,24 +386,20 @@ export async function handleNamedTopicBind(
     return Response.json({ error: "invalid body" }, { status: 400 });
   }
 
-  const requestedChatId = typeof body.chatId === "string" || typeof body.chatId === "number" ? String(body.chatId) : "";
   const key = typeof body.key === "string" ? body.key : "";
   const name = typeof body.name === "string" ? body.name : "";
   const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
 
-  const target = resolveWorkerTarget(env, principal, requestedChatId);
-  if ((!requestedChatId && !target.ok) || !NAMED_TOPIC_KEY_RE.test(key) || !sessionId || sessionId.length > 128) {
-    return Response.json({ error: "chatId, a valid key, and sessionId (1-128 chars) are required" }, { status: 400 });
+  const target = resolveWorkerTarget(env, principal);
+  if (!NAMED_TOPIC_KEY_RE.test(key) || !sessionId || sessionId.length > 128) {
+    return Response.json({ error: "a valid key and sessionId (1-128 chars) are required" }, { status: 400 });
   }
   if (!target.ok) {
     return Response.json({ error: "Chat ID not allowed" }, { status: 403 });
   }
-  const chatId = String(target.chatId);
-  if (target.slack && key.startsWith("_")) {
+  const chatId = target.chatId;
+  if (key.startsWith("_")) {
     return Response.json({ error: "keys starting with _ are reserved" }, { status: 400 });
-  }
-  if (!topicsEnabled(env)) {
-    return Response.json({ error: "topics disabled" }, { status: 409 });
   }
 
   const sessionRow = await db
@@ -427,7 +414,6 @@ export async function handleNamedTopicBind(
     chatId,
     key,
     name,
-    botToken: env.TELEGRAM_BOT_TOKEN,
     env,
   });
   if (!res.ok) {

@@ -21,14 +21,12 @@ import {
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
 import {
-  isAllowedChatId,
   generateToken,
   handleSendNotification,
   handleEditNotification,
   alertRelocation,
 } from "../src/notifications";
 import {
-  topicsEnabled,
   topicName,
   clampPreservingSurrogates,
   getBySession,
@@ -45,8 +43,6 @@ import {
   stealReservation,
   listReapable,
   listOrphaned,
-  MACHINE_ICON_COLORS,
-  DEFAULT_ICON_COLOR,
 } from "../src/topics";
 import { IN_REPLY_TO_MAX_CHARS, MAX_FILE_SIZE } from "../src/chat/limits";
 import { failureDetails } from "../src/chat/failures";
@@ -74,21 +70,6 @@ import {
 } from "../src/named-topics";
 import { handlePollNext, handleAckCommand } from "../src/poll";
 import { handleSessionRequest, MAX_SESSIONS } from "../src/sessions";
-import {
-  sendMessage,
-  editMessageText,
-  sendPhoto,
-  sendDocument,
-  createTelegramClient,
-  createForumTopic,
-  editForumTopic,
-  closeForumTopic,
-  reopenForumTopic,
-  deleteForumTopic,
-  unpinAllForumTopicMessages,
-  logTelegramCall,
-  TELEGRAM_SLOW_CALL_MS,
-} from "../src/telegram";
 import { withD1, StorageError } from "../src/d1";
 import d1Schema from "../src/d1-schema.sql?raw";
 import { handleTopicLookup } from "../src/topic-lookup";
@@ -623,7 +604,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
     slack("chat.postMessage", posted("CALERTS"));
 
     // The alert goes to the first allowlisted chat, here the workspace's `#alerts`.
-    const testEnv = envWith([hwMachine], { ALLOWED_CHAT_IDS: slackChatId(hwMachine.ws) });
+    const testEnv = envWith([hwMachine]);
     const result = await checkSessionHighWaterAlert(env.DB, testEnv, {
       maxSessions,
       thresholdRatio: 0.8,
@@ -662,7 +643,7 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
 
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    const testEnv = envWith([hwMachine], { ALLOWED_CHAT_IDS: slackChatId(hwMachine.ws) });
+    const testEnv = envWith([hwMachine]);
     // Should NOT throw
     await expect(
       checkSessionHighWaterAlert(env.DB, testEnv, {
@@ -675,6 +656,69 @@ describe("session cap and high-water alert (pigeon-bea)", () => {
     fetchMock.deactivate();
     expect(spy).toHaveBeenCalled();
     spy.mockRestore();
+  });
+
+  describe("goes to every configured workspace's #alerts, once per team", () => {
+    const overCap = async () => {
+      await seedSession("devbox"); // so the table is never empty
+      const initialRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sessions").first<{ count: number }>();
+      return Math.max(1, initialRow?.count ?? 0);
+    };
+
+    beforeEach(() => {
+      resetSlackCalls();
+      fetchMock.activate();
+      fetchMock.disableNetConnect();
+    });
+
+    afterEach(() => {
+      fetchMock.get("https://slack.com").cleanMocks();
+      fetchMock.deactivate();
+      vi.restoreAllMocks();
+    });
+
+    test("two machines on one team and a third on another: two posts, one per team, each to its own #alerts", async () => {
+      const teamA = `TA${stamp()}`.toUpperCase();
+      const a1 = await mkSlackMachine({ teamId: teamA });
+      const a2 = await mkSlackMachine({ teamId: teamA });
+      const b = await mkSlackMachine();
+      const alertsA = await seedAlerts(a1.ws);
+      const alertsB = await seedAlerts(b.ws);
+      slack("chat.postMessage", posted(alertsA));
+      slack("chat.postMessage", posted(alertsB));
+
+      const cap = await overCap();
+      const result = await checkSessionHighWaterAlert(env.DB, envWith([a1, a2, b]), { maxSessions: cap, thresholdRatio: 0.5 });
+
+      expect(result.alerted).toBe(true);
+      expect(slackOf("chat.postMessage").map((c) => c.params.get("channel")).sort()).toEqual([alertsA, alertsB].sort());
+    });
+
+    test("one workspace failing does not stop the others; the cron never throws", async () => {
+      const a = await mkSlackMachine();
+      const b = await mkSlackMachine();
+      const alertsA = await seedAlerts(a.ws);
+      const alertsB = await seedAlerts(b.ws);
+      // The first workspace's post fails (and its plain retry), the second's goes through.
+      slack("chat.postMessage", { ok: false, error: "fatal_error" }, 500);
+      slack("chat.postMessage", posted(alertsB));
+      vi.spyOn(console, "error").mockImplementation(() => {});
+
+      const cap = await overCap();
+      const result = await checkSessionHighWaterAlert(env.DB, envWith([a, b]), { maxSessions: cap, thresholdRatio: 0.5 });
+
+      expect(result.alerted).toBe(true);
+      expect(slackOf("chat.postMessage").map((c) => c.params.get("channel"))).toEqual([alertsA, alertsB]);
+    });
+
+    test("no workspace configured: nothing is posted, alerted is false, and it says so", async () => {
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const cap = await overCap();
+      const result = await checkSessionHighWaterAlert(env.DB, env, { maxSessions: cap, thresholdRatio: 0.5 });
+      expect(result.alerted).toBe(false);
+      expect(slackCalls).toHaveLength(0);
+      expect(String(spy.mock.calls[0]?.[0])).toContain("no Slack workspace is configured");
+    });
   });
 });
 
@@ -1046,36 +1090,6 @@ describe("POST /topics/lookup", () => {
 
 // ─── Notification: Unit Tests ──────────────────────────────────────────
 
-describe("isAllowedChatId", () => {
-  it("allows a chat ID in the allowlist", () => {
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: "123,456,789" } as Env;
-    expect(isAllowedChatId("456", testEnv)).toBe(true);
-    expect(isAllowedChatId(456, testEnv)).toBe(true);
-  });
-
-  it("rejects a chat ID not in the allowlist", () => {
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: "123,456" } as Env;
-    expect(isAllowedChatId("999", testEnv)).toBe(false);
-  });
-
-  it("denies all when ALLOWED_CHAT_IDS is empty", () => {
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: "" } as Env;
-    expect(isAllowedChatId("123", testEnv)).toBe(false);
-  });
-
-  it("denies all when ALLOWED_CHAT_IDS is undefined", () => {
-    const testEnv = { ...env } as Env;
-    delete (testEnv as Record<string, unknown>).ALLOWED_CHAT_IDS;
-    expect(isAllowedChatId("123", testEnv)).toBe(false);
-  });
-
-  it("handles whitespace in the allowlist", () => {
-    const testEnv = { ...env, ALLOWED_CHAT_IDS: " 123 , 456 " } as Env;
-    expect(isAllowedChatId("123", testEnv)).toBe(true);
-    expect(isAllowedChatId("456", testEnv)).toBe(true);
-  });
-});
-
 describe("generateToken", () => {
   it("returns a base64url string of ~16 characters", () => {
     const token = generateToken();
@@ -1087,30 +1101,6 @@ describe("generateToken", () => {
   it("generates unique tokens", () => {
     const tokens = new Set(Array.from({ length: 50 }, () => generateToken()));
     expect(tokens.size).toBe(50);
-  });
-});
-
-describe("topicsEnabled", () => {
-  it("returns true when TELEGRAM_TOPICS_ENABLED is 'true'", () => {
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true" } as Env)).toBe(true);
-  });
-
-  it("returns false when TELEGRAM_TOPICS_ENABLED is 'false'", () => {
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "false" } as Env)).toBe(false);
-  });
-
-  it("returns false when TELEGRAM_TOPICS_ENABLED is absent / undefined", () => {
-    expect(topicsEnabled({} as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: undefined } as Env)).toBe(false);
-  });
-
-  it("returns false for messy, truthy, or non-matching inputs", () => {
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "TRUE" } as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "1" } as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "" } as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "   " } as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true " } as Env)).toBe(false);
-    expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "yes" } as Env)).toBe(false);
   });
 });
 
@@ -1331,510 +1321,6 @@ describe("POST /notifications/send", () => {
 });
 
 
-// ─── Telegram Client Module Classifier ─────────────────────────────────────
-
-describe("telegram client module classifier", () => {
-  beforeEach(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-  });
-
-  afterEach(() => {
-    fetchMock.deactivate();
-  });
-
-  it("sendMessage succeeds", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: 42 } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
-    expect(res).toEqual({
-      ok: true,
-      result: { message_id: 42 },
-    });
-  });
-
-  it("sendMessage classifies 429 rate_limited with retry_after", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        429,
-        JSON.stringify({
-          ok: false,
-          error_code: 429,
-          description: "Too Many Requests: retry after 30",
-          parameters: { retry_after: 30 },
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      );
-
-    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
-    expect(res).toEqual({
-      ok: false,
-      kind: "rate_limited",
-      retryAfter: 30,
-      response: {
-        ok: false,
-        error_code: 429,
-        description: "Too Many Requests: retry after 30",
-        parameters: { retry_after: 30 },
-      },
-    });
-  });
-
-  it("sendMessage classifies thread_not_found", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        400,
-        JSON.stringify({
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: message thread not found",
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      );
-
-    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
-    expect(res).toEqual({
-      ok: false,
-      kind: "thread_not_found",
-      response: {
-        ok: false,
-        error_code: 400,
-        description: "Bad Request: message thread not found",
-      },
-    });
-  });
-
-  it("sendMessage classifies plain 400 as kind error", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(
-        400,
-        JSON.stringify({
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: chat not found",
-        }),
-        { headers: { "Content-Type": "application/json" } },
-      );
-
-    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
-    expect(res).toEqual({
-      ok: false,
-      kind: "error",
-      errorCode: 400,
-      description: "Bad Request: chat not found",
-      response: {
-        ok: false,
-        error_code: 400,
-        description: "Bad Request: chat not found",
-      },
-    });
-  });
-
-  it("classifies non-JSON 502 response and generates synthetic details", async () => {
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(502, "Bad Gateway", { headers: { "Content-Type": "text/html" } });
-
-    const res = await sendMessage(env.TELEGRAM_BOT_TOKEN, { chatId: "123", text: "hello" });
-    expect(res).toEqual({
-      ok: false,
-      kind: "error",
-      errorCode: 502,
-      description: undefined,
-      response: undefined,
-    });
-
-    const details = failureDetails(res);
-    expect(details).toEqual({
-      ok: false,
-      description: undefined,
-      error_code: 502,
-    });
-  });
-
-  it("failureDetails extracts raw response body when present", () => {
-    const rawBody = { ok: false, error_code: 400, description: "Bad Request: chat not found" };
-    const details = failureDetails({
-      ok: false,
-      kind: "error",
-      errorCode: 400,
-      description: "Bad Request: chat not found",
-      response: rawBody,
-    });
-    expect(details).toBe(rawBody);
-  });
-
-  describe("createTelegramClient factory and forum topic methods", () => {
-    it("createTelegramClient binds botToken and provides all methods", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(
-          200,
-          JSON.stringify({
-            ok: true,
-            result: {
-              message_thread_id: 101,
-              name: "Bound Topic",
-              icon_color: 7322096,
-            },
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const client = createTelegramClient(env.TELEGRAM_BOT_TOKEN);
-      expect(typeof client.sendMessage).toBe("function");
-      expect(typeof client.editMessageText).toBe("function");
-      expect(typeof client.sendPhoto).toBe("function");
-      expect(typeof client.sendDocument).toBe("function");
-      expect(typeof client.createForumTopic).toBe("function");
-      expect(typeof client.editForumTopic).toBe("function");
-      expect(typeof client.closeForumTopic).toBe("function");
-      expect(typeof client.reopenForumTopic).toBe("function");
-      expect(typeof client.deleteForumTopic).toBe("function");
-      expect(typeof client.unpinAllForumTopicMessages).toBe("function");
-
-      const res = await client.createForumTopic({ chatId: "-10012345", name: "Bound Topic" });
-      expect(res).toEqual({
-        ok: true,
-        result: {
-          message_thread_id: 101,
-          name: "Bound Topic",
-          icon_color: 7322096,
-        },
-      });
-    });
-
-    it("createForumTopic success shape with optional parameters", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(
-          200,
-          JSON.stringify({
-            ok: true,
-            result: {
-              message_thread_id: 42,
-              name: "Feature Topic",
-              icon_color: 16766590,
-              icon_custom_emoji_id: "emoji_123",
-            },
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await createForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        name: "Feature Topic",
-        iconColor: 16766590,
-        iconCustomEmojiId: "emoji_123",
-      });
-
-      expect(res).toEqual({
-        ok: true,
-        result: {
-          message_thread_id: 42,
-          name: "Feature Topic",
-          icon_color: 16766590,
-          icon_custom_emoji_id: "emoji_123",
-        },
-      });
-    });
-
-    it("createForumTopic error classification path", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(
-          400,
-          JSON.stringify({
-            ok: false,
-            error_code: 400,
-            description: "Bad Request: TOPIC_NAME_INVALID",
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await createForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        name: "",
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "error",
-        errorCode: 400,
-        description: "Bad Request: TOPIC_NAME_INVALID",
-        response: {
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: TOPIC_NAME_INVALID",
-        },
-      });
-    });
-
-    it("editForumTopic success shape", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const res = await editForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-        name: "Renamed Topic",
-        iconCustomEmojiId: "emoji_456",
-      });
-
-      expect(res).toEqual({ ok: true, result: true });
-    });
-
-    it("editForumTopic error classification path (rate limited)", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/editForumTopic/ })
-        .reply(
-          429,
-          JSON.stringify({
-            ok: false,
-            error_code: 429,
-            description: "Too Many Requests: retry after 15",
-            parameters: { retry_after: 15 },
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await editForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-        name: "Renamed Topic",
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "rate_limited",
-        retryAfter: 15,
-        response: {
-          ok: false,
-          error_code: 429,
-          description: "Too Many Requests: retry after 15",
-          parameters: { retry_after: 15 },
-        },
-      });
-    });
-
-    it("closeForumTopic success shape", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const res = await closeForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({ ok: true, result: true });
-    });
-
-    it("closeForumTopic error classification path (thread_not_found)", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(
-          400,
-          JSON.stringify({
-            ok: false,
-            error_code: 400,
-            description: "Bad Request: message thread not found",
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await closeForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 999,
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "thread_not_found",
-        response: {
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: message thread not found",
-        },
-      });
-    });
-
-    it("reopenForumTopic success shape", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const res = await reopenForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({ ok: true, result: true });
-    });
-
-    it("reopenForumTopic topic_not_modified classification path", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/reopenForumTopic/ })
-        .reply(
-          400,
-          JSON.stringify({
-            ok: false,
-            error_code: 400,
-            description: "Bad Request: TOPIC_NOT_MODIFIED",
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await reopenForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "topic_not_modified",
-        response: {
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: TOPIC_NOT_MODIFIED",
-        },
-      });
-    });
-
-    it("deleteForumTopic success shape", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, JSON.stringify({ ok: true, result: true }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      const res = await deleteForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({ ok: true, result: true });
-    });
-
-    it("deleteForumTopic error classification path", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(
-          400,
-          JSON.stringify({
-            ok: false,
-            error_code: 400,
-            description: "Bad Request: TOPIC_NOT_FOUND",
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await deleteForumTopic(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "error",
-        errorCode: 400,
-        description: "Bad Request: TOPIC_NOT_FOUND",
-        response: {
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: TOPIC_NOT_FOUND",
-        },
-      });
-    });
-
-    it("unpinAllForumTopicMessages posts chat_id + message_thread_id and returns success shape", async () => {
-      let payload: any = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(200, (opts: any) => {
-          const raw =
-            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          payload = JSON.parse(raw);
-          return { ok: true, result: true };
-        });
-
-      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({ ok: true, result: true });
-      expect(payload).toEqual({ chat_id: "-10012345", message_thread_id: 42 });
-    });
-
-    it("unpinAllForumTopicMessages error classification path", async () => {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(
-          400,
-          JSON.stringify({
-            ok: false,
-            error_code: 400,
-            description: "Bad Request: not enough rights to unpin a message",
-          }),
-          { headers: { "Content-Type": "application/json" } },
-        );
-
-      const res = await unpinAllForumTopicMessages(env.TELEGRAM_BOT_TOKEN, {
-        chatId: "-10012345",
-        messageThreadId: 42,
-      });
-
-      expect(res).toEqual({
-        ok: false,
-        kind: "error",
-        errorCode: 400,
-        description: "Bad Request: not enough rights to unpin a message",
-        response: {
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: not enough rights to unpin a message",
-        },
-      });
-    });
-  });
-});
-
-// The allowed Telegram chat (vitest.config.ts) that the surviving Telegram-egress tests post into.
-const CHAT_ID_NUM = 8248645256;
-
 // ─── Command Queue + Alarm: Integration ───────────────────────────────
 
 describe("command queue lifecycle", () => {
@@ -2034,10 +1520,6 @@ describe("media endpoints", () => {
 // ─── /interrupt Command: Integration Tests ──────────────────────────────
 
 // ─── /compact Command: Integration Tests ─────────────────────────────
-
-// ─── Telegram Media: Unit Tests ───────────────────────────────────────
-
-// ─── Telegram Media: Integration Tests ───────────────────────────────
 
 // ─── Outbound Media: POST /notifications/send with media ──────────────
 
@@ -3336,26 +2818,6 @@ function hasUnpairedSurrogate(s: string): boolean {
 }
 
 describe("topics module and topicName", () => {
-  describe("topicsEnabled", () => {
-    it("returns true only for exact string 'true'", () => {
-      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "true" })).toBe(true);
-      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "false" })).toBe(false);
-      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "TRUE" })).toBe(false);
-      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "1" })).toBe(false);
-      expect(topicsEnabled({ TELEGRAM_TOPICS_ENABLED: "" })).toBe(false);
-      expect(topicsEnabled({})).toBe(false);
-    });
-  });
-
-  describe("constants", () => {
-    it("exports machine icon colors and default color", () => {
-      expect(MACHINE_ICON_COLORS.devbox).toBe(7322096);
-      expect(MACHINE_ICON_COLORS.cloudbox).toBe(9367192);
-      expect(MACHINE_ICON_COLORS.macbook).toBe(13338331);
-      expect(DEFAULT_ICON_COLOR).toBe(16766590);
-    });
-  });
-
   describe("topicName formatting and surrogate clamping", () => {
     it("passes short dir and title through unchanged in title · dir order", () => {
       expect(topicName("pigeon", "Fix flaky auth test")).toBe("Fix flaky auth test · pigeon");
@@ -3649,7 +3111,6 @@ describe("topics module and topicName", () => {
 
   describe("deleteTopicBySession scoping and reaper counter honesty (pigeon-5o7)", () => {
     const chatId = "-1001234567890";
-    const botToken = "fake-bot-token";
 
     beforeEach(() => {
       fetchMock.activate();
@@ -3721,58 +3182,20 @@ describe("topics module and topicName", () => {
          VALUES (?, 'devbox', ?, NULL, 'reap null topic', 'closed', ?, ?, ?)`
       ).bind(sessionId, chatId, closedLongAgo, closedLongAgo, closedLongAgo).run();
 
-      const res = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
+      const res = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
       expect(res.reaped).toBe(1);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row).toBeNull();
-    });
-
-    it("5. Reaper counter honesty: a reaper delete that no-ops does not inflate reaped counter", async () => {
-      await env.DB.prepare("DELETE FROM topics").run();
-      const sessionId = "ses_5o7_reap_honesty";
-      const oldThreadId = 885504;
-      const newThreadId = 885505;
-      const now = Date.now();
-      const closedLongAgo = now - REAP_TTL_MS - 10000;
-
-      await env.DB.prepare(
-        `INSERT INTO topics (session_id, machine_id, chat_id, message_thread_id, name, state, created_at, updated_at, closed_at)
-         VALUES (?, 'devbox', ?, ?, 'reap honesty topic', 'closed', ?, ?, ?)`
-      ).bind(sessionId, chatId, oldThreadId, closedLongAgo, closedLongAgo, closedLongAgo).run();
-
-      // Mock deleteForumTopic, but concurrently update the topic's thread ID in D1 before deleteTopicBySession runs
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, async () => {
-          // Simulate concurrent topic recreation / update to newThreadId
-          await env.DB.prepare("UPDATE topics SET message_thread_id = ? WHERE session_id = ?")
-            .bind(newThreadId, sessionId)
-            .run();
-          return { ok: true, result: true };
-        });
-
-      const res = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS });
-
-      // Because deleteTopicBySession was scoped to oldThreadId, it no-ops on the newThreadId row and returns false.
-      // Therefore reaped must NOT be incremented.
-      expect(res.reaped).toBe(0);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).not.toBeNull();
-      expect(row?.message_thread_id).toBe(newThreadId);
     });
   });
 
   describe("topic manager resolveTopic", () => {
     // Provider results are scripted through an injected transport (Slack-shaped addresses).
     const topicChatId = "slack:TTOPICMGR";
-    const FAKE_TOKEN = "fake-bot-token";
 
     it("two concurrent resolveTopic calls -> exactly one createForumTopic, both get same thread id", async () => {
       const sessionId = "ses_topic_concurrent";
-      const botToken = FAKE_TOKEN;
 
       const { client, calls } = fakeTransport({
         createForumTopic: () => ({
@@ -3790,7 +3213,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "test",
-          botToken,
           delayFn: noopDelay,
           transport: client,
         }),
@@ -3800,7 +3222,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "test",
-          botToken,
           delayFn: noopDelay,
           transport: client,
         }),
@@ -3809,10 +3230,6 @@ describe("topics module and topicName", () => {
       expect(calls.createForumTopic).toHaveLength(1);
       expect(res1).toMatchObject({ ok: true, messageThreadId: 101 });
       expect(res2).toMatchObject({ ok: true, messageThreadId: 101 });
-      // Exactly one caller created the topic, so exactly one carries `created` (pigeon-ud6s):
-      // whichever won the reserve.
-      const createdFlags = [res1, res2].map((r) => (r as any).created === true);
-      expect(createdFlags.filter(Boolean)).toHaveLength(1);
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(101);
@@ -3820,7 +3237,6 @@ describe("topics module and topicName", () => {
 
     it("slow winner -> loser polls to success and shares thread id", async () => {
       const sessionId = "ses_topic_slow_winner";
-      const botToken = FAKE_TOKEN;
 
       let pollCount = 0;
 
@@ -3840,7 +3256,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "slow",
-        botToken,
         delayFn: async () => {
           pollCount++;
           if (pollCount === 2) {
@@ -3856,7 +3271,6 @@ describe("topics module and topicName", () => {
 
     it("winner never finalizes -> loser exhausts bound -> General fallback", async () => {
       const sessionId = "ses_topic_never_finalizes";
-      const botToken = FAKE_TOKEN;
 
       // Winner reserves but never finalizes
       await reserve(env.DB, {
@@ -3878,7 +3292,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "stuck",
-        botToken,
         delayFn: customDelay,
         pollAttempts: 5,
       });
@@ -3893,7 +3306,6 @@ describe("topics module and topicName", () => {
     // defer to. That path sent to General in silence.
     it("lost finalize CAS with no winner row warns that the notification will go to General", async () => {
       const sessionId = "ses_bit4_warn_no_winner";
-      const botToken = FAKE_TOKEN;
 
       const { client, calls } = fakeTransport({
         createForumTopic: async () => {
@@ -3915,7 +3327,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "no winner",
-          botToken,
           transport: client,
         });
 
@@ -3935,7 +3346,6 @@ describe("topics module and topicName", () => {
     // exactly the kind of load that produced the incident, and it returned null in silence.
     it("poll exhaustion warns that the notification will go to General", async () => {
       const sessionId = "ses_bit4_warn_poll_exhausted";
-      const botToken = FAKE_TOKEN;
 
       await reserve(env.DB, {
         sessionId,
@@ -3953,7 +3363,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "exhausted",
-          botToken,
           delayFn: async () => {},
           pollAttempts: 2,
         });
@@ -3971,7 +3380,6 @@ describe("topics module and topicName", () => {
 
     it("create rejects (non-429) -> reservation row gone -> next resolveTopic wins and creates", async () => {
       const sessionId = "ses_topic_create_rejects";
-      const botToken = FAKE_TOKEN;
 
       let call = 0;
       const { client } = fakeTransport({
@@ -3987,7 +3395,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err",
-        botToken,
         transport: client,
       });
 
@@ -4008,11 +3415,10 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err",
-        botToken,
         transport: client,
       });
 
-      expect(res2).toEqual({ ok: true, messageThreadId: 303, created: true });
+      expect(res2).toEqual({ ok: true, messageThreadId: 303 });
       expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(303);
     });
 
@@ -4029,7 +3435,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err520",
-        botToken: FAKE_TOKEN,
         transport: client,
       });
 
@@ -4055,7 +3460,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "err400",
-        botToken: FAKE_TOKEN,
         transport: client,
       });
 
@@ -4086,7 +3490,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "other",
-        botToken: FAKE_TOKEN,
       });
 
       expect(res).toEqual({
@@ -4108,7 +3511,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "rate",
-        botToken: FAKE_TOKEN,
         transport: client,
       });
 
@@ -4141,14 +3543,13 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "fresh",
-        botToken: FAKE_TOKEN,
         now,
         delayFn: async () => {},
         transport: client,
       });
 
       expect(calls.createForumTopic).toHaveLength(1);
-      expect(res).toEqual({ ok: true, messageThreadId: 404, created: true });
+      expect(res).toEqual({ ok: true, messageThreadId: 404 });
 
       const row = await getBySession(env.DB, sessionId);
       expect(row?.message_thread_id).toBe(404);
@@ -4176,7 +3577,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "cas",
-        botToken: FAKE_TOKEN,
         transport: client,
       });
 
@@ -4189,7 +3589,6 @@ describe("topics module and topicName", () => {
 
     describe("Task T2.6: Reopen-on-closed", () => {
       const sessionId = "ses_closed_topic";
-      const botToken = FAKE_TOKEN;
 
       it("resolving a state='closed' topic calls reopenForumTopic and flips state to open", async () => {
         const now = Date.now();
@@ -4206,7 +3605,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "closed",
-          botToken,
           now: now + 1000,
           transport: client,
         });
@@ -4233,7 +3631,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "closed 429",
-          botToken,
           now: now + 1000,
           transport: client,
         });
@@ -4258,7 +3655,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "closed not mod",
-          botToken,
           now: now + 1000,
           transport: client,
         });
@@ -4285,7 +3681,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "closed rights err",
-          botToken,
           now: now + 1000,
           transport: client,
         });
@@ -4299,7 +3694,6 @@ describe("topics module and topicName", () => {
 
     describe("Task T2.7: Stale-thread recovery in resolveTopic", () => {
       const sessionId = "ses_reopen_stale";
-      const botToken = FAKE_TOKEN;
 
       it("reopenForumTopic returns thread_not_found -> deletes stale D1 row and recreates topic", async () => {
         const now = Date.now();
@@ -4319,12 +3713,11 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "pigeon",
           title: "stale closed",
-          botToken,
           now: now + 1000,
           transport: client,
         });
 
-        expect(res).toEqual({ ok: true, messageThreadId: 701, created: true });
+        expect(res).toEqual({ ok: true, messageThreadId: 701 });
 
         const row = await getBySession(env.DB, sessionId);
         expect(row?.message_thread_id).toBe(701);
@@ -4333,7 +3726,6 @@ describe("topics module and topicName", () => {
     });
 
     describe("pigeon-353p: provisional names and the one-shot upgrade rename", () => {
-      const botToken = "fake-bot-token";
 
       /**
        * These tests inject a fake transport rather than using `fetchMock`.
@@ -4408,7 +3800,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "New session - 2026-08-11T10:11:16.127Z",
-          botToken,
           transport: tg.client,
         });
 
@@ -4428,7 +3819,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4448,7 +3838,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "PR review using .lgtm-review-prompt.md",
-          botToken,
           transport: tg.client,
         });
 
@@ -4470,7 +3859,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/protos/.worktrees/pr-698",
           title: "A drifted TUI title",
-          botToken,
           transport: tg.client,
         });
         expect(res2).toEqual({ ok: true, messageThreadId: 902 });
@@ -4491,7 +3879,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "New session - 2026-08-11T10:11:16.127Z",
-          botToken,
           transport: tg.client,
         });
 
@@ -4513,7 +3900,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4539,7 +3925,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4560,7 +3945,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4579,7 +3963,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4604,7 +3987,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4627,7 +4009,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           transport: tg.client,
         });
 
@@ -4647,7 +4028,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           now: now + 1000,
           transport: tg.client,
         });
@@ -4672,7 +4052,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           now: now + 1000,
           transport: tg.client,
         });
@@ -4697,7 +4076,6 @@ describe("topics module and topicName", () => {
           chatId: topicChatId,
           dir: "/home/dev/projects/pigeon",
           title: "Real title",
-          botToken,
           now: now + 1000,
           transport: tg.client,
         });
@@ -5348,411 +4726,6 @@ describe("topics module and topicName", () => {
     });
   });
 
-  // Telegram-only behaviour (the topics flag, an unparseable 200 with no error code, a rate limit on
-  // topic creation, which Slack treats as a hold): kept until the Telegram transport is deleted.
-  describe("Telegram-only leftovers of the topic delivery tests", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-    let msgCounter = 850000;
-    const nextMsgId = () => ++msgCounter;
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-      delete (env as any).TELEGRAM_TOPICS_ENABLED;
-    });
-
-    it("flag off: TELEGRAM_TOPICS_ENABLED unset -> sendMessage payload has no message_thread_id", async () => {
-      const sessionId = "ses_t25_flag_off";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      let sentPayload: any = null;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sentPayload = JSON.parse(raw);
-          return { ok: true, result: { message_id: nextMsgId() } };
-        });
-
-      const res = await sendNotification({
-        sessionId,
-        chatId: topicChatId,
-        text: "Task completed",
-        title: "Feature complete",
-        dir: "pigeon",
-        threaded: true,
-      });
-
-      expect(res.status).toBe(200);
-      expect(sentPayload).not.toBeNull();
-      expect(sentPayload.message_thread_id).toBeUndefined();
-
-      // Verify no topic created in D1
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("flag on + topic resolution rate limited -> returns 429 with retryAfter", async () => {
-      const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-      const sessionId = "ses_t25_rate_limited";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 25 } });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Task completed",
-          title: "My Topic",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(429);
-      const json = await res.json();
-      expect(json).toEqual({ error: "rate_limited", retryAfter: 25 });
-    });
-
-    it("undefined errorCode on a topic send -> returns 502 and does NOT fall back to General", async () => {
-      const sessionId = "ses_bit4_undef_no_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · undef", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 521, now });
-
-      const sentThreadIds: Array<number | undefined> = [];
-
-      for (let i = 0; i < 2; i++) {
-        fetchMock
-          .get("https://api.telegram.org")
-          .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-          .reply((opts: any) => {
-            const body = JSON.parse(opts.body as string);
-            sentThreadIds.push(body.message_thread_id);
-            // HTTP 200 with an unparseable body -> errorCode stays undefined.
-            return {
-              statusCode: 200,
-              data: "<html>not json</html>",
-              responseOptions: { headers: { "Content-Type": "text/html" } },
-            };
-          });
-      }
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Ambiguous outcome must not be relocated",
-          title: "undef",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(502);
-      expect(sentThreadIds).toEqual([521]);
-      // Must NOT be 400: see the comment on the 5xx case above.
-      const body521 = (await res.json()) as { details?: { error_code?: number } };
-      expect(body521.details?.error_code).toBeUndefined();
-    });
-
-    it("429 createForumTopic failure -> returns 429 with retryAfter and does NOT call sendMessage", async () => {
-      const sessionId = "ses_t28_429_create_no_send";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(429, { ok: false, error_code: 429, parameters: { retry_after: 20 } });
-
-      let sendMessageCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, () => {
-          sendMessageCalled = true;
-          return { ok: true, result: { message_id: 1111 } };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Rate limit on create topic",
-          title: "rate limit create",
-          dir: "pigeon",
-          threaded: true,
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, testEnv, request);
-
-      expect(res.status).toBe(429);
-      const json = await res.json();
-      expect(json).toEqual({ error: "rate_limited", retryAfter: 20 });
-      expect(sendMessageCalled).toBe(false); // Crucial assertion: no sendMessage call made
-    });
-
-    it("flag off -> sendPhoto and sendDocument do NOT carry message_thread_id", async () => {
-      const sessionId = "ses_t29_flag_off_media";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const imageKey = `media_test/img_off_${Date.now()}.png`;
-
-      const uploadForm1 = new FormData();
-      uploadForm1.append("key", imageKey);
-      uploadForm1.append("mime", "image/png");
-      uploadForm1.append("filename", "screenshot.png");
-      uploadForm1.append("file", new Blob(["png_data"], { type: "image/png" }), "screenshot.png");
-      await SELF.fetch("https://worker/media/upload", {
-        method: "POST",
-        body: uploadForm1,
-        headers: { Authorization: `Bearer ${API_KEY}` },
-      });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, JSON.stringify({ ok: true, result: { message_id: 2000 } }), {
-          headers: { "Content-Type": "application/json" },
-        });
-
-      let photoThreadId: string | null = null;
-      let photoCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendPhoto/ })
-        .reply((opts: any) => {
-          photoCalled = true;
-          if (opts.body instanceof FormData) {
-            photoThreadId = opts.body.get("message_thread_id") as string | null;
-          } else if (typeof opts.body === "string" || opts.body instanceof Uint8Array) {
-            const str = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-            const match = str.match(/name="message_thread_id"\r?\n\r?\n(\d+)/);
-            photoThreadId = match ? match[1] : null;
-          }
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: { message_id: 2001 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const request = new Request("https://worker/notifications/send", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({
-          sessionId,
-          chatId: topicChatId,
-          text: "Notification with photo with flag off",
-          title: "Media Topic",
-          dir: "pigeon",
-          threaded: true,
-          media: [{ key: imageKey, mime: "image/png", filename: "screenshot.png" }],
-        }),
-      });
-
-      const res = await handleSendNotification(env.DB, env, request);
-
-      expect(res.status).toBe(200);
-      expect(photoCalled).toBe(true);
-      expect(photoThreadId).toBeNull();
-    });
-
-    it("T2.10 (d) flag OFF -> topic row is left completely untouched (still state='open') and zero Telegram calls", async () => {
-      const sessionId = "ses_t210_case_d";
-      await registerSession(sessionId, "devbox", "pigeon");
-
-      const now = Date.now();
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · unreg d", now });
-      await finalize(env.DB, { sessionId, messageThreadId: 61004, now });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const request = new Request("https://worker/sessions/unregister", {
-        method: "POST",
-        headers: authHeaders,
-        body: JSON.stringify({ sessionId }),
-      });
-
-      const res = await handleSessionRequest(env.DB, env, request, "unregister");
-      expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true });
-
-      expect(telegramCalled).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.state).toBe("open");
-      expect(row?.closed_at).toBeNull();
-    });
-  });
-
-  describe("pigeon-ud6s: unpin Telegram's auto-pin of the first message in a new topic", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-
-    beforeEach(() => {
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-      delete (env as any).TELEGRAM_TOPICS_ENABLED;
-    });
-
-    function mockCreateTopic(threadId: number) {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, () => ({
-          ok: true,
-          result: { message_thread_id: threadId, name: "unpin · pigeon" },
-        }))
-        .persist();
-    }
-
-    let unpinMsgCounter = 960000;
-
-    function mockSendMessage() {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(200, () => ({ ok: true, result: { message_id: ++unpinMsgCounter } }))
-        .persist();
-    }
-
-    function captureUnpin(status = 200, body: unknown = { ok: true, result: true }) {
-      const payloads: any[] = [];
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/unpinAllForumTopicMessages/ })
-        .reply(status, (opts: any) => {
-          const raw =
-            typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          payloads.push(JSON.parse(raw));
-          return body;
-        })
-        .persist();
-      return payloads;
-    }
-
-    function notify(sessionId: string, text: string) {
-      return handleSendNotification(
-        env.DB,
-        testEnv,
-        new Request("https://worker/notifications/send", {
-          method: "POST",
-          headers: authHeaders,
-          body: JSON.stringify({
-            sessionId,
-            chatId: topicChatId,
-            text,
-            title: "unpin",
-            dir: "pigeon",
-            threaded: true,
-          }),
-        }),
-      );
-    }
-
-    it("newly created topic -> unpinAllForumTopicMessages called once with the new thread id", async () => {
-      const sessionId = "ses_ud6s_new_topic";
-      await registerSession(sessionId, "devbox", "pigeon");
-      mockCreateTopic(931);
-      mockSendMessage();
-      const unpins = captureUnpin();
-
-      const res = await notify(sessionId, "first message in a brand new topic");
-
-      expect(res.status).toBe(200);
-      expect(unpins).toHaveLength(1);
-      expect(unpins[0].message_thread_id).toBe(931);
-      expect(String(unpins[0].chat_id)).toBe(topicChatId);
-    });
-
-    it("existing topic -> no unpin call on subsequent notifications", async () => {
-      const sessionId = "ses_ud6s_existing_topic";
-      await registerSession(sessionId, "devbox", "pigeon");
-      mockCreateTopic(932);
-      mockSendMessage();
-      const unpins = captureUnpin();
-
-      await notify(sessionId, "first");
-      expect(unpins).toHaveLength(1);
-
-      const res = await notify(sessionId, "second");
-
-      expect(res.status).toBe(200);
-      expect(unpins).toHaveLength(1); // still 1: no unpin on reuse
-    });
-
-    it("unpin failure does not fail the notification", async () => {
-      const sessionId = "ses_ud6s_unpin_fails";
-      await registerSession(sessionId, "devbox", "pigeon");
-      mockCreateTopic(933);
-      mockSendMessage();
-      const unpins = captureUnpin(500, { ok: false, error_code: 500, description: "oops" });
-
-      const res = await notify(sessionId, "unpin will fail");
-
-      expect(res.status).toBe(200);
-      expect(unpins).toHaveLength(1);
-    });
-
-    it("fallback to General (no thread) -> no unpin call", async () => {
-      const sessionId = "ses_ud6s_general_fallback";
-      await registerSession(sessionId, "devbox", "pigeon");
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/createForumTopic/ })
-        .reply(200, () => ({
-          ok: false,
-          error_code: 400,
-          description: "Bad Request: FORUM_CLOSED",
-        }))
-        .persist();
-      mockSendMessage();
-      const unpins = captureUnpin();
-
-      const res = await notify(sessionId, "goes to General");
-
-      expect(res.status).toBe(200);
-      expect(unpins).toHaveLength(0);
-    });
-  });
-
   describe("Task T2.10: Unregister topic closing", () => {
     let um: SlackMachine;
     let uEnv: Env;
@@ -5886,8 +4859,6 @@ describe("topics module and topicName", () => {
   describe("Task T2.11: Topic reaper cron jobs", () => {
     // Rows live in a Slack workspace; the provider is a scripted fake transport.
     const topicChatId = "slack:TREAPER";
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-    const botToken = "fake-bot-token";
 
     beforeEach(async () => {
       await env.DB.prepare("DELETE FROM topics").run();
@@ -5905,10 +4876,9 @@ describe("topics module and topicName", () => {
       await markClosed(env.DB, { sessionId, now: closedAt });
 
       const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
 
       expect(result.reaped).toBe(1);
-      expect(result.rateLimited).toBe(false);
       expect(calls.deleteForumTopic).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
@@ -5926,10 +4896,9 @@ describe("topics module and topicName", () => {
       await markClosed(env.DB, { sessionId, now: closedAt });
 
       const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
 
       expect(result.reaped).toBe(0);
-      expect(result.rateLimited).toBe(false);
       expect(Object.values(calls).flat()).toEqual([]);
 
       const row = await getBySession(env.DB, sessionId);
@@ -5950,7 +4919,7 @@ describe("topics module and topicName", () => {
       }
 
       const { client } = fakeTransport();
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, limit: 5, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, limit: 5, transport: client });
 
       expect(result.reaped).toBe(5);
       const left = await env.DB.prepare("SELECT COUNT(*) AS n FROM topics WHERE session_id LIKE 'ses_t211_reap_cap_%'").first<{ n: number }>();
@@ -5966,7 +4935,7 @@ describe("topics module and topicName", () => {
       await markClosed(env.DB, { sessionId, now: closedAt });
 
       const { client, calls } = fakeTransport();
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, transport: client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, transport: client });
 
       expect(result.reaped).toBe(1);
       expect(Object.values(calls).flat()).toEqual([]);
@@ -5984,7 +4953,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 8 * 86400 * 1000 });
 
       const { client, calls } = fakeTransport();
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(result.closedOrphans).toBe(1);
       expect(result.rateLimited).toBe(false);
@@ -6008,7 +4977,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: oldTime });
 
       const { client, calls } = fakeTransport();
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(result.closedOrphans).toBe(1);
       expect(result.rateLimited).toBe(false);
@@ -6030,7 +4999,7 @@ describe("topics module and topicName", () => {
       await finalize(env.DB, { sessionId, messageThreadId: threadId, now: now - 1000 });
 
       const { client, calls } = fakeTransport();
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(result.closedOrphans).toBe(0);
       expect(result.rateLimited).toBe(false);
@@ -6051,7 +5020,7 @@ describe("topics module and topicName", () => {
       }
 
       const { client, calls } = fakeTransport();
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5, transport: client });
+      const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, limit: 5, transport: client });
 
       expect(result.closedOrphans).toBe(5);
       expect(calls.closeForumTopic).toHaveLength(5);
@@ -6064,7 +5033,7 @@ describe("topics module and topicName", () => {
       await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · null thread orphan", now: now - 8 * 86400 * 1000 });
 
       const { client, calls } = fakeTransport();
-      const result = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const result = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(result.closedOrphans).toBe(1);
       expect(Object.values(calls).flat()).toEqual([]);
@@ -6083,7 +5052,7 @@ describe("topics module and topicName", () => {
       }
 
       const { client, calls } = fakeTransport({ closeForumTopic: () => results.rateLimited(10) });
-      const result = await runTopicReaper(env.DB, testEnv, { now, transport: client });
+      const result = await runTopicReaper(env.DB, { now, transport: client });
 
       expect(result.rateLimited).toBe(true);
       expect(result.reaped).toBe(0);
@@ -6094,202 +5063,9 @@ describe("topics module and topicName", () => {
     });
   });
 
-  // Telegram-only reaper behaviour (a delete call per reaped topic, thread-not-found on that delete, a
-  // 429 on it, the topics flag): kept until the Telegram branch of the reaper is deleted.
-  describe("Telegram-only leftovers of the topic reaper tests", () => {
-    const topicChatId = String(CHAT_ID_NUM);
-    const testEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env;
-    const botToken = "fake-bot-token";
-
-    beforeEach(async () => {
-      await env.DB.prepare("DELETE FROM topics").run();
-      await env.DB.prepare("DELETE FROM sessions WHERE session_id LIKE 'ses_t211_%'").run();
-      fetchMock.activate();
-      fetchMock.disableNetConnect();
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    });
-
-    afterEach(() => {
-      fetchMock.deactivate();
-    });
-
-    it("(a) reap deletes a closed topic older than 30d: deleteForumTopic called, D1 row gone", async () => {
-      const sessionId = "ses_t211_reap_old";
-      const threadId = 62001;
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000); // older than 30d
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap old", now: closedAt - 1000 });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
-      await markClosed(env.DB, { sessionId, now: closedAt });
-
-      let deletedThreadId: number | undefined;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply((opts: any) => {
-          const body = JSON.parse(opts.body as string);
-          deletedThreadId = body.message_thread_id;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
-
-      expect(result.reaped).toBe(1);
-      expect(result.rateLimited).toBe(false);
-      expect(deletedThreadId).toBe(threadId);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("(c) reap on thread_not_found still deletes the D1 row", async () => {
-      const sessionId = "ses_t211_reap_not_found";
-      const threadId = 62003;
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000);
-
-      await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · reap not found", now: closedAt - 1000 });
-      await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
-      await markClosed(env.DB, { sessionId, now: closedAt });
-
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(200, { ok: false, error_code: 400, description: "Bad Request: message thread not found" });
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS });
-
-      expect(result.reaped).toBe(1);
-      expect(result.rateLimited).toBe(false);
-
-      const row = await getBySession(env.DB, sessionId);
-      expect(row).toBeNull();
-    });
-
-    it("(d) reap cap: with 8 eligible rows, at most 5 are processed in one run", async () => {
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000);
-
-      for (let i = 0; i < 8; i++) {
-        const sessionId = `ses_t211_reap_cap_${i}`;
-        const threadId = 62010 + i;
-        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · cap ${i}`, now: closedAt - 1000 });
-        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
-        await markClosed(env.DB, { sessionId, now: closedAt });
-      }
-
-      let deleteCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(() => {
-          deleteCalls++;
-          return {
-            statusCode: 200,
-            data: JSON.stringify({ ok: true, result: true }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        })
-        .persist();
-
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, limit: 5 });
-
-      expect(result.reaped).toBe(5);
-      expect(deleteCalls).toBe(5);
-    });
-
-    it("(j) rate_limited response stops the run early", async () => {
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000);
-
-      for (let i = 0; i < 2; i++) {
-        const sessionId = `ses_t211_rate_reap_${i}`;
-        const threadId = 62040 + i;
-        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: topicChatId, name: `pigeon · rate reap ${i}`, now: closedAt - 1000 });
-        await finalize(env.DB, { sessionId, messageThreadId: threadId, now: closedAt - 500 });
-        await markClosed(env.DB, { sessionId, now: closedAt });
-      }
-
-      const orphanSessionId = "ses_t211_rate_orphan";
-      await reserve(env.DB, { sessionId: orphanSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · rate orphan", now: now - 8 * 86400 * 1000 });
-      await finalize(env.DB, { sessionId: orphanSessionId, messageThreadId: 62045, now: now - 8 * 86400 * 1000 });
-
-      let telegramCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/deleteForumTopic/ })
-        .reply(() => {
-          telegramCalls++;
-          return {
-            statusCode: 429,
-            data: JSON.stringify({ ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 10 } }),
-            responseOptions: { headers: { "Content-Type": "application/json" } },
-          };
-        });
-
-      let closeCalls = 0;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/closeForumTopic/ })
-        .reply(() => {
-          closeCalls++;
-          return { statusCode: 200, data: JSON.stringify({ ok: true, result: true }) };
-        });
-
-      const result = await runTopicReaper(env.DB, testEnv, { now });
-
-      expect(result.rateLimited).toBe(true);
-      expect(result.reaped).toBe(0);
-      expect(result.closedOrphans).toBe(0);
-      expect(telegramCalls).toBe(1);
-      expect(closeCalls).toBe(0);
-    });
-
-    it("(k) flag OFF -> zero Telegram calls and no topic rows modified", async () => {
-      const now = Date.now();
-      const closedAt = now - (REAP_TTL_MS + 1000);
-
-      const reapSessionId = "ses_t211_flag_off_reap";
-      await reserve(env.DB, { sessionId: reapSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · flag off reap", now: closedAt - 1000 });
-      await finalize(env.DB, { sessionId: reapSessionId, messageThreadId: 62050, now: closedAt - 500 });
-      await markClosed(env.DB, { sessionId: reapSessionId, now: closedAt });
-
-      const orphanSessionId = "ses_t211_flag_off_orphan";
-      await reserve(env.DB, { sessionId: orphanSessionId, machineId: "devbox", chatId: topicChatId, name: "pigeon · flag off orphan", now: now - 8 * 86400 * 1000 });
-      await finalize(env.DB, { sessionId: orphanSessionId, messageThreadId: 62051, now: now - 8 * 86400 * 1000 });
-
-      let telegramCalled = false;
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*/ })
-        .reply(() => {
-          telegramCalled = true;
-          return { statusCode: 200, data: JSON.stringify({ ok: true }) };
-        });
-
-      const offEnv = { ...env, TELEGRAM_TOPICS_ENABLED: "false" } as Env;
-      const result = await runTopicReaper(env.DB, offEnv, { now });
-
-      expect(result).toEqual({ reaped: 0, closedOrphans: 0, rateLimited: false });
-      expect(telegramCalled).toBe(false);
-
-      const reapRow = await getBySession(env.DB, reapSessionId);
-      expect(reapRow).not.toBeNull();
-
-      const orphanRow = await getBySession(env.DB, orphanSessionId);
-      expect(orphanRow?.state).toBe("open");
-    });
-  });
-
   describe("F1 Defect Fixes: sticky-closed topics and reaper liveness check", () => {
     // Rows live in a Slack workspace; the provider is a scripted fake transport.
     const topicChatId = "slack:TF1DEFECTS";
-    const botToken = "fake-bot-token";
 
     beforeEach(async () => {
       await env.DB.prepare("DELETE FROM topics").run();
@@ -6313,7 +5089,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "not modified",
-        botToken,
         now: now + 1000,
         transport: client,
       });
@@ -6342,7 +5117,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "429",
-        botToken,
         now: now + 1000,
         transport: limited.client,
       });
@@ -6371,12 +5145,11 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "tnf",
-        botToken,
         now: now + 1000,
         transport: gone.client,
       });
 
-      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId, created: true });
+      expect(resTnf).toEqual({ ok: true, messageThreadId: newThreadId });
       const rowTnf = await getBySession(env.DB, sessionIdTnf);
       expect(rowTnf?.message_thread_id).toBe(newThreadId);
       expect(rowTnf?.state).toBe("open");
@@ -6397,7 +5170,7 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", now - 1000, now - 1000).run();
 
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(0);
       const row = await getBySession(env.DB, sessionId);
@@ -6417,7 +5190,7 @@ describe("topics module and topicName", () => {
 
       // No sessions row created
 
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(1);
       const row = await getBySession(env.DB, sessionId);
@@ -6439,7 +5212,7 @@ describe("topics module and topicName", () => {
         "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)"
       ).bind(sessionId, "devbox", "pigeon", staleSessionTime, staleSessionTime).run();
 
-      const result = await reapTopics(env.DB, { botToken, now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
+      const result = await reapTopics(env.DB, { now, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: fakeTransport().client });
 
       expect(result.reaped).toBe(1);
       const row = await getBySession(env.DB, sessionId);
@@ -6471,7 +5244,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "generic e2e",
-        botToken,
         now: t0 + 1000,
         transport: client,
       });
@@ -6487,7 +5259,7 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(reapRes.reaped).toBe(0);
 
@@ -6519,7 +5291,6 @@ describe("topics module and topicName", () => {
         chatId: topicChatId,
         dir: "pigeon",
         title: "not mod e2e",
-        botToken,
         now: t0 + 1000,
         transport: client,
       });
@@ -6535,7 +5306,7 @@ describe("topics module and topicName", () => {
       // Session receives notifications and stays fresh
       await env.DB.prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?").bind(t30d - 1000, sessionId).run();
 
-      const reapRes = await reapTopics(env.DB, { botToken, now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const reapRes = await reapTopics(env.DB, { now: t30d, reapTtlMs: REAP_TTL_MS, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
 
       expect(reapRes.reaped).toBe(0);
 
@@ -6561,7 +5332,7 @@ describe("topics module and topicName", () => {
       });
 
       const now = t0 + 1000;
-      const res1 = await closeOrphanedTopics(env.DB, { botToken, now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const res1 = await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
       expect(calls.closeForumTopic).toHaveLength(1);
       expect(res1.closedOrphans).toBe(1);
 
@@ -6570,7 +5341,7 @@ describe("topics module and topicName", () => {
       expect(row?.closed_at).not.toBeNull();
 
       // The point of the fix: a SECOND run must not re-select it, so it cannot pin one of the 5 slots.
-      const res2 = await closeOrphanedTopics(env.DB, { botToken, now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+      const res2 = await closeOrphanedTopics(env.DB, { now: now + 1000, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
       expect(res2.closedOrphans).toBe(0);
       expect(calls.closeForumTopic).toHaveLength(1);
     });
@@ -6591,11 +5362,11 @@ describe("topics module and topicName", () => {
 
       // With a 1-day liveness cutoff the session reads as dead, so the reaper MUST reap.
       // If orphanTtlMs is not forwarded, reapTopics falls back to 7d, sees a live session, and reaps nothing.
-      const res = await runTopicReaper(
-        env.DB,
-        { TELEGRAM_TOPICS_ENABLED: "true", TELEGRAM_BOT_TOKEN: botToken },
-        { now: t0, orphanTtlMs: 24 * 60 * 60 * 1000, transport: fakeTransport().client },
-      );
+      const res = await runTopicReaper(env.DB, {
+        now: t0,
+        orphanTtlMs: 24 * 60 * 60 * 1000,
+        transport: fakeTransport().client,
+      });
 
       expect(res.reaped).toBe(1);
       expect(await getBySession(env.DB, sessionId)).toBeNull();
@@ -6613,11 +5384,6 @@ describe("topics module and topicName", () => {
     let wm: SlackMachine;
     let wEnv: Env;
     let topicChatId = "";
-    const botToken = "fake-bot-token";
-    const testEnv = {
-      TELEGRAM_TOPICS_ENABLED: "true",
-      TELEGRAM_BOT_TOKEN: botToken,
-    };
 
     beforeEach(async () => {
       resetSlackCalls();
@@ -6691,7 +5457,7 @@ describe("topics module and topicName", () => {
       await seedOrphan("ses_4890_gated", now);
 
       const { client, calls } = fakeTransport();
-      const res = await runTopicReaper(env.DB, testEnv, { now, closeOrphans: false, transport: client });
+      const res = await runTopicReaper(env.DB, { now, closeOrphans: false, transport: client });
 
       expect(res.closedOrphans).toBe(0);
       expect(calls.closeForumTopic).toHaveLength(0);
@@ -6708,7 +5474,7 @@ describe("topics module and topicName", () => {
       }
 
       const { client } = fakeTransport();
-      const res = await runTopicReaper(env.DB, testEnv, { now, transport: client });
+      const res = await runTopicReaper(env.DB, { now, transport: client });
 
       // >= rather than ==: earlier cases in this describe leave their own orphans behind, and
       // the point of the assertion is that ONE run drains more than the old cap of 5.
@@ -6724,7 +5490,7 @@ describe("topics module and topicName", () => {
       await seedOrphan(sessionId, now);
       const srv = fakeSlack();
 
-      const cronEnv = { ...wEnv, ...testEnv } as Env;
+      const cronEnv = wEnv;
       const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
@@ -6743,7 +5509,7 @@ describe("topics module and topicName", () => {
       const channelId = await seedOrphan(sessionId, now);
       const srv = fakeSlack();
 
-      const cronEnv = { ...wEnv, ...testEnv } as Env;
+      const cronEnv = wEnv;
       const ctx = createExecutionContext();
       await worker.scheduled(
         { scheduledTime: now, cron: "0 * * * *", noRetry: () => {} } as ScheduledController,
@@ -6772,9 +5538,6 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
   });
 
   afterEach(() => {
-    // Also sweeps interceptors the Telegram-only tests above leave unconsumed, which the Telegram
-    // timing tests below would otherwise pick up.
-    fetchMock.get("https://api.telegram.org").cleanMocks();
     fetchMock.deactivate();
   });
 
@@ -7260,103 +6023,6 @@ describe("dispatch boundary outcome log and error catch (5a-T2)", () => {
  */
 // ─── /tag command ─────────────────────────────────────────────────────
 
-// ─── Per-call Telegram latency (pigeon-malt) ─────────────────────────────
-
-describe("per-call Telegram timing (pigeon-malt)", () => {
-  beforeEach(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-  });
-
-  afterEach(() => {
-    try {
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    } catch {}
-    fetchMock.deactivate();
-    vi.restoreAllMocks();
-  });
-
-  it("logs one line per call naming the method and a numeric elapsedMs", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: 1 } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    await sendMessage("tok", { chatId: 1, text: "hi" });
-
-    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
-    expect(calls).toHaveLength(1);
-    const payload = calls[0][1] as { method: string; elapsedMs: number; outcome: string };
-    expect(payload.method).toBe("sendMessage");
-    expect(typeof payload.elapsedMs).toBe("number");
-    expect(payload.elapsedMs).toBeGreaterThanOrEqual(0);
-    expect(payload.outcome).toBe("ok");
-  });
-
-  it("never puts the bot token (or the URL carrying it) in the log payload", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: true, result: { message_id: 1 } }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    await sendMessage("SUPERSECRETTOKEN", { chatId: 1, text: "hi" });
-
-    const serialized = JSON.stringify(logSpy.mock.calls);
-    expect(serialized).not.toContain("SUPERSECRETTOKEN");
-    expect(serialized).not.toContain("api.telegram.org");
-  });
-
-  it("records the outcome kind for a failed call, not just ok/not-ok", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(400, JSON.stringify({ ok: false, error_code: 400, description: "message thread not found" }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    await sendMessage("tok", { chatId: 1, text: "hi", messageThreadId: 9 });
-
-    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
-    expect(calls).toHaveLength(1);
-    expect((calls[0][1] as { outcome: string }).outcome).toBe("thread_not_found");
-  });
-
-  it("still times and logs a call that THROWS, and rethrows unchanged", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const boom = new Error("connection reset");
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .replyWithError(boom);
-
-    await expect(sendMessage("tok", { chatId: 1, text: "hi" })).rejects.toThrow("connection reset");
-
-    const calls = logSpy.mock.calls.filter((c) => String(c[0]).includes("telegram call"));
-    expect(calls).toHaveLength(1);
-    expect((calls[0][1] as { outcome: string }).outcome).toBe("threw");
-  });
-
-  it("escalates to console.warn once a call crosses the slow threshold", () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
-    logTelegramCall("sendMessage", TELEGRAM_SLOW_CALL_MS - 1, "ok");
-    expect(logSpy).toHaveBeenCalledTimes(1);
-    expect(warnSpy).toHaveBeenCalledTimes(0);
-
-    logTelegramCall("sendMessage", TELEGRAM_SLOW_CALL_MS, "ok");
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(logSpy).toHaveBeenCalledTimes(1);
-  });
-});
-
 // ─── Relocation alert (pigeon-t5bd) ──────────────────────────────────────
 
 describe("relocation alert (pigeon-t5bd)", () => {
@@ -7472,75 +6138,7 @@ describe("relocation alert (pigeon-t5bd)", () => {
   });
 });
 
-// Telegram-only: the relocation alert's Telegram branch (a General thread, an allowlisted operator chat).
-describe("relocation alert, Telegram branch (pigeon-t5bd)", () => {
-  const topicChatId = String(CHAT_ID_NUM);
-  const testEnv = {
-    ...env,
-    TELEGRAM_TOPICS_ENABLED: "true",
-    ALLOWED_CHAT_IDS: `555000111,${topicChatId}`,
-  } as Env;
-
-  it("says so loudly when there is nowhere to send the alert", async () => {
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const noChatEnv = { ...testEnv, ALLOWED_CHAT_IDS: "" } as Env;
-
-    const sent = await alertRelocation(noChatEnv, createTelegramClient("tok"), {
-      sessionId: "ses_t5bd_nowhere",
-      chatId: topicChatId,
-      messageId: 1,
-      reason: "poll_exhausted",
-    });
-
-    expect(sent).toBe(false);
-    expect(errSpy.mock.calls.some((c) => String(c[0]).includes("relocation alert"))).toBe(true);
-  });
-});
-
 // ─── Unparseable 200 base rate (pigeon-jahv) ─────────────────────────────
-
-describe("unparseable 200 measurement (pigeon-jahv)", () => {
-  beforeEach(() => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-    try {
-      fetchMock.get("https://api.telegram.org").cleanMocks();
-    } catch {}
-  });
-
-  afterEach(() => {
-    fetchMock.deactivate();
-    vi.restoreAllMocks();
-  });
-
-  it("warns when Telegram returns 200 with a body that yields no error_code", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, "<html>truncated", { headers: { "Content-Type": "text/html" } });
-
-    const res = await sendMessage("tok", { chatId: 1, text: "hi" });
-    expect(res.ok).toBe(false);
-
-    const hit = warnSpy.mock.calls.find((c) => String(c[0]).includes("unparseable 200"));
-    expect(hit).toBeDefined();
-    expect(hit![1]).toMatchObject({ method: "sendMessage" });
-  });
-
-  it("does not warn for an ordinary Telegram error that carries a code", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-      .reply(200, JSON.stringify({ ok: false, error_code: 400, description: "Bad Request" }), {
-        headers: { "Content-Type": "application/json" },
-      });
-
-    await sendMessage("tok", { chatId: 1, text: "hi" });
-    expect(warnSpy.mock.calls.find((c) => String(c[0]).includes("unparseable 200"))).toBeUndefined();
-  });
-});
 
 // ─── Named topics (POST /topics/named) ─────────────────────────────────
 
@@ -7689,8 +6287,8 @@ describe("named topics", () => {
        VALUES (?, ?, ?, 'n', ?, ?)`,
     ).bind(CHAT, nextKey(), thread, now - 60 * 86400 * 1000, now - 60 * 86400 * 1000).run();
     const { client, calls } = fakeTransport();
-    await closeOrphanedTopics(env.DB, { botToken: "t", now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
-    await reapTopics(env.DB, { botToken: "t", now, transport: client });
+    await closeOrphanedTopics(env.DB, { now, orphanTtlMs: ORPHAN_TTL_MS, transport: client });
+    await reapTopics(env.DB, { now, transport: client });
     expect(calls.closeForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
     expect(calls.deleteForumTopic.filter((c) => c.messageThreadId === thread)).toHaveLength(0);
   });
@@ -7707,27 +6305,6 @@ describe("named topics", () => {
     expect(sends).toHaveLength(1);
     expect(sends[0]!.params.get("channel")).toBe(channelId);
     expect(sends[0]!.params.get("text")).toContain(NAMED_TOPIC_HINT_TEXT);
-  });
-});
-
-// Telegram-only: the topics flag on the named-topic route.
-describe("named topics, Telegram-only", () => {
-  test("topics-disabled is a 409 (the flag is Telegram's)", async () => {
-    const res = await handleNamedTopic(env.DB, env as Env, new Request("https://worker/topics/named", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ chatId: String(CHAT_ID_NUM), key: "test:named-flag-off", name: "n" }),
-    }));
-    expect(res.status).toBe(409);
-  });
-
-  test("a chat outside the allowlist is 403", async () => {
-    const res = await handleNamedTopic(env.DB, { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env, new Request("https://worker/topics/named", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ chatId: "-1009999", key: "test:named-disallowed", name: "n" }),
-    }));
-    expect(res.status).toBe(403);
   });
 });
 
@@ -8006,20 +6583,5 @@ describe("named topic binding", () => {
     } as unknown as D1Database;
     await expect(getBindingForSession(failing, "ses_x")).rejects.toThrow(/Network connection lost/);
     await expect(getBoundSessionByThread(failing, "1", 2)).rejects.toThrow(/Network connection lost/);
-  });
-});
-
-// Telegram-only: the topics flag and the allowlist on the bind route.
-describe("named topic binding, Telegram-only", () => {
-  const bindTg = (chatId: string, e: Env) =>
-    handleNamedTopicBind(env.DB, e, new Request("https://worker/topics/named/bind", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ chatId, key: "valid_key", name: "n", sessionId: "ses_valid" }),
-    }));
-
-  test("a chat outside the allowlist is 403 and topics-disabled is 409", async () => {
-    expect((await bindTg("-1009999", { ...env, TELEGRAM_TOPICS_ENABLED: "true" } as Env)).status).toBe(403);
-    expect((await bindTg(String(CHAT_ID_NUM), env as Env)).status).toBe(409);
   });
 });

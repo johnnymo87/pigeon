@@ -1,8 +1,7 @@
 /**
  * The Slack Web API client (bead pigeon-4ogz.3; plan docs/plans/2026-11-20-slack-outbound-plan.md,
- * "Slack API client"). The worker's only door to Slack, as `src/telegram.ts` is its only door to
- * Telegram: the egress guard test (`test/slack-egress.test.ts`) fails if Slack's host appears in
- * any other source file. A new call belongs here, as a function, so it is timed, logged and
+ * "Slack API client"). The worker's only door to Slack: the egress guard test
+ * (`test/slack-egress.test.ts`) fails if Slack's host appears in any other source file. A new call belongs here, as a function, so it is timed, logged and
  * error-mapped like the rest.
  *
  * Results are mapped onto `ChatResult` because the worker's seam (`./chat/transport.ts`) is
@@ -64,7 +63,7 @@ const REJECTED_ERRORS = new Set([
 
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
 
-/** A Slack call at or above this many milliseconds is logged at `warn` (same rule as Telegram). */
+/** A Slack call at or above this many milliseconds is logged at `warn` (a coarser filter than a numeric predicate over a structured field). */
 export const SLACK_SLOW_CALL_MS = 5_000;
 
 /**
@@ -156,7 +155,7 @@ async function mapResponse<T>(res: Response, method: string, rateLimitIsTransien
 
   if (body === null) {
     // A 200 whose body will not parse: Slack may well have processed the call, so this is
-    // retried like any transient fault (the duplicate is the better-placed risk, as for Telegram).
+    // retried like any transient fault (the duplicate is the better-placed risk).
     console.warn("[worker] slack unparseable response", { method, status: res.status });
     return upstream("unparseable_response");
   }
@@ -187,7 +186,7 @@ async function mapResponse<T>(res: Response, method: string, rateLimitIsTransien
 /**
  * The single place a Slack Web API call is made, so the timing cannot be bypassed.
  *
- * Same contract as `callTelegram`: the clock is in a `finally` so a call that throws is timed
+ * The clock is in a `finally` so a call that throws is timed
  * too, `elapsedMs` covers reading the body, and a thrown fetch (a transport fault, or an abort)
  * propagates for the caller's boundary to deal with. A non-throwing failure is returned, mapped.
  */

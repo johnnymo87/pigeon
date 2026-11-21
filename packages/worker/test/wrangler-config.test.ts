@@ -15,4 +15,21 @@ describe("wrangler.toml observability configuration", () => {
 
     expect(blockContent).toMatch(/^\s*enabled\s*=\s*true\b/m);
   });
+
+  test("Telegram's vars are gone from [vars] (the deployed values are inert and removed in the dashboard)", () => {
+    const code = wranglerToml
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("#"))
+      .join("\n");
+    for (const name of [
+      "ALLOWED_CHAT_IDS",
+      "TELEGRAM_TOPICS_ENABLED",
+      "TELEGRAM_RICH_MESSAGES",
+      "TELEGRAM_BOT_TOKEN",
+    ]) {
+      expect(code).not.toContain(name);
+    }
+    // keep_vars must stay on: it is what keeps the dashboard-set SLACK_* vars.
+    expect(code).toMatch(/^keep_vars\s*=\s*true\b/m);
+  });
 });

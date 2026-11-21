@@ -70,7 +70,6 @@ async function mkBox(opts: { online?: boolean } = {}): Promise<Box> {
   }
   const boxEnv = {
     ...env,
-    TELEGRAM_TOPICS_ENABLED: "true",
     [slackSecretKeyForMachine(machineId)]: JSON.stringify(ws),
   } as unknown as Env;
   return { machineId, ws, chat: slackChatId(ws), env: boxEnv };

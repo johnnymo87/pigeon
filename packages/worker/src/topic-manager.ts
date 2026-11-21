@@ -13,27 +13,21 @@ import {
   reserve,
   stealReservation,
   topicName,
-  MACHINE_ICON_COLORS,
-  DEFAULT_ICON_COLOR,
   type TopicRow,
 } from "./topics";
 
 export type ResolveTopicResult =
-  // `created` is true only on the path that both created the Telegram topic AND won the
-  // finalize CAS for it — i.e. exactly one caller per topic ever sees it. Callers use it to
-  // clear Telegram's auto-pin of the first message posted into a new topic (pigeon-ud6s).
-  | { ok: true; messageThreadId: number; created?: boolean }
+  | { ok: true; messageThreadId: number }
   // `reason` names WHY no topic was resolved, so the caller can report the fallback instead of
   // only logging it. These paths write no intended_thread_id, which is exactly why the
   // messages column pair cannot see them (pigeon-t5bd).
   // `transient` indicates whether the resolution failure is transient (true) or permanent (false).
   // When the caller requests `onTopicUnavailable: "retry"`, transient failures are held for retry
   // (returning 502) rather than relocating to General (pigeon-iqpd).
-  // `createError` carries the underlying Telegram error details when topic creation failed.
+  // `createError` carries the underlying provider error details when topic creation failed.
   | {
       ok: true;
       messageThreadId: null;
-      created?: boolean;
       reason?: string;
       transient: boolean;
       createError?: unknown;
@@ -46,7 +40,6 @@ export interface ResolveTopicOptions {
   chatId: string;
   dir: string;
   title: string;
-  botToken: string;
   now?: number;
   delayFn?: (ms: number) => Promise<void>;
   ttlMs?: number;
@@ -56,42 +49,23 @@ export interface ResolveTopicOptions {
   transport?: ChatTransport;
   /** The worker env, which a Slack address needs for its workspace secret. */
   env?: Env;
-  /**
-   * The caller is the session's owning machine, so a row it left in the OTHER transport (a
-   * machine that moved from Telegram to Slack or back) is replaced rather than honoured: the old
-   * row is removed, its conversation closed, and a new one created in `chatId`. Without it, and
-   * for a row in another chat of the SAME transport, the row stays and the notification goes
-   * unthreaded (pigeon-533h). The worker cannot tell a machine's rollout from a foreign machine
-   * on its own, so the handler passes this only for the owner.
-   */
-  supersede?: boolean;
 }
-
-/** How long a superseded conversation's close is awaited before the notification carries on. */
-export const SUPERSEDE_CLOSE_BOUND_MS = 3_000;
-
-/**
- * A row younger than this is never superseded. Worker isolates pick up a changed
- * `SLACK_WORKSPACE_*` secret one at a time, so for a while some resolve a machine to Slack and
- * others to Telegram. Without a floor, each flips the session's conversation back and forth (every
- * flip archives a channel and mints another). A row that young was almost certainly made by the
- * other side of that overlap; the loser answers `topic_in_other_chat` (unthreaded, healed at the
- * next supersede once the rollout settles and the row has aged).
- */
-export const SUPERSEDE_MIN_AGE_MS = 5 * 60_000;
 
 export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. Outbox TOPIC_HOLD_WINDOW_MS (150s in daemon/outbox-sender.ts) must exceed this.
 
 /**
- * Resolves a Telegram forum topic for a session using a reservation protocol with TTL,
+ * Resolves a session's conversation (a Slack channel) using a reservation protocol with TTL,
  * steal CAS, and CAS finalization.
  *
+ * A `topics` row whose chat is not a `slack:` address (a numeric Telegram-era row) is treated as
+ * ABSENT: it is CAS-deleted without a provider call and the conversation is created in Slack as
+ * for a new session. There is no second transport to supersede between.
+ *
  * Residual failure mode note:
- * If the worker isolate dies right after Telegram topic creation (`createForumTopic`)
- * succeeds in Telegram but before `finalize()` updates D1, an orphan Telegram topic
- * exists with no D1 record. Telegram does not provide an idempotent topic creation API,
- * so this residual cannot be avoided without external distributed transactions.
- * Cleanup for this rare edge case is manual.
+ * If the worker isolate dies right after conversation creation (`createForumTopic`) succeeds
+ * but before `finalize()` updates D1, an orphan channel exists with no D1 record. The provider
+ * has no idempotent creation API, so this residual cannot be avoided without external
+ * distributed transactions. Cleanup for this rare edge case is manual.
  */
 export async function resolveTopic(
   db: D1Database,
@@ -125,7 +99,7 @@ export async function resolveTopic(
       row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
     const name = topicName(opts.dir || fallbackDir, title);
 
-    const tgClient = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
+    const tgClient = transportForChat(opts.chatId, slackCtx, opts.transport);
     try {
       const res = await tgClient.editForumTopic({
         chatId: opts.chatId,
@@ -179,82 +153,29 @@ export async function resolveTopic(
     return { ok: true, messageThreadId: null, reason: "topic_in_other_chat", transient: false };
   }
 
-  /** At most one supersede per call: a second foreign row means something is flapping. */
-  let superseded = false;
-
   /**
-   * Replaces a row that lives in the other transport, when the caller may. Returns true when a
-   * supersede was attempted (so the caller re-reads the row: it is gone if the CAS won, and
-   * whatever a rival wrote if it missed), false when the row is to be left alone.
-   *
-   * The delete is the commit point and is chat- and thread-scoped (a CAS), so two isolates
-   * cannot both supersede, and a rival that moved the row meanwhile is not undone. Only the
-   * winner closes the old conversation, through ITS transport, awaited because a Worker may stop
-   * as soon as it responds, but bounded: a slow or dead provider (a deleted Slack secret, say)
-   * must not hold the notification. Close failures are logged and never change the result.
+   * A row in a chat that is not a Slack workspace is a leftover from the Telegram days: no
+   * transport can reach its conversation, so it counts for nothing. Delete it (a CAS scoped to its
+   * own chat and thread, so a rival that moved the row meanwhile is not undone) and let the caller
+   * re-read: the row is gone if the CAS won, and whatever a rival wrote if it missed. No provider
+   * call is made: there is nothing to close.
    */
-  async function maybeSupersede(row: TopicRow): Promise<boolean> {
-    if (!opts.supersede || superseded) return false;
-    if (isSlackChatId(row.chat_id) === isSlackChatId(opts.chatId)) return false;
-    if ((opts.now ?? Date.now()) - row.created_at < SUPERSEDE_MIN_AGE_MS) return false;
-    superseded = true;
+  async function purgeNumericRow(row: TopicRow): Promise<boolean> {
+    if (isSlackChatId(row.chat_id)) return false;
     const deleted = await deleteTopicBySession(db, opts.sessionId, row.chat_id, row.message_thread_id);
-    console.warn("[worker] superseding the session's conversation in the other transport", {
+    console.warn("[worker] dropping a topic row that is not in a Slack workspace", {
       sessionId: opts.sessionId,
       fromChatId: row.chat_id,
       toChatId: opts.chatId,
       messageThreadId: row.message_thread_id,
       deleted,
     });
-    if (deleted && row.message_thread_id !== null) {
-      const threadId = row.message_thread_id;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const old = transportForChat(row.chat_id, opts.botToken, undefined, slackCtx);
-        const closing = old
-          .closeForumTopic({ chatId: row.chat_id, messageThreadId: threadId })
-          .then((res) => {
-            if (!res.ok) {
-              console.warn("[worker] closing the superseded conversation failed", {
-                sessionId: opts.sessionId,
-                chatId: row.chat_id,
-                kind: res.kind,
-              });
-            }
-          })
-          .catch((err) => {
-            console.warn("[worker] closing the superseded conversation threw", {
-              sessionId: opts.sessionId,
-              chatId: row.chat_id,
-              error: String(err),
-            });
-          });
-        const bound = new Promise<void>((resolve) => {
-          timer = setTimeout(() => {
-            console.warn("[worker] closing the superseded conversation timed out", {
-              sessionId: opts.sessionId,
-              chatId: row.chat_id,
-            });
-            resolve();
-          }, SUPERSEDE_CLOSE_BOUND_MS);
-        });
-        await Promise.race([closing, bound]);
-      } catch (err) {
-        console.warn("[worker] closing the superseded conversation threw", {
-          sessionId: opts.sessionId,
-          chatId: row.chat_id,
-          error: String(err),
-        });
-      } finally {
-        if (timer !== undefined) clearTimeout(timer);
-      }
-    }
     return true;
   }
 
   // 1. Existing topic lookup
   let existing = await getBySession(db, opts.sessionId);
-  if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
+  if (existing && (await purgeNumericRow(existing))) {
     existing = await getBySession(db, opts.sessionId);
   }
   if (existing && existing.chat_id !== opts.chatId) {
@@ -262,7 +183,7 @@ export async function resolveTopic(
   }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
-      const tgClient = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
+      const tgClient = transportForChat(opts.chatId, slackCtx, opts.transport);
       // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
       // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
       // Removing this reopen call is tracked as roadmap item 6c.
@@ -335,18 +256,13 @@ export async function resolveTopic(
   const delay =
     opts.delayFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.transport, slackCtx);
+  const tg = transportForChat(opts.chatId, slackCtx, opts.transport);
 
   // Helper for creator flow (executed by initial reserve winner or steal winner)
   async function runCreatorFlow(): Promise<ResolveTopicResult> {
-    const iconColor = opts.machineId
-      ? MACHINE_ICON_COLORS[opts.machineId] ?? DEFAULT_ICON_COLOR
-      : DEFAULT_ICON_COLOR;
-
     const createRes = await tg.createForumTopic({
       chatId: opts.chatId,
       name,
-      iconColor,
       sessionId: opts.sessionId,
     });
 
@@ -362,6 +278,8 @@ export async function resolveTopic(
           retryAfter: createRes.retryAfter,
         };
       }
+      // `no_transport` (a numeric address; unreachable from the routes, which refuse it first) is
+      // permanent: holding it for retry could never help.
       const transient = !isPermanentTopicFailure(createRes);
       const createError = failureDetails(createRes);
       // Non-429 failure -> topic resolution failed (pigeon-bit4: say so; this was silent)
@@ -394,7 +312,7 @@ export async function resolveTopic(
     });
 
     if (finalized) {
-      return { ok: true, messageThreadId: threadId, created: true };
+      return { ok: true, messageThreadId: threadId };
     }
 
     // Lost finalize CAS! Another caller finalized first.
@@ -446,8 +364,8 @@ export async function resolveTopic(
 
   // 3. Loser path. The row that beat our reserve may belong to another chat (pigeon-533h).
   existing = await getBySession(db, opts.sessionId);
-  if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
-    // The row that beat our reserve was the other transport's, and it is gone now: reserve again.
+  if (existing && (await purgeNumericRow(existing))) {
+    // The row that beat our reserve was a numeric leftover, and it is gone now: reserve again.
     if (await reserveHere()) return runCreatorFlow();
     existing = await getBySession(db, opts.sessionId);
   }
@@ -462,7 +380,7 @@ export async function resolveTopic(
   for (let i = 0; i < pollAttempts; i++) {
     await delay(pollIntervalMs);
     existing = await getBySession(db, opts.sessionId);
-    if (existing && existing.chat_id !== opts.chatId && (await maybeSupersede(existing))) {
+    if (existing && (await purgeNumericRow(existing))) {
       if (await reserveHere()) return runCreatorFlow();
       existing = await getBySession(db, opts.sessionId);
     }

@@ -24,7 +24,7 @@
  * two want a `wrangler dev` script rather than vitest.
  */
 import { env, fetchMock, createExecutionContext } from "cloudflare:test";
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import worker from "../src/index";
 import { slackChatId } from "../src/chat/slack-config";
 import { envWith, mkSlackMachine, seedAlerts, type SlackMachine } from "./slack-harness";
@@ -78,13 +78,13 @@ function makePoller(backends: string | undefined) {
  * fail for reasons unrelated to draining.
  */
 let seedClock = Date.now();
-async function seedLaunch(commandId: string, metadataJson: string | null): Promise<void> {
+async function seedLaunch(commandId: string, metadataJson: string | null, chatId: string = CHAT_ID): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO commands (command_id, machine_id, session_id, command_type, command,
                            chat_id, directory, metadata_json, status, created_at)
      VALUES (?, ?, NULL, 'launch', 'do the thing', ?, '/home/dev/projects/pigeon', ?, 'pending', ?)`,
   )
-    .bind(commandId, MACHINE, CHAT_ID, metadataJson, seedClock++)
+    .bind(commandId, MACHINE, chatId, metadataJson, seedClock++)
     .run();
 }
 
@@ -255,6 +255,49 @@ describe("backend capability gate, across the real wire", () => {
     const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
     expect(await poller.poll()).toBeNull();
     expect(await statusOf("cmd-permanent")).toBe("acked");
+  });
+
+  /**
+   * A launch typed in the Telegram days still queued under a numeric chat: there is no transport to
+   * tell the human with. It is not retried (no transport will ever appear) and not an error: the
+   * refusal is only logged, and the command is acked.
+   */
+  it("acks a refused launch of a numeric (Telegram-era) chat with nothing sent, only logged", async () => {
+    const sent: string[] = [];
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
+    await seedLaunch("cmd-numeric", JSON.stringify({ backend: "goose" }), "-1001234567890");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
+    expect(await poller.poll()).toBeNull();
+
+    expect(await statusOf("cmd-numeric")).toBe("acked");
+    expect(sent).toHaveLength(0);
+    expect(errors.mock.calls.some((c) => c[0] === "[poll] refused launch: daemon cannot serve backend")).toBe(true);
+    errors.mockRestore();
+  });
+
+  /** The refusal goes into the command's own thread, with no gate on any flag. */
+  it("posts a refusal into the command's own conversation", async () => {
+    const channels: string[] = [];
+    fetchMock
+      .get("https://slack.com")
+      .intercept({ method: "POST", path: "/api/chat.postMessage" })
+      .reply(200, (opts: { body?: unknown }) => {
+        channels.push(new URLSearchParams(String(opts.body)).get("channel") ?? "");
+        return JSON.stringify({ ok: true, ts: "1700000000.000100", channel: "CTHREADGATE" });
+      }, { headers: { "Content-Type": "application/json" } });
+    await seedLaunch("cmd-thread", JSON.stringify({ backend: "goose" }));
+    await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, 'CTHREADGATE', ?, 1)")
+      .bind(machine.ws.teamId, Date.now())
+      .run();
+    const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE channel_id = 'CTHREADGATE'").first<{ handle: number }>();
+    await env.DB.prepare("UPDATE commands SET message_thread_id = ? WHERE command_id = 'cmd-thread'").bind(row!.handle).run();
+
+    const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
+    expect(await poller.poll()).toBeNull();
+    expect(await statusOf("cmd-thread")).toBe("acked");
+    expect(channels).toEqual(["CTHREADGATE"]);
   });
 
   /**

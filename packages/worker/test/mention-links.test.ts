@@ -1,4 +1,4 @@
-import { env, SELF, fetchMock } from "cloudflare:test";
+import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
 import {
@@ -24,6 +24,7 @@ import {
   stamp,
 } from "./slack-harness";
 
+/** A numeric (Telegram-era) chat id: the rows seeded under it get no link. */
 const CHAT_ID = "-1001234567890";
 const SELF_ID = "ses_aaaaaaaaaaaa1111111111111a";
 const WORKER_A = "ses_e71285defffe4WBGXJlfV2dBZ2";
@@ -136,6 +137,11 @@ describe("resolveMentionKeyboard (Slack rows)", () => {
     expect(kb?.inline_keyboard.map((r: Array<{ text: string }>) => r[0]!.text)).toEqual(["G", "A"]);
   });
 
+  it("does not treat SQL LIKE wildcards in the id as wildcards", async () => {
+    await seedSlackRow("sesXe71285defffe4WBGXJlfV2dBZ2", "not a session");
+    expect(await resolveMentionKeyboard(env.DB, "ses_e71285de", SELF_ID, e)).toBeUndefined();
+  });
+
   it("gives no button for an ambiguous prefix, a missing topic, a reserved row, or a conversation Slack does not know", async () => {
     await seedSlackRow(WORKER_A, "A");
     await seedSlackRow("ses_e71285de0000aaaaaaaaaaaaaa", "A2");
@@ -152,37 +158,10 @@ describe("resolveMentionKeyboard (Slack rows)", () => {
 });
 
 describe("resolveMentionKeyboard", () => {
-  it("[Telegram t.me] links a shortened id to the one topic it prefixes, labelled by title", async () => {
-    await seedTopic(WORKER_A, 77, "Rework goose delivery · ~/projects/pigeon");
-    const kb = await resolveMentionKeyboard(env.DB, "worker ses_e71285de is stuck", SELF_ID);
-    expect(kb).toEqual({
-      inline_keyboard: [[{ text: "Rework goose delivery", url: "https://t.me/c/1234567890/77" }]],
-    });
-  });
-
-  it("[Telegram t.me] links full ids and goose ids, in mention order", async () => {
+  it("a row in a numeric (Telegram-era) chat gets no button, whatever its thread id", async () => {
     await seedTopic(WORKER_A, 77, "A");
-    await seedTopic(GOOSE, 78, "G");
-    const kb = await resolveMentionKeyboard(env.DB, `${GOOSE} then ${WORKER_A}`, SELF_ID);
-    expect(kb?.inline_keyboard.map((r: Array<{ text: string }>) => r[0]!.text)).toEqual(["G", "A"]);
-  });
-
-  it("[Telegram t.me] gives no button for an ambiguous prefix, a missing topic, a reserved row, or a non-supergroup chat", async () => {
-    await seedTopic(WORKER_A, 77, "A");
-    await seedTopic("ses_e71285de0000aaaaaaaaaaaaaa", 79, "A2");
-    await seedTopic(WORKER_B, null, "reserved");
-    await seedTopic("ses_e6000000000000000000000000", 80, "private", "12345");
-    const kb = await resolveMentionKeyboard(
-      env.DB,
-      "ses_e71285de ses_e7000000 ses_e6000000 ses_ffffffff",
-      SELF_ID,
-    );
-    expect(kb).toBeUndefined();
-  });
-
-  it("does not treat SQL LIKE wildcards in the id as wildcards", async () => {
-    await seedTopic("sesXe71285defffe4WBGXJlfV2dBZ2", 81, "not a session");
-    expect(await resolveMentionKeyboard(env.DB, "ses_e71285de", SELF_ID)).toBeUndefined();
+    await seedTopic(WORKER_B, 78, "B", "12345");
+    expect(await resolveMentionKeyboard(env.DB, "ses_e71285de ses_e7000000", SELF_ID)).toBeUndefined();
   });
 
   it("returns undefined when nothing is mentioned, without touching D1", async () => {
@@ -256,65 +235,5 @@ describe("POST /notifications/send adds mention links (Slack)", () => {
     await send({ text: "ses_e71285de?", replyMarkup: own });
     expect(buttons()).toMatchObject([{ type: "button", value: "cmd:tok:v1:q0" }]);
     expect(buttons().some((b) => "url" in b)).toBe(false);
-  });
-});
-
-describe("POST /notifications/send adds mention links (Telegram)", () => {
-  const authHeaders = {
-    "Content-Type": "application/json",
-    Authorization: "Bearer test-api-key",
-  };
-  const SENDER = "mention-sender";
-  const ALLOWED_CHAT = "8248645256";
-
-  beforeEach(async () => {
-    fetchMock.activate();
-    fetchMock.disableNetConnect();
-    const now = Date.now();
-    await env.DB.prepare(
-      "INSERT OR REPLACE INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-    )
-      .bind(SENDER, "machine-1", "coord", now, now)
-      .run();
-    await seedTopic(WORKER_A, 77, "Rework goose delivery · ~/projects/pigeon");
-  });
-
-  afterEach(() => {
-    fetchMock.deactivate();
-  });
-
-  function captureSends(replies: Array<{ status: number; body: unknown }>): any[] {
-    const sent: any[] = [];
-    for (const r of replies) {
-      fetchMock
-        .get("https://api.telegram.org")
-        .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
-        .reply(r.status, (opts: any) => {
-          const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body);
-          sent.push(JSON.parse(raw));
-          return r.body as any;
-        });
-    }
-    return sent;
-  }
-
-  function send(body: Record<string, unknown>): Promise<Response> {
-    return SELF.fetch("https://worker/notifications/send", {
-      method: "POST",
-      headers: authHeaders,
-      body: JSON.stringify({ sessionId: SENDER, chatId: ALLOWED_CHAT, threaded: false, ...body }),
-    });
-  }
-
-  it("resends once without the buttons when Telegram rejects them with a 400", async () => {
-    const sent = captureSends([
-      { status: 400, body: { ok: false, error_code: 400, description: "Bad Request: BUTTON_URL_INVALID" } },
-      { status: 200, body: { ok: true, result: { message_id: 503 } } },
-    ]);
-    const res = await send({ text: "ses_e71285de finished" });
-    expect(res.status).toBe(200);
-    expect(sent.length).toBe(2);
-    expect(sent[0].reply_markup?.inline_keyboard?.length).toBe(1);
-    expect(sent[1].reply_markup).toBeUndefined();
   });
 });

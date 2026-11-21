@@ -4,7 +4,6 @@ import { pollNextCommand, ackCommand, touchMachine } from "./d1-ops";
 import { transportForChat } from "./chat";
 import { handOutRelayItems, SWARM_RELAY_HEADER, type HandOutItem } from "./relay";
 import { handOutLaunchItems, type LaunchHandOut } from "./remote-launch";
-import { topicsEnabled } from "./topics";
 
 /**
  * The capability header a daemon sends to say what it can launch. Spelled
@@ -22,7 +21,7 @@ export const BACKENDS_HEADER = "X-Pigeon-Backends";
 const DEFAULT_BACKEND = "opencode";
 
 /**
- * A refusal costs one Telegram send, and the daemon sleeps ~5s between polls,
+ * A refusal costs one chat send, and the daemon sleeps ~5s between polls,
  * so N queued unservable launches would otherwise take N*5s to drain while any
  * ordinary command created after them waits behind (`pollNextCommand` is
  * LIMIT 1, ORDER BY created_at). Draining a few per poll keeps a burst of
@@ -51,7 +50,7 @@ export function parseAdvertisedBackends(header: string | null): Set<string> {
 }
 
 /**
- * Whether a failed Telegram send is worth retrying.
+ * Whether a failed chat send is worth retrying.
  *
  * This is what decides if a refusal may be acked. Acking after a send that
  * never arrived destroys the command silently -- the precise failure the gate
@@ -61,22 +60,23 @@ export function parseAdvertisedBackends(header: string | null): Set<string> {
  * the row buys 24h of retries nobody can see.
  */
 function isPermanentSendFailure(res: { ok: false; kind: string; errorCode?: number }): boolean {
-  // The chat or topic is gone. Retrying cannot conjure it back.
-  if (res.kind === "thread_not_found" || res.kind === "topic_not_modified") return true;
-  // Telegram asked us to slow down; that is the definition of transient.
+  // The chat or topic is gone. Retrying cannot conjure it back. A numeric (Telegram-era) command
+  // chat has no transport at all: the refusal can never be delivered, so it is only logged.
+  if (res.kind === "thread_not_found" || res.kind === "topic_not_modified" || res.kind === "no_transport") return true;
+  // The provider asked us to slow down; that is the definition of transient.
   if (res.kind === "rate_limited") return false;
   // A missing errorCode does NOT mean the request failed to go out: a genuine
-  // network failure THROWS out of the telegram client, past this function
+  // network failure THROWS out of the transport, past this function
   // entirely, and is turned into a 500 by the router -- which leaves the row
   // leased and retried, the outcome we want, reached by a different road. What
   // lands here without a code is an HTTP 200 carrying a body we could not
-  // parse, i.e. Telegram very likely DID deliver. Treating it as retryable
+  // parse, i.e. the provider very likely DID deliver. Treating it as retryable
   // therefore risks a duplicate refusal rather than a lost one, which is the
   // side to err on and matches how the rest of this worker treats an
-  // unparseable Telegram response.
+  // unparseable provider response.
   if (res.errorCode === undefined) return false;
-  // A 4xx is Telegram refusing on the merits and will refuse identically
-  // forever; a 5xx is Telegram being unwell, which may pass.
+  // A 4xx is the provider refusing on the merits and will refuse identically
+  // forever; a 5xx is the provider being unwell, which may pass.
   return res.errorCode >= 400 && res.errorCode < 500;
 }
 
@@ -216,7 +216,7 @@ async function nextCommand(
     // Stopping rather than continuing is a weak preference, not a guarantee of
     // ordering -- the next poll 5s later will skip this still-leased row and
     // refuse the ones behind it anyway. It buys only that we do not pile up
-    // further sends in the same poll while Telegram is visibly unhappy.
+    // further sends in the same poll while the provider is visibly unhappy.
     if (!acked) {
       return new Response(null, { status: 204 });
     }
@@ -263,11 +263,11 @@ async function refuseUnservableLaunch(
     "The command was dropped; nothing was started. Re-send it once the machine can serve that backend.",
   ].join("\n");
 
-  const tg = transportForChat(info.chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+  const tg = transportForChat(info.chatId, { env, db });
   const res = await tg.sendMessage({
     chatId: info.chatId,
     text,
-    messageThreadId: topicsEnabled(env) ? info.messageThreadId ?? undefined : undefined,
+    messageThreadId: info.messageThreadId ?? undefined,
   });
 
   if (!res.ok && !isPermanentSendFailure(res)) {

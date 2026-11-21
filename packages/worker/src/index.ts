@@ -228,7 +228,7 @@ export default {
       console.error("Session high-water alert failed:", err);
     }
     // Only a worker with a Slack workspace secret has Slack tables to tidy: without one this must
-    // not touch D1 at all (the schema may not even be applied), so Telegram-only stays as it was.
+    // not touch D1 at all (the schema may not even be applied), so a worker with no workspace stays as it was.
     if (hasSlackWorkspaceSecret(env)) {
       try {
         // Best-effort on its own (a missing table is a quiet log line, any other D1 error is
@@ -246,7 +246,7 @@ export default {
       // service message that marks the topic unread; the reap half still runs every tick.
       // `scheduledTime` is the cron tick's own timestamp, so the gate cannot drift with however
       // long the jobs above took.
-      await runTopicReaper(env.DB, env, {
+      await runTopicReaper(env.DB, {
         closeOrphans: shouldCloseOrphans(controller.scheduledTime),
         env,
       });

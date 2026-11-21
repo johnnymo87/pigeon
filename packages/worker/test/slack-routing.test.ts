@@ -1,13 +1,14 @@
 /**
- * Slack address routing, authorization and supersede (bead pigeon-4ogz.3, task 3). Plan:
- * docs/plans/2026-11-20-slack-outbound-plan.md ("Address resolution and authorization",
- * "/notifications/send changes", "resolveTopic supersede", "Named topics") and its review deltas.
+ * Slack address routing and authorization (bead pigeon-4ogz.3, task 3), and what a numeric
+ * (Telegram-era) address now gets (pigeon-4ogz.13). Plan: docs/plans/2026-11-20-slack-outbound-plan.md
+ * ("Address resolution and authorization", "/notifications/send changes", "Named topics") and its
+ * review deltas; docs/plans/2026-11-21-delete-telegram-plan.md decision 3.
  *
  * Handlers are called directly with `{...env, SLACK_WORKSPACE_<MACHINE>: <json>}` and per-machine
- * credentials inserted into `machine_credentials`, so the principal is real. Slack and Telegram
- * are fetchMocks, with `disableNetConnect` and `assertNoPendingInterceptors`, so a missing OR an
- * unexpected provider call fails the test. Every test uses its own machine, team and session ids:
- * the D1 tables are shared by the whole file.
+ * credentials inserted into `machine_credentials`, so the principal is real. Slack is a fetchMock,
+ * with `disableNetConnect` and `assertNoPendingInterceptors`, so a missing OR an unexpected
+ * provider call fails the test. Every test uses its own machine, team and session ids: the D1
+ * tables are shared by the whole file.
  */
 import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
@@ -17,9 +18,9 @@ import { SLACK_HANDLE_MIN, slackChatId, slackSecretKeyForMachine, type SlackWork
 import { handleEditNotification, handleSendNotification } from "../src/notifications";
 import { handleSendMessage, handleUnpinTopic } from "../src/messages";
 import { handleNamedTopic, handleNamedTopicBind } from "../src/named-topics";
-import { resolveTopic, SUPERSEDE_CLOSE_BOUND_MS, SUPERSEDE_MIN_AGE_MS } from "../src/topic-manager";
+import { resolveTopic } from "../src/topic-manager";
 import { finalize, getBySession, reserve } from "../src/topics";
-import { createTelegramClient } from "../src/telegram";
+import { fakeTransport } from "./slack-harness";
 import { authorizeStoredAddress, resolveWorkerTarget } from "../src/chat/address";
 import type { Principal } from "../src/credentials";
 
@@ -33,7 +34,6 @@ beforeEach(() => {
   fetchMock.activate();
   fetchMock.disableNetConnect();
   slackCalls.length = 0;
-  tgCalls.length = 0;
 });
 
 afterEach(() => {
@@ -47,7 +47,7 @@ afterEach(() => {
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
-const ALLOWED = "8248645256"; // ALLOWED_CHAT_IDS in vitest.config.ts
+const ALLOWED = "8248645256"; // a numeric chat id of the Telegram days, as an old daemon still sends it
 const SHARED = "test-api-key";
 
 let counter = 0;
@@ -86,7 +86,7 @@ async function mkMachine(opts: { slack?: boolean; teamId?: string } = {}): Promi
 function envFor(machines: Machine[], extra: Record<string, unknown> = {}): Env {
   const secrets: Record<string, string> = {};
   for (const m of machines) if (m.ws) secrets[slackSecretKeyForMachine(m.machineId)] = JSON.stringify(m.ws);
-  return { ...env, TELEGRAM_TOPICS_ENABLED: "true", ...secrets, ...extra } as unknown as Env;
+  return { ...env, ...secrets, ...extra } as unknown as Env;
 }
 
 function request(path: string, key: string, body: unknown): Request {
@@ -137,26 +137,6 @@ function slack(method: string, reply: Reply, status = 200, headers?: Record<stri
 const slackOf = (method: string) => slackCalls.filter((c) => c.method === method);
 const slackJson = (c: SlackCall | undefined, key: string) => JSON.parse(c?.params.get(key) ?? "null");
 
-interface TgCall {
-  method: string;
-  body: Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-}
-const tgCalls: TgCall[] = [];
-
-/** One expected Telegram Bot API call. */
-function tg(method: string, result: unknown, status = 200, delayMs?: number) {
-  const interceptor = fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
-    .reply(status, (opts: { body?: unknown }) => {
-      const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body as ArrayBuffer);
-      tgCalls.push({ method, body: JSON.parse(raw) });
-      return status === 200 ? { ok: true, result } : (result as Record<string, unknown>);
-    });
-  if (delayMs !== undefined) interceptor.delay(delayMs);
-}
-const tgOf = (method: string) => tgCalls.filter((c) => c.method === method);
-
 /** A conversation this team already has, returning its handle. */
 async function seedChannel(teamId: string, channelId: string): Promise<number> {
   await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, ?, ?, 1)")
@@ -182,18 +162,7 @@ async function seedAlerts(ws: SlackWorkspace): Promise<string> {
 }
 
 /** A session whose topic row already lives in Slack. */
-/**
- * Topic rows are seeded as OLD (10 minutes) so a supersede is allowed to replace them: a row
- * younger than SUPERSEDE_MIN_AGE_MS is deliberately left alone. `ageMs: 0` seeds a fresh one.
- */
-const OLD_ROW_MS = 10 * 60_000;
-async function ageTopic(sessionId: string, ageMs: number) {
-  await env.DB.prepare("UPDATE topics SET created_at = ? WHERE session_id = ?")
-    .bind(Date.now() - ageMs, sessionId)
-    .run();
-}
-
-async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWorkspace, ageMs = OLD_ROW_MS) {
+async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWorkspace) {
   const channelId = `CSESS${stamp()}`.toUpperCase();
   const handle = await seedChannel(ws.teamId, channelId);
   await reserve(env.DB, { sessionId, machineId, chatId: slackChatId(ws), name: "s" });
@@ -204,14 +173,13 @@ async function seedSlackTopic(sessionId: string, machineId: string, ws: SlackWor
     name: "s",
     provisional: false,
   });
-  await ageTopic(sessionId, ageMs);
   return { channelId, handle };
 }
 
-async function seedTelegramTopic(sessionId: string, machineId: string, chatId: string, thread: number, ageMs = OLD_ROW_MS) {
+/** A topic row of the Telegram days: a numeric chat id. `thread: null` is an unfinalized reservation. */
+async function seedNumericTopic(sessionId: string, machineId: string, chatId: string, thread: number | null) {
   await reserve(env.DB, { sessionId, machineId, chatId, name: "tg" });
-  await finalize(env.DB, { sessionId, chatId, messageThreadId: thread, name: "tg", provisional: false });
-  await ageTopic(sessionId, ageMs);
+  if (thread !== null) await finalize(env.DB, { sessionId, chatId, messageThreadId: thread, name: "tg", provisional: false });
 }
 
 async function messageRow(chatId: string, messageId: number) {
@@ -219,9 +187,6 @@ async function messageRow(chatId: string, messageId: number) {
     .bind(chatId, messageId)
     .first<{ chat_id: string; message_id: number; notification_id: string | null }>();
 }
-
-/** Telegram message ids must be unique per chat (the messages table keys on them). */
-const mid = () => 1_000_000 + ++counter;
 
 const posted = (channel = "C1", ts = "1700000000.000100") => ({ ok: true, ts, channel });
 
@@ -274,7 +239,7 @@ describe("/notifications/send routing", () => {
     expect(res.status).toBe(200);
   });
 
-  it("the daemon's stale (even allowlisted) numeric chatId cannot pull a Slack session back to Telegram", async () => {
+  it("the daemon's stale numeric chatId is ignored: the post still goes to the session's Slack channel", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
     const { channelId, handle } = await seedSlackTopic(sessionId, m.machineId, m.ws!);
@@ -287,40 +252,45 @@ describe("/notifications/send routing", () => {
     );
     expect(res.status).toBe(200);
     const body = (await res.json()) as { messageId: number };
-    expect(tgCalls).toHaveLength(0);
     expect((await messageRow(slackChatId(m.ws!), body.messageId))?.chat_id).toBe(slackChatId(m.ws!));
     expect((await getBySession(env.DB, sessionId))?.message_thread_id).toBe(handle);
   });
 
-  it("with no Slack secret nothing changes: Telegram, the same response body, and a slack: chatId is refused", async () => {
+  it("a machine with no workspace gets 503 no_transport, with no retryAfter and no provider call", async () => {
     const m = await mkMachine();
     const sessionId = await seedSession(m.machineId);
-    const id = mid();
-    tg("sendMessage", { message_id: id });
     const res = await handleSendNotification(
       env.DB,
-      envFor([m], { TELEGRAM_TOPICS_ENABLED: "false" }),
+      envFor([m]),
       request("/notifications/send", m.key, sendBody(sessionId, { chatId: ALLOWED })),
     );
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as Record<string, unknown>;
-    expect(Object.keys(body).sort()).toEqual(["messageId", "ok", "token"]);
-    expect(body.messageId).toBe(id);
-    expect(tgCalls[0]?.body.chat_id).toBe(ALLOWED);
-
-    const refused = await handleSendNotification(
-      env.DB,
-      envFor([m]),
-      request("/notifications/send", m.key, sendBody(sessionId, { chatId: "slack:TANY" })),
-    );
-    expect(refused.status).toBe(403);
-    expect(await refused.json()).toEqual({ error: "Chat ID not allowed" });
-
-    const missing = await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId)));
-    expect(missing.status).toBe(400);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ error: "no_transport" });
+    // ...and with no chatId at all (a machine needs none), the same answer, not a 400.
+    const bare = await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId)));
+    expect(bare.status).toBe(503);
+    expect(await bare.json()).toEqual({ error: "no_transport" });
+    expect(slackCalls).toHaveLength(0);
   });
 
-  it("notifyOwner reaches a Slack post as a mention only for an enabled category, and is not sent to Telegram", async () => {
+  it("the shared key can post nowhere: 403 chat_not_allowed, 400 when it names no chat", async () => {
+    const m = await mkMachine({ slack: true });
+    const sessionId = await seedSession(m.machineId);
+    const e = envFor([m]);
+    const numeric = await handleSendNotification(env.DB, e, request("/notifications/send", SHARED, sendBody(sessionId, { chatId: ALLOWED })));
+    expect(numeric.status).toBe(403);
+    expect(await numeric.json()).toEqual({ error: "Chat ID not allowed" });
+    const slackAddr = await handleSendNotification(
+      env.DB,
+      e,
+      request("/notifications/send", SHARED, sendBody(sessionId, { chatId: slackChatId(m.ws!) })),
+    );
+    expect(slackAddr.status).toBe(403);
+    expect((await handleSendNotification(env.DB, e, request("/notifications/send", SHARED, sendBody(sessionId)))).status).toBe(400);
+    expect(slackCalls).toHaveLength(0);
+  });
+
+  it("notifyOwner reaches a Slack post as a mention only for an enabled category", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
     const { channelId } = await seedSlackTopic(sessionId, m.machineId, m.ws!);
@@ -351,296 +321,183 @@ describe("/notifications/send routing", () => {
   });
 });
 
-// ─── supersede ─────────────────────────────────────────────────────────────
+// ─── numeric (Telegram-era) topic rows ─────────────────────────────────────
 
-describe("supersede", () => {
-  it("Telegram -> Slack: the owner's row is replaced, the old topic closed, a channel created", async () => {
+describe("a session's topic row in a numeric chat is treated as absent", () => {
+  it("/notifications/send: the row is deleted without a close call, and the channel is created (no age guard)", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
-    await seedTelegramTopic(sessionId, m.machineId, ALLOWED, 77);
-    tg("closeForumTopic", true);
-    slackCreate("CSUP1");
-    slack("chat.postMessage", posted("CSUP1"));
+    await seedNumericTopic(sessionId, m.machineId, ALLOWED, 77); // created just now
+    slackCreate("CNUM1");
+    slack("chat.postMessage", posted("CNUM1"));
 
     const res = await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId)));
     expect(res.status).toBe(200);
-    expect(tgOf("closeForumTopic")[0]?.body).toMatchObject({ chat_id: ALLOWED, message_thread_id: 77 });
+    expect(slackCalls.map((c) => c.method)).toEqual([
+      "conversations.create",
+      "conversations.invite",
+      "conversations.setTopic",
+      "chat.postMessage",
+    ]);
     const row = await getBySession(env.DB, sessionId);
     expect(row?.chat_id).toBe(slackChatId(m.ws!));
     expect(row?.message_thread_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
   });
 
-  it("Slack -> Telegram: the owner (now on Telegram) replaces the Slack row and archives its channel", async () => {
-    // Team T stays configured under another machine's secret; the owner has none.
-    const holder = await mkMachine({ slack: true });
-    const owner = await mkMachine();
-    const sessionId = await seedSession(owner.machineId);
-    const { channelId } = await seedSlackTopic(sessionId, owner.machineId, holder.ws!);
-    slack("conversations.archive", { ok: true });
-    tg("createForumTopic", { message_thread_id: 321, name: "n", icon_color: 1 });
-    tg("sendMessage", { message_id: mid() });
-    tg("unpinAllForumTopicMessages", true);
+  it("an unfinalized numeric reservation too: purged, one create, no close or delete", async () => {
+    const sessionId = await seedSession("devbox");
+    await seedNumericTopic(sessionId, "devbox", ALLOWED, null);
+    const { client, calls } = fakeTransport();
+    const res = await resolveTopic(env.DB, {
+      sessionId,
+      machineId: "devbox",
+      chatId: "slack:TNUMRES",
+      dir: "~/p",
+      title: "T",
+      transport: client,
+    });
+    expect(res).toEqual({ ok: true, messageThreadId: 1 });
+    expect(calls.createForumTopic).toHaveLength(1);
+    expect(calls.closeForumTopic).toHaveLength(0);
+    expect(calls.deleteForumTopic).toHaveLength(0);
+    expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("slack:TNUMRES");
+  });
 
-    const res = await handleSendNotification(
-      env.DB,
-      envFor([holder, owner]),
-      request("/notifications/send", owner.key, sendBody(sessionId, { chatId: ALLOWED })),
+  /** A D1 that lets the numeric row land right after the first row lookup. */
+  function racingDb(onFirstLookup: () => Promise<void>): D1Database {
+    let lookups = 0;
+    return new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop !== "prepare") {
+          const v = Reflect.get(target, prop, target);
+          return typeof v === "function" ? v.bind(target) : v;
+        }
+        return (sql: string) => {
+          const stmt = target.prepare(sql);
+          if (sql !== "SELECT * FROM topics WHERE session_id = ?") return stmt;
+          return {
+            bind: (...args: unknown[]) => {
+              const bound = stmt.bind(...args);
+              return {
+                first: async () => {
+                  const row = await bound.first();
+                  if (++lookups === 1) await onFirstLookup();
+                  return row;
+                },
+              };
+            },
+          };
+        };
+      },
+    }) as unknown as D1Database;
+  }
+
+  it("loser path: the reserve is lost to a numeric row, which is purged and reserved again", async () => {
+    const sessionId = await seedSession("devbox");
+    const { client, calls } = fakeTransport({
+      createForumTopic: (o) => ({ ok: true, result: { message_thread_id: 4242, name: o.name, icon_color: 0 } }),
+    });
+    const res = await resolveTopic(
+      racingDb(() => seedNumericTopic(sessionId, "devbox", ALLOWED, 5)),
+      { sessionId, machineId: "devbox", chatId: "slack:TNUMLOSE", dir: "~/p", title: "T", transport: client },
     );
-    expect(res.status).toBe(200);
-    expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(channelId);
+    expect(res).toEqual({ ok: true, messageThreadId: 4242 });
+    expect(calls.createForumTopic).toHaveLength(1);
+    expect(calls.closeForumTopic).toHaveLength(0);
     const row = await getBySession(env.DB, sessionId);
-    expect(row?.chat_id).toBe(ALLOWED);
-    expect(row?.message_thread_id).toBe(321);
-    expect(tgOf("sendMessage")[0]?.body).toMatchObject({ chat_id: ALLOWED, message_thread_id: 321 });
+    expect(row?.chat_id).toBe("slack:TNUMLOSE");
+    expect(row?.message_thread_id).toBe(4242);
   });
 
-  describe("hysteresis: a row younger than SUPERSEDE_MIN_AGE_MS is not superseded", () => {
-    const run = async (rowAgeMs: number, thread: number) => {
-      const m = await mkMachine({ slack: true });
-      const sessionId = await seedSession(m.machineId);
-      const seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!, rowAgeMs);
-      const created: number[] = [];
-      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-      const res = await resolveTopic(env.DB, {
-        sessionId,
-        machineId: m.machineId,
-        chatId: ALLOWED,
-        dir: "~/p",
-        title: "T",
-        botToken: "unused",
-        supersede: true,
-        env: envFor([m]),
-        transport: {
-          ...createTelegramClient("unused"),
-          createForumTopic: async (o: { name: string }) => {
-            created.push(thread);
-            return { ok: true as const, result: { message_thread_id: thread, name: o.name, icon_color: 0 } };
-          },
-        },
-      });
-      warn.mockRestore();
-      return { res, sessionId, seeded, created, m };
-    };
-
-    it("is five minutes", () => {
-      expect(SUPERSEDE_MIN_AGE_MS).toBe(5 * 60_000);
+  it("poll path: a numeric row that shows up while polling is purged the same way", async () => {
+    const sessionId = await seedSession("devbox");
+    // A rival's unfinalized reservation in OUR chat: step 1 and the loser path wait on it.
+    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TNUMPOLL", name: "rival" });
+    let polls = 0;
+    const { client, calls } = fakeTransport({
+      createForumTopic: (o) => ({ ok: true, result: { message_thread_id: 4243, name: o.name, icon_color: 0 } }),
     });
-
-    it("just under the floor: topic_in_other_chat, the Slack row untouched, nothing created or closed", async () => {
-      const { res, sessionId, seeded, created, m } = await run(SUPERSEDE_MIN_AGE_MS - 5000, 5100);
-      expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat" });
-      expect(created).toEqual([]);
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.chat_id).toBe(slackChatId(m.ws!));
-      expect(row?.message_thread_id).toBe(seeded.handle);
-      expect(slackOf("conversations.archive")).toHaveLength(0);
+    const res = await resolveTopic(env.DB, {
+      sessionId,
+      machineId: "devbox",
+      chatId: "slack:TNUMPOLL",
+      dir: "~/p",
+      title: "T",
+      transport: client,
+      delayFn: async () => {
+        if (++polls !== 1) return;
+        // The rival gave up and a numeric row took its place.
+        await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
+        await seedNumericTopic(sessionId, "devbox", ALLOWED, 6);
+      },
     });
-
-    it("just over the floor: superseded as before", async () => {
-      // The archive of the old channel is the Slack call a supersede makes.
-      slack("conversations.archive", { ok: true });
-      const { res, sessionId, created } = await run(SUPERSEDE_MIN_AGE_MS + 5000, 5101);
-      expect(res).toMatchObject({ ok: true, messageThreadId: 5101, created: true });
-      expect(created).toEqual([5101]);
-      expect((await getBySession(env.DB, sessionId))?.chat_id).toBe(ALLOWED);
-      expect(slackOf("conversations.archive")).toHaveLength(1);
-    });
+    expect(res).toEqual({ ok: true, messageThreadId: 4243 });
+    expect(calls.createForumTopic).toHaveLength(1);
+    expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("slack:TNUMPOLL");
   });
 
-  it("a close that outlasts the 3 s bound is logged and does not hold the notification", async () => {
-    expect(SUPERSEDE_CLOSE_BOUND_MS).toBe(3000);
-    const m = await mkMachine({ slack: true });
-    const sessionId = await seedSession(m.machineId);
-    await seedTelegramTopic(sessionId, m.machineId, ALLOWED, 78);
-    tg("closeForumTopic", true, 200, 5000);
-    slackCreate("CSUP2");
-    slack("chat.postMessage", posted("CSUP2"));
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("a numeric chat address with no injected transport is a permanent no_transport create failure, never a throw", async () => {
+    const sessionId = await seedSession("devbox");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await resolveTopic(env.DB, { sessionId, machineId: "devbox", chatId: ALLOWED, dir: "~/p", title: "T" });
+    expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "create_failed", transient: false });
+    expect(JSON.stringify(res)).not.toContain("error_code");
+    expect(await getBySession(env.DB, sessionId)).toBeNull();
+  });
+});
 
-    const started = Date.now();
-    const res = await handleSendNotification(env.DB, envFor([m]), request("/notifications/send", m.key, sendBody(sessionId)));
-    expect(res.status).toBe(200);
-    expect(Date.now() - started).toBeLessThan(4800);
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("closing the superseded conversation timed out"))).toBe(true);
-  }, 15_000);
+describe("another workspace's row is never touched", () => {
+  it("resolveTopic: the row in another team's chat answers topic_in_other_chat, nothing created or closed", async () => {
+    const sessionId = await seedSession("devbox");
+    await reserve(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TROWA", name: "a" });
+    await finalize(env.DB, { sessionId, chatId: "slack:TROWA", messageThreadId: SLACK_HANDLE_MIN + 11, name: "a", provisional: false });
+    const { client, calls } = fakeTransport();
+    const res = await resolveTopic(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TROWB", dir: "~/p", title: "T", transport: client });
+    expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat", transient: false });
+    expect(Object.values(calls).flat()).toEqual([]);
+    expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("slack:TROWA");
+  });
 
-  it.each([
-    ["a foreign machine", "machine"],
-    ["the shared key", "shared"],
-  ])("%s gets topic_in_other_chat: unthreaded, the Slack row untouched", async (_name, kind) => {
+  it("a foreign machine on its own workspace gets topic_in_other_chat: unthreaded, the owner's row untouched", async () => {
     const owner = await mkMachine({ slack: true });
-    const foreign = await mkMachine();
+    const foreign = await mkMachine({ slack: true });
     const sessionId = await seedSession(owner.machineId);
     const { handle } = await seedSlackTopic(sessionId, owner.machineId, owner.ws!);
-    tg("sendMessage", { message_id: mid() });
-    tg("sendMessage", { message_id: mid() }); // the relocation alert
+    const alerts = await seedAlerts(foreign.ws!);
+    slack("chat.postMessage", posted(alerts));
+    slack("chat.postMessage", posted(alerts)); // the relocation alert
+    vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const key = kind === "shared" ? SHARED : foreign.key;
     const res = await handleSendNotification(
       env.DB,
       envFor([owner, foreign]),
-      request("/notifications/send", key, sendBody(sessionId, { chatId: ALLOWED })),
+      request("/notifications/send", foreign.key, sendBody(sessionId)),
     );
     expect(res.status).toBe(200);
-    expect(tgOf("sendMessage")[0]?.body.message_thread_id).toBeUndefined();
+    expect(slackOf("chat.postMessage").map((c) => c.params.get("channel"))).toEqual([alerts, alerts]);
     const row = await getBySession(env.DB, sessionId);
     expect(row?.chat_id).toBe(slackChatId(owner.ws!));
     expect(row?.message_thread_id).toBe(handle);
   });
 
-  it("the same transport's other chat is never superseded, even for the owner", async () => {
+  it("a create that finishes after the row moved to another chat does not touch that row (chat-scoped finalize)", async () => {
     const sessionId = await seedSession("devbox");
-    await seedTelegramTopic(sessionId, "devbox", "-100111", 5);
-    const never = createTelegramClient("unused");
-    const res = await resolveTopic(env.DB, {
-      sessionId,
-      machineId: "devbox",
-      chatId: "-100222",
-      dir: "~/p",
-      title: "T",
-      botToken: "unused",
-      supersede: true,
-      transport: {
-        ...never,
-        createForumTopic: async () => {
-          throw new Error("must not create");
-        },
-        closeForumTopic: async () => {
-          throw new Error("must not close");
-        },
-      },
-    });
-    expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat" });
-    expect((await getBySession(env.DB, sessionId))?.chat_id).toBe("-100111");
-  });
-
-  describe("a row that appears while resolveTopic is already running", () => {
-    const FOREIGN_CREATE = (created: number[], thread: number) => ({
-      ...createTelegramClient("unused"),
-      createForumTopic: async (o: { name: string }) => {
-        created.push(created.length + 1);
-        return { ok: true as const, result: { message_thread_id: thread, name: o.name, icon_color: 0 } };
-      },
-    });
-
-    it("loser path: the reserve is lost to the other transport's row, which is superseded and reserved again", async () => {
-      const m = await mkMachine({ slack: true });
-      const e = envFor([m]);
-      const sessionId = await seedSession(m.machineId);
-      let seeded: { channelId: string } | undefined;
-      // The first lookup (step 1) sees nothing; the Slack row lands right after it, so the
-      // reserve loses and the loser-path re-read is what finds the foreign row.
-      let lookups = 0;
-      const racing = new Proxy(env.DB, {
-        get(target, prop) {
-          if (prop !== "prepare") {
-            const v = Reflect.get(target, prop, target);
-            return typeof v === "function" ? v.bind(target) : v;
-          }
-          return (sql: string) => {
-            const stmt = target.prepare(sql);
-            if (sql !== "SELECT * FROM topics WHERE session_id = ?") return stmt;
-            return {
-              bind: (...args: unknown[]) => {
-                const bound = stmt.bind(...args);
-                return {
-                  first: async () => {
-                    const row = await bound.first();
-                    if (++lookups === 1) seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!);
-                    return row;
-                  },
-                };
-              },
-            };
-          };
-        },
-      }) as unknown as D1Database;
-      slack("conversations.archive", { ok: true });
-      const created: number[] = [];
-
-      const res = await resolveTopic(racing, {
-        sessionId,
-        machineId: m.machineId,
-        chatId: ALLOWED,
-        dir: "~/p",
-        title: "T",
-        botToken: "unused",
-        supersede: true,
-        env: e,
-        transport: FOREIGN_CREATE(created, 4242),
-      });
-      expect(res).toMatchObject({ ok: true, messageThreadId: 4242, created: true });
-      expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(seeded?.channelId);
-      expect(created).toHaveLength(1);
-      const row = await getBySession(env.DB, sessionId);
-      expect(row?.chat_id).toBe(ALLOWED);
-      expect(row?.message_thread_id).toBe(4242);
-    });
-
-    it("poll path: a foreign row that shows up while polling is superseded the same way", async () => {
-      const m = await mkMachine({ slack: true });
-      const e = envFor([m]);
-      const sessionId = await seedSession(m.machineId);
-      // A rival's unfinalized reservation in OUR chat: step 1 and the loser path wait on it.
-      await reserve(env.DB, { sessionId, machineId: m.machineId, chatId: ALLOWED, name: "rival" });
-      let seeded: { channelId: string } | undefined;
-      let polls = 0;
-      slack("conversations.archive", { ok: true });
-      const created: number[] = [];
-
-      const res = await resolveTopic(env.DB, {
-        sessionId,
-        machineId: m.machineId,
-        chatId: ALLOWED,
-        dir: "~/p",
-        title: "T",
-        botToken: "unused",
-        supersede: true,
-        env: e,
-        transport: FOREIGN_CREATE(created, 4243),
-        delayFn: async () => {
-          if (++polls !== 1) return;
-          // The rival gave up and the machine's other-transport row took its place.
-          await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
-          seeded = await seedSlackTopic(sessionId, m.machineId, m.ws!);
-        },
-      });
-      expect(res).toMatchObject({ ok: true, messageThreadId: 4243, created: true });
-      expect(slackOf("conversations.archive")[0]?.params.get("channel")).toBe(seeded?.channelId);
-      expect(created).toHaveLength(1);
-      expect((await getBySession(env.DB, sessionId))?.chat_id).toBe(ALLOWED);
-    });
-  });
-
-  it("a Telegram create that finishes after a supersede does not touch the Slack row (chat-scoped finalize)", async () => {
-    const m = await mkMachine({ slack: true });
-    const sessionId = await seedSession(m.machineId);
-    const slackChat = slackChatId(m.ws!);
     const deleted: number[] = [];
-    const res = await resolveTopic(env.DB, {
-      sessionId,
-      machineId: m.machineId,
-      chatId: ALLOWED,
-      dir: "~/p",
-      title: "T",
-      botToken: "unused",
-      supersede: true,
-      transport: {
-        ...createTelegramClient("unused"),
-        createForumTopic: async (o) => {
-          // While the 57 s create is in flight, the row moves to Slack.
-          await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
-          await reserve(env.DB, { sessionId, machineId: m.machineId, chatId: slackChat, name: "slack row" });
-          return { ok: true, result: { message_thread_id: 9100, name: o.name, icon_color: 0 } };
-        },
-        deleteForumTopic: async (o) => {
-          deleted.push(o.messageThreadId);
-          return { ok: true, result: true };
-        },
+    const { client } = fakeTransport({
+      createForumTopic: async (o) => {
+        // While the create is in flight, the row moves to another workspace.
+        await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
+        await reserve(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TLATEB", name: "other row" });
+        return { ok: true, result: { message_thread_id: 9100, name: o.name, icon_color: 0 } };
+      },
+      deleteForumTopic: (o) => {
+        deleted.push(o.messageThreadId);
+        return { ok: true, result: true };
       },
     });
+    const res = await resolveTopic(env.DB, { sessionId, machineId: "devbox", chatId: "slack:TLATEA", dir: "~/p", title: "T", transport: client });
     const row = await getBySession(env.DB, sessionId);
-    expect(row?.chat_id).toBe(slackChat);
+    expect(row?.chat_id).toBe("slack:TLATEB");
     expect(row?.message_thread_id).toBeNull();
     expect(deleted).toEqual([9100]);
     expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat" });
@@ -677,7 +534,7 @@ describe("rich dialect matrix", () => {
     expect((await messageRow(slackChatId(m.ws!), body.messageId))?.notification_id).toBe(`s:${sessionId}:1#rich`);
   });
 
-  it("dialect-less rich on a Slack target goes plain (Telegram markdown is not Slack's)", async () => {
+  it("dialect-less rich goes plain (an old daemon's markdown is not Slack's)", async () => {
     const { m, sessionId, channelId } = await slackSession();
     slack("chat.postMessage", posted(channelId));
     const res = await handleSendNotification(
@@ -687,31 +544,6 @@ describe("rich dialect matrix", () => {
     );
     expect(((await res.json()) as { rich: string }).rich).toBe("fallback");
     expect(blockTypes(slackOf("chat.postMessage")[0])).not.toContain("markdown");
-  });
-
-  it("dialect slack on a Telegram target goes plain, with no sendRichMessage", async () => {
-    const m = await mkMachine();
-    const sessionId = await seedSession(m.machineId);
-    tg("sendMessage", { message_id: mid() });
-    const res = await handleSendNotification(
-      env.DB,
-      envFor([m]),
-      request("/notifications/send", m.key, sendBody(sessionId, { chatId: ALLOWED, threaded: false, rich: { markdown: TABLE, dialect: "slack" } })),
-    );
-    expect(((await res.json()) as { rich: string }).rich).toBe("fallback");
-    expect(tgOf("sendRichMessage")).toHaveLength(0);
-  });
-
-  it("dialect-less rich on a Telegram target is still sent rich", async () => {
-    const m = await mkMachine();
-    const sessionId = await seedSession(m.machineId);
-    tg("sendRichMessage", { message_id: mid() });
-    const res = await handleSendNotification(
-      env.DB,
-      envFor([m]),
-      request("/notifications/send", m.key, sendBody(sessionId, { chatId: ALLOWED, threaded: false, rich: { markdown: TABLE } })),
-    );
-    expect(((await res.json()) as { rich: string }).rich).toBe("sent");
   });
 
   it("SLACK_MARKDOWN_BLOCKS=off sends plain", async () => {
@@ -798,20 +630,6 @@ describe("errorClass on Slack failures", () => {
     expect(((await res.json()) as { errorClass: string }).errorClass).toBe("rejected_format");
   });
 
-  it("a Telegram failure has no errorClass (responses unchanged)", async () => {
-    const m = await mkMachine();
-    const sessionId = await seedSession(m.machineId);
-    tg("sendMessage", { ok: false, error_code: 500, description: "boom" }, 500);
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    const res = await handleSendNotification(
-      env.DB,
-      envFor([m]),
-      request("/notifications/send", m.key, sendBody(sessionId, { chatId: ALLOWED, threaded: false })),
-    );
-    expect(res.status).toBe(502);
-    expect(Object.keys((await res.json()) as object).sort()).toEqual(["details", "error"]);
-  });
-
   it("a 429 on conversations.create is a topic_unavailable hold with errorClass, never retryAfter", async () => {
     const m = await mkMachine({ slack: true });
     const sessionId = await seedSession(m.machineId);
@@ -857,7 +675,7 @@ describe("/messages/send authorization", () => {
 
   it("another team's conversation needs a thread AND a commands row for this machine", async () => {
     const owner = await mkMachine({ slack: true });
-    const other = await mkMachine(); // a Telegram machine
+    const other = await mkMachine(); // a machine with no workspace
     const e = envFor([owner, other]);
     const chat = slackChatId(owner.ws!);
     const handle = await seedChannel(owner.ws!.teamId, "CXTEAM1");
@@ -935,22 +753,50 @@ describe("/messages/send authorization", () => {
     expect(((await res.json()) as { chatId: string }).chatId).toBe(slackChatId(m.ws!));
   });
 
-  it("a Telegram thread from a Slack machine still takes the Telegram path, with the old response", async () => {
+  it("a numeric chatId with a Telegram-era thread (< 2^40) is 403, with no provider call", async () => {
     const m = await mkMachine({ slack: true });
-    const id = mid();
-    tg("sendMessage", { message_id: id });
     const res = await send(envFor([m]), m.key, { chatId: ALLOWED, messageThreadId: 55 });
-    expect(await res.json()).toEqual({ ok: true, messageId: id });
-    expect(tgCalls[0]?.body).toMatchObject({ chat_id: ALLOWED, message_thread_id: 55 });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "chat_not_allowed" });
+    expect(slackCalls).toHaveLength(0);
   });
 
-  it("with no Slack secret the response is exactly as before (no chatId)", async () => {
+  it("a machine with no workspace, and the shared key, are refused for a numeric chatId", async () => {
     const m = await mkMachine();
-    const id = mid();
-    tg("sendMessage", { message_id: id });
-    const res = await send(envFor([m]), m.key, { chatId: ALLOWED });
-    expect(await res.json()).toEqual({ ok: true, messageId: id });
+    expect((await send(envFor([m]), m.key, { chatId: ALLOWED })).status).toBe(403);
     expect((await send(envFor([m]), m.key, { chatId: "slack:TX" })).status).toBe(403);
+    expect((await send(envFor([m]), SHARED, { chatId: ALLOWED })).status).toBe(403);
+    expect(slackCalls).toHaveLength(0);
+  });
+
+  it("no chatId at all: a Slack machine posts to its own #alerts", async () => {
+    const m = await mkMachine({ slack: true });
+    const alerts = await seedAlerts(m.ws!);
+    slack("chat.postMessage", posted(alerts));
+    const res = await send(envFor([m]), m.key, {});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, chatId: slackChatId(m.ws!) });
+    expect(slackOf("chat.postMessage")[0]?.params.get("channel")).toBe(alerts);
+  });
+
+  it("no chatId, with a Slack handle: that conversation in its own workspace; a smaller thread is 403", async () => {
+    const m = await mkMachine({ slack: true });
+    const handle = await seedChannel(m.ws!.teamId, "CNOCHAT1");
+    slack("chat.postMessage", posted("CNOCHAT1"));
+    const ok = await send(envFor([m]), m.key, { messageThreadId: handle });
+    expect(ok.status).toBe(200);
+    expect(slackOf("chat.postMessage")[0]?.params.get("channel")).toBe("CNOCHAT1");
+    expect((await send(envFor([m]), m.key, { messageThreadId: 55 })).status).toBe(403);
+  });
+
+  it("no chatId from a machine with no workspace or from the shared key is 403; a malformed chatId is 400", async () => {
+    const bare = await mkMachine();
+    const m = await mkMachine({ slack: true });
+    expect((await send(envFor([bare]), bare.key, {})).status).toBe(403);
+    expect((await send(envFor([m]), SHARED, {})).status).toBe(403);
+    expect((await send(envFor([m]), m.key, { chatId: { not: "a chat" } })).status).toBe(400);
+    expect((await send(envFor([m]), m.key, { chatId: "" })).status).toBe(400);
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("maps Slack results onto the Telegram-shaped contract, each with errorClass", async () => {
@@ -989,26 +835,29 @@ describe("/messages/send authorization", () => {
 describe("/topics/unpin", () => {
   const unpin = (e: Env, key: string, body: Record<string, unknown>) => handleUnpinTopic(e, request("/topics/unpin", key, body));
 
-  it("is {ok:true} with no provider call on Slack, and refused for the shared key", async () => {
+  it("is a constant {ok:true} with no provider call, whoever asks and whatever is named", async () => {
     const m = await mkMachine({ slack: true });
-    const e = envFor([m]);
+    const bare = await mkMachine();
+    const e = envFor([m, bare]);
     const chat = slackChatId(m.ws!);
-    const res = await unpin(e, m.key, { chatId: chat, messageThreadId: 99 });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-    // The numeric-address-with-a-handle form from an old daemon is Slack too.
-    const viaNumeric = await unpin(e, m.key, { chatId: ALLOWED, messageThreadId: SLACK_HANDLE_MIN + 5 });
-    expect(await viaNumeric.json()).toEqual({ ok: true });
-    expect((await unpin(e, SHARED, { chatId: chat, messageThreadId: 99 })).status).toBe(403);
+    for (const [key, body] of [
+      [m.key, { chatId: chat, messageThreadId: 99 }],
+      [m.key, { chatId: ALLOWED, messageThreadId: SLACK_HANDLE_MIN + 5 }],
+      [m.key, { chatId: ALLOWED, messageThreadId: 12 }], // a Telegram-era thread
+      [bare.key, { chatId: ALLOWED, messageThreadId: 12 }],
+      [SHARED, { chatId: chat, messageThreadId: 99 }],
+      [m.key, {}],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const res = await unpin(e, key, body);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    }
     expect(slackCalls).toHaveLength(0);
   });
 
-  it("is unchanged on Telegram", async () => {
-    const m = await mkMachine();
-    tg("unpinAllForumTopicMessages", true);
-    const res = await unpin(envFor([m]), m.key, { chatId: ALLOWED, messageThreadId: 12 });
-    expect(await res.json()).toEqual({ ok: true });
-    expect(tgCalls[0]?.body).toMatchObject({ chat_id: ALLOWED, message_thread_id: 12 });
+  it("still needs a credential", async () => {
+    const res = await handleUnpinTopic(envFor([]), request("/topics/unpin", "not-a-key", { chatId: ALLOWED, messageThreadId: 12 }));
+    expect(res.status).toBe(401);
   });
 });
 
@@ -1059,10 +908,26 @@ describe("/notifications/edit routing", () => {
     expect(call?.params.get("text")).not.toContain("<@U0OWNER>");
   });
 
+  it("a row in a numeric chat (a Telegram-era post) is the existing 404 not-found, with no provider call", async () => {
+    const m = await mkMachine({ slack: true });
+    const notificationId = `q:numeric:${stamp()}`;
+    await env.DB.prepare(
+      "INSERT INTO messages (chat_id, message_id, session_id, token, notification_id, created_at) VALUES (?, ?, 'ses_edit', 't', ?, ?)",
+    )
+      .bind(ALLOWED, 424242 + counter, notificationId, Date.now())
+      .run();
+    for (const key of [m.key, SHARED]) {
+      const res = await edit(envFor([m]), key, { notificationId });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: "Message not found for notificationId" });
+    }
+    expect(slackCalls).toHaveLength(0);
+  });
+
   it("a post whose team has no configured workspace is not a 403: it is a transient failure with no provider call", async () => {
     const owner = await mkMachine({ slack: true });
     const { notificationId } = await slackQuestion(owner.ws!);
-    const bare = await mkMachine(); // a Telegram machine, and the team's secret is gone from env
+    const bare = await mkMachine(); // a machine with no workspace, and the team's secret is gone from env
     for (const key of [bare.key, SHARED]) {
       const res = await edit(envFor([bare]), key, { notificationId });
       expect(res.status).toBe(502);
@@ -1111,25 +976,24 @@ describe("named topics on Slack", () => {
     expect(await again.json()).toMatchObject({ chatId: slackChatId(m.ws!), created: false });
   });
 
-  it("refuses a _-prefixed key on Slack only", async () => {
+  it("refuses a _-prefixed key (reserved for the worker's own, like _alerts)", async () => {
     const slackM = await mkMachine({ slack: true });
     const refused = await named(envFor([slackM]), slackM.key, { key: "_alerts", name: "x" });
     expect(refused.status).toBe(400);
     expect(slackCalls).toHaveLength(0);
-
-    const tgM = await mkMachine();
-    tg("createForumTopic", { message_thread_id: 654, name: "x", icon_color: 1 });
-    const ok = await named(envFor([tgM]), tgM.key, { chatId: ALLOWED, key: "_private", name: "x" });
-    expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ chatId: ALLOWED, messageThreadId: 654, created: true });
   });
 
-  it("Telegram machines still need an allowlisted chatId, and cannot name a slack: chat", async () => {
+  it("a machine with no workspace and the shared key have nowhere to put one: 403, whatever chatId they send", async () => {
     const m = await mkMachine();
-    const e = envFor([m]);
-    expect((await named(e, m.key, { key: "k", name: "x" })).status).toBe(400);
-    expect((await named(e, m.key, { chatId: "555", key: "k", name: "x" })).status).toBe(403);
-    expect((await named(e, m.key, { chatId: "slack:TX", key: "k", name: "x" })).status).toBe(403);
+    const slackM = await mkMachine({ slack: true });
+    const e = envFor([m, slackM]);
+    for (const key of [m.key, SHARED]) {
+      expect((await named(e, key, { key: "k", name: "x" })).status).toBe(403);
+      expect((await named(e, key, { chatId: ALLOWED, key: "k", name: "x" })).status).toBe(403);
+      expect((await named(e, key, { chatId: slackChatId(slackM.ws!), key: "k", name: "x" })).status).toBe(403);
+    }
+    expect((await named(e, m.key, { name: "x" })).status).toBe(400); // no key
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("bind writes the binding under the resolved Slack chat id", async () => {
@@ -1163,14 +1027,17 @@ describe("named topics on Slack", () => {
 // ─── the helpers themselves ────────────────────────────────────────────────
 
 describe("address helpers", () => {
-  it("resolveWorkerTarget: Telegram targets keep the caller's raw chatId", async () => {
-    const m = await mkMachine();
-    const e = envFor([m]);
-    const principal: Principal = { kind: "machine", machineId: m.machineId };
-    expect(resolveWorkerTarget(e, principal, ALLOWED)).toEqual({ ok: true, chatId: ALLOWED, slack: false });
-    expect(resolveWorkerTarget(e, principal, Number(ALLOWED))).toEqual({ ok: true, chatId: Number(ALLOWED), slack: false });
-    expect(resolveWorkerTarget(e, principal, undefined)).toEqual({ ok: false });
-    expect(resolveWorkerTarget(e, { kind: "shared" }, "slack:T1")).toEqual({ ok: false });
+  it("resolveWorkerTarget: a machine's target is its own workspace, whatever it sent; nobody else has one", async () => {
+    const m = await mkMachine({ slack: true });
+    const bare = await mkMachine();
+    const e = envFor([m, bare]);
+    expect(resolveWorkerTarget(e, { kind: "machine", machineId: m.machineId })).toEqual({
+      ok: true,
+      chatId: slackChatId(m.ws!),
+      slack: true,
+    });
+    expect(resolveWorkerTarget(e, { kind: "machine", machineId: bare.machineId })).toEqual({ ok: false });
+    expect(resolveWorkerTarget(e, { kind: "shared" })).toEqual({ ok: false });
   });
 
   it("authorizeStoredAddress: a slack: address with no team id is refused", async () => {

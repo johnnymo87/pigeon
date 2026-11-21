@@ -17,8 +17,8 @@ export interface TopicLookupEntry {
   state: "open" | "closed";
   /**
    * The conversation's link, on Slack rows ONLY (`null` when it cannot be built: the workspace's
-   * secret is gone, or the handle has no conversation). A Telegram entry has no `url` field at
-   * all, so its shape is exactly what it always was; callers build Telegram links themselves.
+   * secret is gone, or the handle has no conversation). A numeric (Telegram-era) entry has no
+   * `url` field at all.
    */
   url?: string | null;
 }

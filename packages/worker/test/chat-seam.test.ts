@@ -4,15 +4,17 @@
  * on session commands. Spec: docs/plans/2026-11-20-slack-transport-design.md §1, §5.
  */
 import { env, fetchMock } from "cloudflare:test";
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
 import { fakeTransport } from "./slack-harness";
 import { isSlackChatId, transportForChat, type ChatTransport } from "../src/chat";
+import { failureDetails, isPermanentTopicFailure } from "../src/chat/failures";
 import { parseChatCommand, SESSION_REF_RE } from "../src/chat/commands";
 import { resolveSessionRef } from "../src/chat/session-ref";
 import { deleteBySession, finalize, getBySession, markOpen, renameProvisional, reserve } from "../src/topics";
 import { resolveTopic } from "../src/topic-manager";
 
+/** A numeric chat id of the Telegram days: no transport exists for it. */
 const TG_CHAT = "8248645256";
 const SLACK_CHAT = "slack:T0SEAM";
 /** A second chat of the same transport: the CAS tests only need two distinct addresses. */
@@ -46,23 +48,9 @@ describe("transportForChat", () => {
     expect(isSlackChatId("slackT123")).toBe(false);
   });
 
-  it("routes a Telegram chat id to the Telegram Bot API", async () => {
-    let path = "";
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bottok-seam\/sendMessage/ })
-      .reply(200, (opts: { path: string }) => {
-        path = opts.path;
-        return { ok: true, result: { message_id: 7 } };
-      });
-    const res = await transportForChat(TG_CHAT, "tok-seam").sendMessage({ chatId: TG_CHAT, text: "hi" });
-    expect(res.ok).toBe(true);
-    expect(path).toContain("/bottok-seam/sendMessage");
-  });
-
-  it("never sends a slack address to Telegram, and reports a transient (non-4xx) failure", async () => {
+  it("never sends a slack address anywhere without a workspace, and reports a transient (non-4xx) failure", async () => {
     // disableNetConnect: any fetch would throw, so a resolved result proves nothing was called.
-    const t = transportForChat(SLACK_CHAT, "tok-seam");
+    const t = transportForChat(SLACK_CHAT);
     const res = await t.sendMessage({ chatId: SLACK_CHAT, text: "hi" });
     expect(res.ok).toBe(false);
     if (!res.ok && res.kind === "error") {
@@ -75,6 +63,36 @@ describe("transportForChat", () => {
     expect(created.ok).toBe(false);
   });
 
+  it("answers every call to a numeric address with a distinct no_transport result, and calls nothing", async () => {
+    // disableNetConnect again: a resolved result proves no fetch was attempted.
+    const t = transportForChat(TG_CHAT);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const blob = new Blob(["x"]);
+    const results = await Promise.all([
+      t.sendMessage({ chatId: TG_CHAT, text: "hi" }),
+      t.sendRichMessage({ chatId: TG_CHAT, markdown: "hi" }),
+      t.editMessageText({ chatId: TG_CHAT, messageId: 1, text: "hi" }),
+      t.sendPhoto({ chatId: TG_CHAT, photo: blob, filename: "a.png" }),
+      t.sendDocument({ chatId: TG_CHAT, document: blob, filename: "a.txt" }),
+      t.createForumTopic({ chatId: TG_CHAT, name: "x" }),
+      t.editForumTopic({ chatId: TG_CHAT, messageThreadId: 1, name: "x" }),
+      t.closeForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.reopenForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.deleteForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+    ]);
+    for (const res of results) expect(res).toEqual({ ok: false, kind: "no_transport" });
+    expect(warn).toHaveBeenCalled();
+    // The kind is permanent, and its details never read as a 4xx from a provider.
+    expect(isPermanentTopicFailure(results[0]!)).toBe(true);
+    expect(JSON.stringify(failureDetails(results[0]!))).not.toContain("error_code");
+    // A numeric address with a Slack context is still no transport: the context is for slack: only.
+    const ctx = { env: env as unknown as Env, db: env.DB };
+    expect(await transportForChat(TG_CHAT, ctx).sendMessage({ chatId: TG_CHAT, text: "hi" })).toEqual({
+      ok: false,
+      kind: "no_transport",
+    });
+  });
+
   it("uses an injected transport for any address, a Slack one included", async () => {
     const calls: string[] = [];
     const { client } = fakeTransport({
@@ -83,8 +101,8 @@ describe("transportForChat", () => {
         return { ok: true, result: { message_id: 1 } };
       },
     });
-    await transportForChat(TG_CHAT, "tok", client).sendMessage({ chatId: TG_CHAT, text: "a" });
-    const slackRes = await transportForChat(SLACK_CHAT, "tok", client).sendMessage({ chatId: SLACK_CHAT, text: "b" });
+    await transportForChat(TG_CHAT, undefined, client).sendMessage({ chatId: TG_CHAT, text: "a" });
+    const slackRes = await transportForChat(SLACK_CHAT, undefined, client).sendMessage({ chatId: SLACK_CHAT, text: "b" });
     expect(calls).toEqual([TG_CHAT, SLACK_CHAT]);
     expect(slackRes.ok).toBe(true);
   });

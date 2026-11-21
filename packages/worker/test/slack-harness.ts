@@ -51,15 +51,11 @@ export async function mkSlackMachine(opts: { teamId?: string; domain?: string } 
   return { machineId, key, ws };
 }
 
-/**
- * The worker env with these machines' workspace secrets (and whatever else the test sets). Topics
- * are on: that flag is `TELEGRAM_TOPICS_ENABLED` until the Telegram deletion makes them always on
- * (this line is then the only thing to remove here).
- */
+/** The worker env with these machines' workspace secrets (and whatever else the test sets). */
 export function envWith(machines: SlackMachine[], extra: Record<string, unknown> = {}): Env {
   const secrets: Record<string, string> = {};
   for (const m of machines) secrets[slackSecretKeyForMachine(m.machineId)] = JSON.stringify(m.ws);
-  return { ...env, TELEGRAM_TOPICS_ENABLED: "true", ...secrets, ...extra } as unknown as Env;
+  return { ...env, ...secrets, ...extra } as unknown as Env;
 }
 
 export function postJson(path: string, key: string, body: unknown): Request {
@@ -159,7 +155,6 @@ const METHODS = [
   "closeForumTopic",
   "reopenForumTopic",
   "deleteForumTopic",
-  "unpinAllForumTopicMessages",
 ] as const;
 
 /**
@@ -182,7 +177,6 @@ export function fakeTransport(handlers: Partial<Record<(typeof METHODS)[number],
     closeForumTopic: () => ({ ok: true, result: true }),
     reopenForumTopic: () => ({ ok: true, result: true }),
     deleteForumTopic: () => ({ ok: true, result: true }),
-    unpinAllForumTopicMessages: () => ({ ok: true, result: true }),
   };
   const client = {} as Record<string, Handler>;
   for (const m of METHODS) {

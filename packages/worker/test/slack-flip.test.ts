@@ -1,10 +1,12 @@
 /**
  * POST /topics/named/rehome: the binding half of `slack-flip` (bead pigeon-4ogz.6; spec
  * docs/plans/2026-11-20-slack-transport-design.md §3 "Flip and unflip move bindings explicitly").
+ * Slack is the only transport (pigeon-4ogz.13): the route moves a machine's bindings into its
+ * workspace, and there is no way back.
  *
  * Same harness as slack-routing.test.ts: handlers called directly, real per-machine credentials,
- * Slack and Telegram as fetchMocks with `disableNetConnect` and `assertNoPendingInterceptors`, so
- * a missing or unexpected provider call fails the test. Every test uses its own ids.
+ * Slack as a fetchMock with `disableNetConnect` and `assertNoPendingInterceptors`, so a missing or
+ * unexpected provider call fails the test. Every test uses its own ids.
  */
 import { env, fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
@@ -25,7 +27,6 @@ beforeEach(() => {
   fetchMock.activate();
   fetchMock.disableNetConnect();
   slackCalls.length = 0;
-  tgCalls.length = 0;
 });
 
 afterEach(() => {
@@ -39,7 +40,7 @@ afterEach(() => {
 
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
-const ALLOWED = "8248645256"; // ALLOWED_CHAT_IDS in vitest.config.ts
+const ALLOWED = "8248645256"; // the numeric chat a binding had in the Telegram days
 const SHARED = "test-api-key";
 
 let counter = 0;
@@ -76,7 +77,7 @@ async function mkMachine(): Promise<Machine> {
 function envFor(on: Machine[]): Env {
   const secrets: Record<string, string> = {};
   for (const m of on) secrets[slackSecretKeyForMachine(m.machineId)] = JSON.stringify(m.ws);
-  return { ...env, TELEGRAM_TOPICS_ENABLED: "true", ...secrets } as unknown as Env;
+  return { ...env, ...secrets } as unknown as Env;
 }
 
 function request(key: string, body: unknown): Request {
@@ -100,7 +101,7 @@ async function seedSession(machineId: string): Promise<string> {
   return sessionId;
 }
 
-/** A Telegram named topic bound to `sessionId`, as a coordinator has before the flip. */
+/** A named topic of the Telegram days (numeric chat) bound to `sessionId`, as a coordinator had before the flip. */
 async function seedTelegramBinding(sessionId: string, key: string, thread: number, chatId = ALLOWED) {
   const now = Date.now();
   await env.DB.prepare(
@@ -141,20 +142,8 @@ function slackCreate(channelId: string, name: string) {
   slack("conversations.setTopic", { ok: true });
 }
 
-const tgCalls: Array<{ method: string; body: Record<string, unknown> }> = [];
-function tg(method: string, result: unknown) {
-  fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: new RegExp(`/bot.*/${method}$`) })
-    .reply(200, (opts: { body?: unknown }) => {
-      const raw = typeof opts.body === "string" ? opts.body : new TextDecoder().decode(opts.body as ArrayBuffer);
-      tgCalls.push({ method, body: JSON.parse(raw) });
-      return { ok: true, result };
-    });
-}
-
 interface RehomeBody {
-  transport: string;
+  workspace: boolean;
   pending: number;
   results: Array<{ sessionId: string; key: string; outcome: string; chatId?: string; messageThreadId?: number; reason?: string }>;
   next: string | null;
@@ -170,15 +159,15 @@ describe("POST /topics/named/rehome", () => {
     await seedTelegramBinding(coord, "stallwatch:chat-transport", 4101);
     slackCreate("CCOORD1", "stallwatch-chat-transport");
 
-    const res = await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" });
+    const res = await rehome(envFor([m]), m.key, { machine: m.machineId });
     expect(res.status).toBe(200);
     const body = (await res.json()) as RehomeBody;
-    expect(body.transport).toBe("slack");
+    expect(body.workspace).toBe(true);
     expect(body.next).toBeNull();
     expect(body.results).toHaveLength(1);
     expect(body.results[0]).toMatchObject({ sessionId: coord, key: "stallwatch:chat-transport", outcome: "moved" });
     expect(slackOf("conversations.create")[0]?.params.get("name")).toBe("stallwatch-chat-transport");
-    // The topic line is the Telegram topic's human name, not the key.
+    // The topic line is the old topic's human name, not the key.
     expect(slackOf("conversations.setTopic")[0]?.params.get("topic")).toBe("📋 stallwatch:chat-transport");
 
     const chat = slackChatId(m.ws);
@@ -187,7 +176,7 @@ describe("POST /topics/named/rehome", () => {
     expect(binding!.message_thread_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
     // Inbound: a message typed in the new channel reaches the coordinator.
     expect(await getBoundSessionByThread(env.DB, chat, binding!.message_thread_id)).toBe(coord);
-    // The Telegram topic is left as history; nothing routes to it any more.
+    // The old numeric topic is left as history; nothing routes to it any more.
     expect(await getBoundSessionByThread(env.DB, ALLOWED, 4101)).toBeNull();
 
     // Outbound: the coordinator's next notification lands in that channel.
@@ -210,9 +199,9 @@ describe("POST /topics/named/rehome", () => {
     const coord = await seedSession(m.machineId);
     await seedTelegramBinding(coord, "stallwatch:idem", 4102);
     slackCreate("CIDEM1", "stallwatch-idem");
-    expect((await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).status).toBe(200);
+    expect((await rehome(envFor([m]), m.key, { machine: m.machineId })).status).toBe(200);
 
-    const again = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).json()) as RehomeBody;
+    const again = (await (await rehome(envFor([m]), m.key, { machine: m.machineId })).json()) as RehomeBody;
     expect(again).toMatchObject({ pending: 0, results: [], next: null });
     expect(slackOf("conversations.create")).toHaveLength(1);
   });
@@ -226,26 +215,37 @@ describe("POST /topics/named/rehome", () => {
     await seedTelegramBinding(theirs, "stallwatch:theirs", 4104);
     slackCreate("CMINE1", "stallwatch-mine");
 
-    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).json()) as RehomeBody;
+    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId })).json()) as RehomeBody;
     expect(body.results.map((r) => r.sessionId)).toEqual([mine]);
     expect((await getBindingForSession(env.DB, theirs))?.chat_id).toBe(ALLOWED);
   });
 
-  it("refuses to move against the transport this isolate sees (409), so it is safe for any machine key", async () => {
+  it("a machine with no workspace is a 409 no_workspace and nothing moves, so it is safe for any machine key", async () => {
     const m = await mkMachine();
     const coord = await seedSession(m.machineId);
     await seedTelegramBinding(coord, "stallwatch:early", 4105);
 
     // The secret has not reached this isolate yet.
-    const early = await rehome(envFor([]), m.key, { machine: m.machineId, expect: "slack" });
+    const early = await rehome(envFor([]), m.key, { machine: m.machineId });
     expect(early.status).toBe(409);
-    expect(await early.json()).toMatchObject({ error: "transport_mismatch", transport: "telegram" });
-
-    // And the inverse: the secret is still visible, so nothing may move back to Telegram.
-    const late = await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "telegram" });
-    expect(late.status).toBe(409);
-    expect(await late.json()).toMatchObject({ error: "transport_mismatch", transport: "slack" });
+    expect(await early.json()).toEqual({ error: "no_workspace" });
     expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(ALLOWED);
+    expect(slackCalls).toHaveLength(0);
+  });
+
+  it("ignores the `expect` and `telegramChatId` fields a deployed script or caller may still send", async () => {
+    const m = await mkMachine();
+    const coord = await seedSession(m.machineId);
+    await seedTelegramBinding(coord, "stallwatch:legacy", 4109);
+    slackCreate("CLEGACY1", "stallwatch-legacy");
+    const res = await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack", telegramChatId: ALLOWED });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as RehomeBody).results[0]).toMatchObject({ sessionId: coord, outcome: "moved" });
+    // `expect: "telegram"` does not move anything back: there is no Telegram to move to.
+    const back = await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "telegram" });
+    expect(back.status).toBe(200);
+    expect(await back.json()).toMatchObject({ workspace: true, pending: 0, results: [] });
+    expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(slackChatId(m.ws));
   });
 
   it("another machine's key may run it (the flip runs on devbox for every machine); the shared key may not (401)", async () => {
@@ -254,11 +254,11 @@ describe("POST /topics/named/rehome", () => {
     const coord = await seedSession(m.machineId);
     await seedTelegramBinding(coord, "stallwatch:remote", 4106);
 
-    expect((await rehome(envFor([m]), SHARED, { machine: m.machineId, expect: "slack" })).status).toBe(401);
-    expect((await rehome(envFor([m]), "pgk_nope", { machine: m.machineId, expect: "slack" })).status).toBe(401);
+    expect((await rehome(envFor([m]), SHARED, { machine: m.machineId })).status).toBe(401);
+    expect((await rehome(envFor([m]), "pgk_nope", { machine: m.machineId })).status).toBe(401);
 
     slackCreate("CREMOTE1", "stallwatch-remote");
-    const res = await rehome(envFor([m]), runner.key, { machine: m.machineId, expect: "slack" });
+    const res = await rehome(envFor([m]), runner.key, { machine: m.machineId });
     expect(res.status).toBe(200);
     expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(slackChatId(m.ws));
   });
@@ -266,12 +266,11 @@ describe("POST /topics/named/rehome", () => {
   it("validates its body", async () => {
     const m = await mkMachine();
     const e = envFor([m]);
-    expect((await rehome(e, m.key, { expect: "slack" })).status).toBe(400);
-    expect((await rehome(e, m.key, { machine: "Bad Id", expect: "slack" })).status).toBe(400);
-    expect((await rehome(e, m.key, { machine: m.machineId, expect: "teams" })).status).toBe(400);
-    expect((await rehome(e, m.key, { machine: m.machineId, expect: "slack", limit: 0 })).status).toBe(400);
-    expect((await rehome(e, m.key, { machine: m.machineId, expect: "slack", limit: REHOME_MAX_LIMIT + 1 })).status).toBe(400);
-    expect((await rehome(e, m.key, { machine: m.machineId, expect: "telegram", telegramChatId: "555" })).status).toBe(400);
+    expect((await rehome(e, m.key, {})).status).toBe(400);
+    expect((await rehome(e, m.key, { machine: "Bad Id" })).status).toBe(400);
+    expect((await rehome(e, m.key, { machine: m.machineId, limit: 0 })).status).toBe(400);
+    expect((await rehome(e, m.key, { machine: m.machineId, limit: REHOME_MAX_LIMIT + 1 })).status).toBe(400);
+    expect((await rehome(e, m.key, { machine: m.machineId, after: "" })).status).toBe(400);
   });
 
   it("dry run lists what would move and calls no provider", async () => {
@@ -281,14 +280,14 @@ describe("POST /topics/named/rehome", () => {
     await seedTelegramBinding(a, "stallwatch:dry-a", 4107);
     await seedTelegramBinding(b, "stallwatch:dry-b", 4108);
 
-    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack", dryRun: true })).json()) as RehomeBody;
+    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, dryRun: true })).json()) as RehomeBody;
     expect(body.pending).toBe(2);
     expect(body.results.map((r) => r.outcome)).toEqual(["pending", "pending"]);
     expect((await getBindingForSession(env.DB, a))?.chat_id).toBe(ALLOWED);
 
-    // Before the secret exists, too: the preview of a flip, against the transport it is still on.
-    const before = (await (await rehome(envFor([]), m.key, { machine: m.machineId, expect: "slack", dryRun: true })).json()) as RehomeBody;
-    expect(before).toMatchObject({ transport: "telegram", pending: 2 });
+    // Before the secret exists, too: the preview of a flip, with no workspace to move to yet.
+    const before = (await (await rehome(envFor([]), m.key, { machine: m.machineId, dryRun: true })).json()) as RehomeBody;
+    expect(before).toMatchObject({ workspace: false, pending: 2 });
   });
 
   it("pages with a cursor, and stops at a Slack 429 without skipping the limited binding", async () => {
@@ -302,20 +301,20 @@ describe("POST /topics/named/rehome", () => {
     const e = envFor([m]);
 
     slackCreate("CP1", "stallwatch-p1");
-    const first = (await (await rehome(e, m.key, { machine: m.machineId, expect: "slack", limit: 1 })).json()) as RehomeBody;
+    const first = (await (await rehome(e, m.key, { machine: m.machineId, limit: 1 })).json()) as RehomeBody;
     expect(first.results.map((r) => [r.sessionId, r.outcome])).toEqual([[s1, "moved"]]);
     expect(first.next).toBe(s1);
     expect(first.pending).toBe(2);
 
     slack("conversations.create", { ok: false, error: "ratelimited" }, 429, { "Retry-After": "7" });
-    const limited = (await (await rehome(e, m.key, { machine: m.machineId, expect: "slack", after: first.next })).json()) as RehomeBody;
+    const limited = (await (await rehome(e, m.key, { machine: m.machineId, after: first.next })).json()) as RehomeBody;
     expect(limited.retryAfter).toBe(REHOME_SLACK_BACKOFF_S);
     expect(limited.results).toEqual([]);
     expect(limited.next).toBe(s1); // s2 is retried, not skipped
 
     slackCreate("CP2", "stallwatch-p2");
     slackCreate("CP3", "stallwatch-p3");
-    const rest = (await (await rehome(e, m.key, { machine: m.machineId, expect: "slack", after: limited.next })).json()) as RehomeBody;
+    const rest = (await (await rehome(e, m.key, { machine: m.machineId, after: limited.next })).json()) as RehomeBody;
     expect(rest.results.map((r) => [r.sessionId, r.outcome])).toEqual([
       [s2, "moved"],
       [s3, "moved"],
@@ -333,7 +332,7 @@ describe("POST /topics/named/rehome", () => {
     slack("conversations.create", { ok: false, error: "restricted_action" });
     slackCreate("CGOOD", "stallwatch-good");
 
-    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).json()) as RehomeBody;
+    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId })).json()) as RehomeBody;
     expect(body.results.map((r) => [r.sessionId, r.outcome])).toEqual([
       [bad, "failed"],
       [good, "moved"],
@@ -342,68 +341,12 @@ describe("POST /topics/named/rehome", () => {
     expect(body.pending).toBe(1);
   });
 
-  it("off: moves the binding back to its Telegram topic, which routes again; the Slack row is left alone", async () => {
-    const m = await mkMachine();
-    const coord = await seedSession(m.machineId);
-    await seedTelegramBinding(coord, "stallwatch:back", 4131);
-    slackCreate("CBACK1", "stallwatch-back");
-    expect((await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).status).toBe(200);
-    const onSlack = await getBindingForSession(env.DB, coord);
-
-    // The secret is deleted; the old Telegram topic still exists and was checked recently, so no call.
-    const res = await rehome(envFor([]), m.key, { machine: m.machineId, expect: "telegram" });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as RehomeBody;
-    expect(body.results[0]).toMatchObject({ sessionId: coord, outcome: "moved", chatId: ALLOWED, messageThreadId: 4131 });
-    expect(await getBindingForSession(env.DB, coord)).toMatchObject({ chat_id: ALLOWED, message_thread_id: 4131 });
-    expect(await getBoundSessionByThread(env.DB, ALLOWED, 4131)).toBe(coord);
-    expect(await getBoundSessionByThread(env.DB, slackChatId(m.ws), onSlack!.message_thread_id)).toBeNull();
-    expect(slackCalls).toHaveLength(3); // only the create from the flip
-  });
-
-  it("off: a binding born on Slack needs telegramChatId, and gets a topic created there", async () => {
-    const m = await mkMachine();
-    const coord = await seedSession(m.machineId);
-    // Bound on Slack directly (after the flip), never had a Telegram topic.
-    const chat = slackChatId(m.ws);
-    await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, 'CBORN', ?, 1)")
-      .bind(m.ws.teamId, Date.now())
-      .run();
-    const handle = (await env.DB.prepare("SELECT handle FROM slack_conversations WHERE team_id = ? AND channel_id = 'CBORN'")
-      .bind(m.ws.teamId)
-      .first<{ handle: number }>())!.handle;
-    const now = Date.now();
-    await env.DB.prepare(
-      `INSERT INTO named_topics (chat_id, topic_key, message_thread_id, name, reopen_checked_at, hint_at, created_at, updated_at)
-       VALUES (?, 'stallwatch:born', ?, 'Born', ?, NULL, ?, ?)`,
-    )
-      .bind(chat, handle, now, now, now)
-      .run();
-    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, 'stallwatch:born', ?, ?)")
-      .bind(chat, coord, now)
-      .run();
-
-    const unplaced = (await (await rehome(envFor([]), m.key, { machine: m.machineId, expect: "telegram" })).json()) as RehomeBody;
-    expect(unplaced.results[0]).toMatchObject({ sessionId: coord, outcome: "unplaced" });
-    expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(chat);
-
-    tg("createForumTopic", { message_thread_id: 4141, name: "Born", icon_color: 1 });
-    const placed = (await (
-      await rehome(envFor([]), m.key, { machine: m.machineId, expect: "telegram", telegramChatId: ALLOWED })
-    ).json()) as RehomeBody;
-    expect(placed.results[0]).toMatchObject({ outcome: "moved", chatId: ALLOWED, messageThreadId: 4141 });
-    expect(tgCalls[0]?.body.name).toBe("Born");
-    expect(await getBindingForSession(env.DB, coord)).toMatchObject({ chat_id: ALLOWED, message_thread_id: 4141 });
-  });
-
-  it("off: never takes a key another machine's session holds in the target chat", async () => {
+  it("never takes a key another machine's session holds in the target workspace", async () => {
     const m = await mkMachine();
     const other = await mkMachine();
     const coord = await seedSession(m.machineId);
     const theirs = await seedSession(other.machineId);
-    // The other machine's coordinator owns stallwatch:shared in ALLOWED.
-    await seedTelegramBinding(theirs, "stallwatch:shared", 4151);
-    // Ours was bound on Slack.
+    // The other machine's coordinator owns stallwatch:shared in m's workspace chat.
     const chat = slackChatId(m.ws);
     await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, 'CSHARED', ?, 1)")
       .bind(m.ws.teamId, Date.now())
@@ -419,24 +362,25 @@ describe("POST /topics/named/rehome", () => {
       .bind(chat, handle, now, now, now)
       .run();
     await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, 'stallwatch:shared', ?, ?)")
-      .bind(chat, coord, now)
+      .bind(chat, theirs, now)
       .run();
+    // Ours is still bound in a numeric chat, under the same key.
+    await seedTelegramBinding(coord, "stallwatch:shared", 4151);
 
-    for (const body of [{}, { telegramChatId: ALLOWED }]) {
-      const res = (await (await rehome(envFor([]), m.key, { machine: m.machineId, expect: "telegram", ...body })).json()) as RehomeBody;
-      expect(res.results[0]).toMatchObject({ sessionId: coord, outcome: "failed" });
-      expect(res.results[0]!.reason).toContain(other.machineId);
-    }
-    expect((await getBindingForSession(env.DB, theirs))?.chat_id).toBe(ALLOWED);
-    expect(await getBoundSessionByThread(env.DB, ALLOWED, 4151)).toBe(theirs);
-    expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(chat);
+    const res = (await (await rehome(envFor([m]), m.key, { machine: m.machineId })).json()) as RehomeBody;
+    expect(res.results[0]).toMatchObject({ sessionId: coord, outcome: "failed" });
+    expect(res.results[0]!.reason).toContain(other.machineId);
+    expect((await getBindingForSession(env.DB, theirs))?.chat_id).toBe(chat);
+    expect(await getBoundSessionByThread(env.DB, chat, handle)).toBe(theirs);
+    expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(ALLOWED);
+    expect(slackCalls).toHaveLength(0);
   });
 
   it("on: a _-prefixed key is never moved onto Slack (it would take over a reserved channel like #alerts)", async () => {
     const m = await mkMachine();
     const coord = await seedSession(m.machineId);
     await seedTelegramBinding(coord, "_alerts", 4161);
-    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId, expect: "slack" })).json()) as RehomeBody;
+    const body = (await (await rehome(envFor([m]), m.key, { machine: m.machineId })).json()) as RehomeBody;
     expect(body.results[0]).toMatchObject({ sessionId: coord, outcome: "failed", reason: "reserved key" });
     expect((await getBindingForSession(env.DB, coord))?.chat_id).toBe(ALLOWED);
     expect(slackCalls).toHaveLength(0);

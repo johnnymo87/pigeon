@@ -31,7 +31,6 @@ import type {
   SendMessageOptions,
   SendPhotoOptions,
   SendRichMessageOptions,
-  UnpinAllForumTopicMessagesOptions,
 } from "./transport";
 import { slackChatId, type SlackWorkspace } from "./slack-config";
 import { shouldMention, type ConversationKind, type ExplicitNotifyCategory, type NotifyCategory } from "./slack-notify";
@@ -890,11 +889,6 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     async deleteForumTopic(options: DeleteForumTopicOptions) {
       // Bots cannot delete a channel. This is only used to retire a lost-race duplicate.
       return archive(options.messageThreadId);
-    },
-
-    async unpinAllForumTopicMessages(_options: UnpinAllForumTopicMessagesOptions) {
-      // Slack pins nothing on its own, so there is nothing to clear.
-      return OK_TRUE;
     },
   };
 }

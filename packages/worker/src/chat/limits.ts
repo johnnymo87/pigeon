@@ -1,4 +1,4 @@
-/** Limits shared by every inbound chat ingress (Slack's, and Telegram's while it exists). */
+/** Limits shared by every inbound chat ingress (Slack's). */
 
 /** Longest command body accepted. */
 export const MAX_COMMAND_LENGTH = 10_000;

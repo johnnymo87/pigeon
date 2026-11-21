@@ -172,7 +172,7 @@ function parseQuestionRequestId(notificationId: string | null | undefined): stri
 async function postInChannel(env: Env, db: D1Database, ws: SlackWorkspace, handle: number, text: string): Promise<void> {
   const chatId = slackChatId(ws);
   try {
-    const res = await transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db }).sendMessage({
+    const res = await transportForChat(chatId, { env, db }).sendMessage({
       chatId,
       messageThreadId: handle,
       text,
