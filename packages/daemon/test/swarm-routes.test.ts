@@ -277,7 +277,7 @@ describe("POST /swarm/send", () => {
       backendKind: PULL_BACKEND_KIND,
       notify: true,
     });
-    s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {

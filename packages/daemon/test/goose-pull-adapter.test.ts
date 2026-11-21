@@ -65,7 +65,7 @@ describe("GoosePullAdapter", () => {
 
     const [row] = s.pullInbox.claim("ses_pull", 3_000);
     expect(row!.payload).toBe("stop repinning");
-    expect(row!.source).toBe("telegram-reply");
+    expect(row!.source).toBe("chat-reply");
     expect(row!.chatId).toBe("42");
     expect(row!.senderId).toBe(OWNER);
     expect(row!.inReplyTo).toBeNull();

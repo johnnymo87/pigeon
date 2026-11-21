@@ -1,11 +1,27 @@
-// "telegram-reply" is the persisted/wire name of the human-reply source (kept, pigeon-4ogz.14).
-export const DEFAULT_PULL_SOURCES: readonly string[] = ["telegram-reply"];
+/**
+ * The human-reply source: a message the owner typed in the session's (or its
+ * bound) chat channel, banked in `pull_inbox` and listed in `pull_sources`.
+ *
+ * Renamed from "telegram-reply" (pigeon-4ogz.14). The old name is still
+ * ACCEPTED where a client may send it (`pull_sources` on /session-start) and
+ * read back as the new one (stored `pull_sources`, and `pull_inbox` rows, which
+ * `initPullInboxSchema` rewrites), but never written or reported. Readers
+ * outside pigeon (stall-watch, lanes) accept both names, and were deployed first.
+ */
+export const HUMAN_REPLY_SOURCE = "chat-reply";
+export const LEGACY_HUMAN_REPLY_SOURCE = "telegram-reply";
+export const DEFAULT_PULL_SOURCES: readonly string[] = [HUMAN_REPLY_SOURCE];
 /**
  * `swarm-remote` (pigeon-k0qn.6): also accept swarm messages relayed from another machine.
  * Meaningful only alongside `swarm`; `swarm` alone was a local-trust decision.
  */
-export const ALLOWED_PULL_SOURCES = ["telegram-reply", "swarm", "swarm-remote"] as const;
+export const ALLOWED_PULL_SOURCES = [HUMAN_REPLY_SOURCE, "swarm", "swarm-remote"] as const;
 export type PullSource = (typeof ALLOWED_PULL_SOURCES)[number];
+
+/** Maps the legacy human-reply name to the current one; any other value is returned as is. */
+export function normalizePullSource(source: string): string {
+  return source === LEGACY_HUMAN_REPLY_SOURCE ? HUMAN_REPLY_SOURCE : source;
+}
 
 export interface SessionRecord {
   sessionId: string;
@@ -59,9 +75,9 @@ export interface SessionRecord {
    * Sources this session banks messages from in `pull_inbox`.
    *
    * Effective value: if the underlying `pull_sources` column is NULL,
-   * defaults to `["telegram-reply"]`.
+   * defaults to `["chat-reply"]` (`DEFAULT_PULL_SOURCES`).
    *
-   * Gates ONLY swarm banking. chat-reply (`telegram-reply` source) banking stays active
+   * Gates ONLY swarm banking. Human-reply (`chat-reply`) banking stays active
    * regardless of whether it is listed here.
    */
   pullSources: string[];

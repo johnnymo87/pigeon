@@ -31,7 +31,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
       1_000,
       () => "gse_target",
     );
-    s.sessions.setPullSources("gse_target", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_target", ["chat-reply", "swarm"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -71,7 +71,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_pull_target", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_pull_target", ["chat-reply", "swarm"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -113,7 +113,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_no_optin", ["telegram-reply"]);
+    s.sessions.setPullSources("gse_no_optin", ["chat-reply"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -148,7 +148,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
       1_000,
       () => "gse_endpoint_no_pull_optin",
     );
-    s.sessions.setPullSources("gse_endpoint_no_pull_optin", ["telegram-reply"]);
+    s.sessions.setPullSources("gse_endpoint_no_pull_optin", ["chat-reply"]);
 
     const res = await app(
       new Request("http://localhost/swarm/send", {
@@ -205,7 +205,7 @@ describe("goose-acp swarm mailbox (Task A1)", () => {
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_sched_pull", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_sched_pull", ["chat-reply", "swarm"]);
 
     const res = await app(
       new Request("http://localhost/swarm/schedule", {
@@ -336,7 +336,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(body.error).toContain("refusing to convert");
   });
 
-  it("absent row -> creates notify: false row with endpoint/token/backend id and pull_sources ['telegram-reply', 'swarm']", async () => {
+  it("absent row -> creates notify: false row with endpoint/token/backend id and pull_sources ['chat-reply', 'swarm']", async () => {
     const { app, storage: s } = newApp(1_000);
     const res = await postMailbox(app, {
       session_id: "20261020_1",
@@ -371,7 +371,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(row!.backendSessionId).toBe("20261020_1");
     expect(row!.cwd).toBe("/repo/path");
     expect(row!.label).toBe("my goose session");
-    expect(row!.pullSources).toEqual(["telegram-reply", "swarm"]);
+    expect(row!.pullSources).toEqual(["chat-reply", "swarm"]);
   });
 
   it("refuses a legacy row (pigeon id == goose id, NULL backend id) with 409 directing to re-register", async () => {
@@ -398,7 +398,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     const row = s.sessions.get("20260918_1")!;
     expect(row.backendEndpoint).toBe("ws://old/acp");
     expect(row.lastSeen).toBe(500);
-    expect(row.pullSources).toEqual(["telegram-reply"]);
+    expect(row.pullSources).toEqual(["chat-reply"]);
   });
 
   it("present row registered via /goose/sessions -> created: false, notify: true, endpoint/label untouched, swarm added", async () => {
@@ -449,7 +449,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     expect(row.backendAuthToken).toBe("orig_tok");
     expect(row.notify).toBe(true);
     // pullSources updated
-    expect(row.pullSources).toEqual(["telegram-reply", "swarm"]);
+    expect(row.pullSources).toEqual(["chat-reply", "swarm"]);
     // touched
     expect(row.lastSeen).toBe(1_000);
   });
@@ -470,7 +470,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
 
     expect(second.created).toBe(false);
     expect(second.session_id).toBe(first.session_id);
-    expect(s.sessions.get(first.session_id)?.pullSources).toEqual(["telegram-reply", "swarm"]);
+    expect(s.sessions.get(first.session_id)?.pullSources).toEqual(["chat-reply", "swarm"]);
   });
 
   it("a later /goose/sessions keeps pull_sources and sets notify: true", async () => {
@@ -481,7 +481,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     })).json() as { session_id: string; notify: boolean };
 
     expect(mailboxRes.notify).toBe(false);
-    expect(s.sessions.get(mailboxRes.session_id)?.pullSources).toEqual(["telegram-reply", "swarm"]);
+    expect(s.sessions.get(mailboxRes.session_id)?.pullSources).toEqual(["chat-reply", "swarm"]);
 
     // Now honk telegram registers the session via POST /goose/sessions
     const sessionsRes = await app(
@@ -500,7 +500,7 @@ describe("POST /goose/swarm-mailbox (Task A2)", () => {
     const row = s.sessions.get(mailboxRes.session_id)!;
     expect(row.notify).toBe(true);
     // pullSources must still contain "swarm"!
-    expect(row.pullSources).toEqual(["telegram-reply", "swarm"]);
+    expect(row.pullSources).toEqual(["chat-reply", "swarm"]);
   });
 
   it("does not call onSessionStart for a created row", async () => {
@@ -831,7 +831,7 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_sender", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_sender", ["chat-reply", "swarm"]);
 
     notifySenderOfFailure(
       s,
@@ -927,7 +927,7 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
     const { app, storage: s } = newApp(1_000);
     // Create an opencode session with explicit pullSources
     s.sessions.upsert({ sessionId: "ses_with_sources", notify: true }, 1_000);
-    s.sessions.setPullSources("ses_with_sources", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("ses_with_sources", ["chat-reply", "swarm"]);
 
     // Create an opencode session with default pullSources (NULL in DB)
     s.sessions.upsert({ sessionId: "ses_default_sources", notify: true }, 1_000);
@@ -938,10 +938,10 @@ describe("Task A5: delivery.failed to gse_ senders and pull_sources in GET /sess
 
     const withSources = body.sessions.find((sess) => sess.session_id === "ses_with_sources");
     expect(withSources).toBeDefined();
-    expect(withSources!.pull_sources).toEqual(["telegram-reply", "swarm"]);
+    expect(withSources!.pull_sources).toEqual(["chat-reply", "swarm"]);
 
     const defaultSources = body.sessions.find((sess) => sess.session_id === "ses_default_sources");
     expect(defaultSources).toBeDefined();
-    expect(defaultSources!.pull_sources).toEqual(["telegram-reply"]);
+    expect(defaultSources!.pull_sources).toEqual(["chat-reply"]);
   });
 });

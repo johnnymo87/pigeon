@@ -26,7 +26,7 @@ describe("bankOrInsertSwarmMessage", () => {
       backendKind: PULL_BACKEND_KIND,
       notify: true,
     });
-    s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
 
     const result = bankOrInsertSwarmMessage(s, {
       msgId: "msg_1",
@@ -111,7 +111,7 @@ describe("bankOrInsertSwarmMessage", () => {
       backendKind: PULL_BACKEND_KIND,
       notify: true,
     });
-    // Default pullSources is ["telegram-reply"], "swarm" not present
+    // Default pullSources is ["chat-reply"], "swarm" not present
 
     const result = bankOrInsertSwarmMessage(s, {
       msgId: "msg_norm",
@@ -338,7 +338,7 @@ describe("bankOrInsertSwarmMessage", () => {
       notify: true,
     });
     // pullSources does NOT need "swarm"
-    s.sessions.setPullSources("gse_push", ["telegram-reply"]);
+    s.sessions.setPullSources("gse_push", ["chat-reply"]);
 
     const result = bankOrInsertSwarmMessage(s, {
       msgId: "msg_goose_push",
@@ -368,7 +368,7 @@ describe("bankOrInsertSwarmMessage", () => {
       backendEndpoint: "ws://127.0.0.1:4280/acp",
       notify: true,
     });
-    s.sessions.setPullSources("gse_push", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_push", ["chat-reply", "swarm"]);
 
     const schedResult = bankOrInsertSwarmMessage(s, {
       msgId: "msg_goose_sched",
@@ -407,7 +407,7 @@ describe("bankOrInsertSwarmMessage", () => {
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_pull_only", ["telegram-reply", "swarm"]);
+    s.sessions.setPullSources("gse_pull_only", ["chat-reply", "swarm"]);
 
     const result = bankOrInsertSwarmMessage(s, {
       msgId: "msg_pull_goose",
@@ -437,7 +437,7 @@ describe("bankOrInsertSwarmMessage", () => {
       backendEndpoint: null,
       notify: true,
     });
-    s.sessions.setPullSources("gse_no_mb", ["telegram-reply"]);
+    s.sessions.setPullSources("gse_no_mb", ["chat-reply"]);
 
     const result = bankOrInsertSwarmMessage(s, {
       msgId: "msg_no_mb",
@@ -461,8 +461,8 @@ describe("bankOrInsertSwarmMessage", () => {
   });
 
   it.each([
-    ["opted into swarm", ["telegram-reply", "swarm"]],
-    ["not opted into swarm", ["telegram-reply"]],
+    ["opted into swarm", ["chat-reply", "swarm"]],
+    ["not opted into swarm", ["chat-reply"]],
   ])("pushes a notify=false goose target with a backendEndpoint (%s): a honk chat session", (_label, sources) => {
     const s = newStorage();
     s.sessions.upsert({

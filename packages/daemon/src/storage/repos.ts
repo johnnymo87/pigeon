@@ -17,7 +17,7 @@ import type {
   StorePendingQuestionInput,
   UpsertSessionInput,
 } from "./types";
-import { ALLOWED_PULL_SOURCES, DEFAULT_PULL_SOURCES } from "./types";
+import { ALLOWED_PULL_SOURCES, DEFAULT_PULL_SOURCES, normalizePullSource } from "./types";
 
 type SqlRow = Record<string, unknown>;
 
@@ -32,7 +32,12 @@ function parsePullSources(value: unknown): string[] {
       const parsed = JSON.parse(value);
       if (Array.isArray(parsed)) {
         // Fails closed to known allowed values so corrupt or stale stored entries cannot read as opted-in.
-        return parsed.filter((elem): elem is string => typeof elem === "string" && allowedSources.has(elem));
+        // A legacy "telegram-reply" stored before pigeon-4ogz.14 reads as "chat-reply".
+        const known = parsed
+          .filter((elem): elem is string => typeof elem === "string")
+          .map(normalizePullSource)
+          .filter((elem) => allowedSources.has(elem));
+        return Array.from(new Set(known));
       }
     } catch {
       return [...DEFAULT_PULL_SOURCES];

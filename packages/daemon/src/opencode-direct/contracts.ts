@@ -8,12 +8,23 @@ export const OpencodeDirectMessageType = {
   QuestionReplyResult: "pigeon.question.reply.result",
 } as const;
 
-// The string values are persisted/wire values and keep their Telegram-era spelling (pigeon-4ogz.14).
+// The values the daemon SENDS. They keep their Telegram-era spelling for now: the
+// plugin validates incoming envelopes with isExecuteCommandEnvelope below and loads
+// it only at a serve restart, so a daemon that sent a name an older plugin does not
+// know would have every command refused. ACCEPTED_SOURCES already takes the
+// neutral names; switching these to them is the follow-up (pigeon-4ogz.14).
 export const OpencodeDirectSource = {
   ChatReply: "telegram-reply",
   ChatCallback: "telegram-callback",
   Manual: "manual",
 } as const;
+
+/** Every source an execute envelope may carry: the sent values plus their neutral names. */
+export const ACCEPTED_SOURCES: ReadonlySet<string> = new Set([
+  ...Object.values(OpencodeDirectSource),
+  "chat-reply",
+  "chat-callback",
+]);
 
 export const AckRejectReason = {
   InvalidSession: "INVALID_SESSION",
@@ -49,7 +60,7 @@ export interface ExecuteCommandEnvelope {
   commandId: string;
   sessionId: string;
   command: string;
-  source: OpencodeDirectSource;
+  source: OpencodeDirectSource | "chat-reply" | "chat-callback";
   issuedAt: number;
   deadlineMs?: number;
   metadata?: {
@@ -148,7 +159,7 @@ export function isExecuteCommandEnvelope(value: unknown): value is ExecuteComman
   if (!isNonEmptyString(record.commandId)) return false;
   if (!isNonEmptyString(record.sessionId)) return false;
   if (!isNonEmptyString(record.command)) return false;
-  if (!Object.values(OpencodeDirectSource).includes(record.source as OpencodeDirectSource)) return false;
+  if (typeof record.source !== "string" || !ACCEPTED_SOURCES.has(record.source)) return false;
   if (!isFiniteNumber(record.issuedAt)) return false;
   if (record.deadlineMs !== undefined && !isFiniteNumber(record.deadlineMs)) return false;
 

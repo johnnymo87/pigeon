@@ -1,4 +1,5 @@
 import type BetterSqlite3 from "better-sqlite3";
+import { HUMAN_REPLY_SOURCE, LEGACY_HUMAN_REPLY_SOURCE } from "./types";
 
 /**
  * The bank for PULL-mode backends: clients that are not addressable HTTP servers
@@ -89,4 +90,15 @@ export function initPullInboxSchema(db: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_pull_inbox_sweep
       ON pull_inbox(acked_at, expires_at, claimed_at);
   `);
+
+  // pigeon-4ogz.14: the human-reply source was renamed "telegram-reply" ->
+  // "chat-reply". Rows banked by an older daemon are rewritten, so a drain never
+  // returns the old name and every query here needs only the new one. Runs at
+  // every start and is a no-op once done. Readers outside pigeon accept both
+  // names, so a row claimed under the old name and re-served under the new one
+  // is still read (an ack is by msg_id, unaffected).
+  db.prepare("UPDATE pull_inbox SET source = ? WHERE source = ?").run(
+    HUMAN_REPLY_SOURCE,
+    LEGACY_HUMAN_REPLY_SOURCE,
+  );
 }

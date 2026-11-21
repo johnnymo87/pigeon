@@ -58,7 +58,7 @@ describe("GET /swarm/goose-sessions", () => {
   it("leaves out goose rows a send cannot reach, and does not count a non-tag binding as a coordinator", async () => {
     goose("gse_nomailbox00001", { endpoint: null });
     goose("gse_mailbox0000001", { endpoint: null });
-    storage.sessions.setPullSources("gse_mailbox0000001", ["telegram-reply", "swarm"], NOW);
+    storage.sessions.setPullSources("gse_mailbox0000001", ["chat-reply", "swarm"], NOW);
     goose("gse_notices0000001", { key: "stallwatch:_notices" });
     const ids = (await list()).map((s) => [s.session_id, s.program]);
     expect(ids).toEqual(expect.arrayContaining([["gse_mailbox0000001", null], ["gse_notices0000001", null]]));

@@ -1415,7 +1415,7 @@ describe("RemoteLaunchRequester", () => {
     it("integration with real createMarkGooseRemoteReachable: failed registration in handleRequest is retried and pull_sources granted on tick accept", async () => {
       storage.sessions.upsert({ sessionId: gseSessionId, backendKind: GOOSE_BACKEND_KIND, notify: true }, now);
       // Ensure initial pull_sources
-      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply"]);
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["chat-reply"]);
 
       const workerRegister = vi.fn()
         .mockResolvedValueOnce({ ok: false, error: "worker busy" })
@@ -1441,7 +1441,7 @@ describe("RemoteLaunchRequester", () => {
       expect(res.status).toBe(202);
       expect(workerRegister).toHaveBeenCalledTimes(1);
       // pull_sources NOT granted yet!
-      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply"]);
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["chat-reply"]);
 
       // In tick(), request succeeds -> grant: true retries worker registration and writes pull_sources!
       (client.request as any).mockResolvedValueOnce({ kind: "accepted", toMachine: "devbox", duplicate: false });
@@ -1449,7 +1449,7 @@ describe("RemoteLaunchRequester", () => {
       await requester.tick();
 
       expect(workerRegister).toHaveBeenCalledTimes(2);
-      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["telegram-reply", "swarm", "swarm-remote"]);
+      expect(storage.sessions.get(gseSessionId)!.pullSources).toEqual(["chat-reply", "swarm", "swarm-remote"]);
     });
   });
 

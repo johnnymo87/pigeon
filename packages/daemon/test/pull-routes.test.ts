@@ -42,7 +42,7 @@ describe("pull routes", () => {
 
   function bank(s: StorageDb, msgId: string, now = 2_000, sessionId = "ses_pull") {
     s.pullInbox.bank(
-      { msgId, sessionId, source: "telegram-reply", payload: `text ${msgId}` },
+      { msgId, sessionId, source: "chat-reply", payload: `text ${msgId}` },
       now,
     );
   }
@@ -149,7 +149,7 @@ describe("pull routes", () => {
         {
           msgId: "a1",
           sessionId: "ses_pull",
-          source: "telegram-reply",
+          source: "chat-reply",
           payload: "wait",
           senderId: "1001",
           inReplyTo: "Rebase or wait?",
@@ -172,7 +172,7 @@ describe("pull routes", () => {
 
     it("returns kind and reply_to (null for chat rows, values for swarm rows)", async () => {
       const { app, storage: s } = newApp();
-      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
       bank(s, "tg1", 2_000);
       s.pullInbox.bank(
         {
@@ -199,7 +199,7 @@ describe("pull routes", () => {
       };
 
       const chatMsg = body.messages.find((m) => m.msg_id === "tg1")!;
-      expect(chatMsg.source).toBe("telegram-reply");
+      expect(chatMsg.source).toBe("chat-reply");
       expect(chatMsg.kind).toBeNull();
       expect(chatMsg.reply_to).toBeNull();
 
@@ -209,9 +209,9 @@ describe("pull routes", () => {
       expect(swMsg.reply_to).toBe("orig_1");
     });
 
-    it("claims telegram-reply rows before swarm rows under limit", async () => {
+    it("claims chat-reply rows before swarm rows under limit", async () => {
       const { app, storage: s } = newApp();
-      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
       // swarm arrived earlier
       s.pullInbox.bank(
         { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "swarm early" },
@@ -229,7 +229,7 @@ describe("pull routes", () => {
 
     it("holds swarm rows when session is not opted into swarm, and serves them on re-opt-in", async () => {
       const { app, storage: s } = newApp();
-      // ses_pull has default pullSources: ["telegram-reply"] (opted out of swarm)
+      // ses_pull has default pullSources: ["chat-reply"] (opted out of swarm)
       bank(s, "tg1", 2_000);
       s.pullInbox.bank(
         { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "held swarm message" },
@@ -248,7 +248,7 @@ describe("pull routes", () => {
       const pending1Body = (await pending1.json()) as { pending: number; by_source: Record<string, number> };
       expect(pending1Body.pending).toBe(1); // tg1 is claimed but unacked
       expect(pending1Body.by_source).toEqual({
-        "telegram-reply": 1,
+        "chat-reply": 1,
         swarm: 0,
       });
 
@@ -268,14 +268,14 @@ describe("pull routes", () => {
       const pending2Body = (await pending2.json()) as { pending: number; by_source: Record<string, number> };
       expect(pending2Body.pending).toBe(0);
       expect(pending2Body.by_source).toEqual({
-        "telegram-reply": 0,
+        "chat-reply": 0,
         swarm: 0,
       });
 
       // Now session re-opts into swarm via session-start
       const reopt = await post(app, "/session-start", {
         session_id: "ses_pull",
-        pull_sources: ["telegram-reply", "swarm"],
+        pull_sources: ["chat-reply", "swarm"],
       });
       expect(reopt.status).toBe(200);
 
@@ -284,7 +284,7 @@ describe("pull routes", () => {
       const pending3Body = (await pending3.json()) as { pending: number; by_source: Record<string, number> };
       expect(pending3Body.pending).toBe(1);
       expect(pending3Body.by_source).toEqual({
-        "telegram-reply": 0,
+        "chat-reply": 0,
         swarm: 1,
       });
 
@@ -298,7 +298,7 @@ describe("pull routes", () => {
       // Session opts out again BEFORE acking sw1
       const optout = await post(app, "/session-start", {
         session_id: "ses_pull",
-        pull_sources: ["telegram-reply"],
+        pull_sources: ["chat-reply"],
       });
       expect(optout.status).toBe(200);
 
@@ -373,7 +373,7 @@ describe("pull routes", () => {
         backend_kind: PULL_BACKEND_KIND,
         pending: 1,
         by_source: {
-          "telegram-reply": 1,
+          "chat-reply": 1,
           swarm: 0,
         },
         swarm_pending: [],
@@ -381,9 +381,9 @@ describe("pull routes", () => {
       });
     });
 
-    it("reports by_source breakdown with both telegram-reply and swarm keys", async () => {
+    it("reports by_source breakdown with both chat-reply and swarm keys", async () => {
       const { app, storage: s } = newApp();
-      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
       bank(s, "tg1", 2_000);
       s.pullInbox.bank(
         { msgId: "sw1", sessionId: "ses_pull", source: "swarm", payload: "sw" },
@@ -395,14 +395,14 @@ describe("pull routes", () => {
       const body = (await res.json()) as { pending: number; by_source: Record<string, number> };
       expect(body.pending).toBe(2);
       expect(body.by_source).toEqual({
-        "telegram-reply": 1,
+        "chat-reply": 1,
         swarm: 1,
       });
     });
 
     it("reports swarm_pending with sender ids, metadata, and length equal to by_source.swarm under the limit", async () => {
       const { app, storage: s } = newApp();
-      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
       s.pullInbox.bank(
         {
           msgId: "sw1",
@@ -475,7 +475,7 @@ describe("pull routes", () => {
 
     it("returns empty swarm_pending when swarm is held (session not opted in)", async () => {
       const { app, storage: s } = newApp();
-      // ses_pull has default pull_sources ["telegram-reply"] (not opted in to swarm)
+      // ses_pull has default pull_sources ["chat-reply"] (not opted in to swarm)
       s.pullInbox.bank(
         {
           msgId: "sw_held",
@@ -513,7 +513,7 @@ describe("pull routes", () => {
       expect(body.session_known).toBe(false);
       expect(body.pending).toBe(0);
       expect(body.by_source).toEqual({
-        "telegram-reply": 0,
+        "chat-reply": 0,
         swarm: 0,
       });
       expect(body.swarm_pending).toEqual([]);
@@ -522,7 +522,7 @@ describe("pull routes", () => {
 
     it("sets swarm_pending_truncated to true and caps swarm_pending at 50 when more than 50 swarm messages are pending", async () => {
       const { app, storage: s } = newApp();
-      s.sessions.setPullSources("ses_pull", ["telegram-reply", "swarm"]);
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
       for (let i = 1; i <= 55; i++) {
         s.pullInbox.bank(
           {
@@ -561,7 +561,7 @@ describe("pull routes", () => {
         session_known: false,
         pending: 0,
         by_source: {
-          "telegram-reply": 0,
+          "chat-reply": 0,
           swarm: 0,
         },
       });
@@ -578,24 +578,24 @@ describe("pull routes", () => {
       const { app, storage: s } = newApp();
       const res = await post(app, "/session-start", {
         session_id: "ses_pull",
-        pull_sources: ["telegram-reply", "swarm"],
+        pull_sources: ["chat-reply", "swarm"],
       });
       expect(res.status).toBe(200);
       const session = s.sessions.get("ses_pull");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["telegram-reply", "swarm"]);
+      expect(session!.pullSources).toEqual(["chat-reply", "swarm"]);
     });
 
     it("deduplicates pull_sources", async () => {
       const { app, storage: s } = newApp();
       const res = await post(app, "/session-start", {
         session_id: "ses_pull",
-        pull_sources: ["swarm", "swarm", "telegram-reply"],
+        pull_sources: ["swarm", "swarm", "chat-reply"],
       });
       expect(res.status).toBe(200);
       const session = s.sessions.get("ses_pull");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["swarm", "telegram-reply"]);
+      expect(session!.pullSources).toEqual(["swarm", "chat-reply"]);
     });
 
     it("accepts empty array []", async () => {
@@ -627,7 +627,7 @@ describe("pull routes", () => {
       expect(res2.status).toBe(200);
       const session = s.sessions.get("ses_pull");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["telegram-reply"]);
+      expect(session!.pullSources).toEqual(["chat-reply"]);
 
       // Verify column in DB is reset to NULL
       const rawRow = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_pull") as { pull_sources: string | null };
@@ -642,7 +642,7 @@ describe("pull routes", () => {
         pull_sources: null,
       });
       expect(res1.status).toBe(200);
-      expect(s.sessions.get("ses_null_fresh")!.pullSources).toEqual(["telegram-reply"]);
+      expect(s.sessions.get("ses_null_fresh")!.pullSources).toEqual(["chat-reply"]);
       const raw1 = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_null_fresh") as { pull_sources: string | null };
       expect(raw1.pull_sources).toBeNull();
 
@@ -658,7 +658,7 @@ describe("pull routes", () => {
         pull_sources: null,
       });
       expect(res2.status).toBe(200);
-      expect(s.sessions.get("ses_null_reset")!.pullSources).toEqual(["telegram-reply"]);
+      expect(s.sessions.get("ses_null_reset")!.pullSources).toEqual(["chat-reply"]);
       const raw2 = s.db.prepare("SELECT pull_sources FROM sessions WHERE session_id = ?").get("ses_null_reset") as { pull_sources: string | null };
       expect(raw2.pull_sources).toBeNull();
     });
@@ -674,7 +674,7 @@ describe("pull routes", () => {
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
+        expect(body.error).toBe("pull_sources must be an array of: chat-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid")).toBeNull();
       }
 
@@ -686,19 +686,19 @@ describe("pull routes", () => {
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
+        expect(body.error).toBe("pull_sources must be an array of: chat-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid2")).toBeNull();
       }
 
       // Unknown values
-      for (const invalid of [["unknown"], ["telegram-reply", "webhook"]]) {
+      for (const invalid of [["unknown"], ["chat-reply", "webhook"]]) {
         const res = await post(app, "/session-start", {
           session_id: "ses_new_invalid3",
           pull_sources: invalid,
         });
         expect(res.status).toBe(400);
         const body = (await res.json()) as { error: string };
-        expect(body.error).toBe("pull_sources must be an array of: telegram-reply, swarm, swarm-remote");
+        expect(body.error).toBe("pull_sources must be an array of: chat-reply, swarm, swarm-remote");
         expect(s.sessions.get("ses_new_invalid3")).toBeNull();
       }
 

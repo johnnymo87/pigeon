@@ -374,7 +374,7 @@ describe("storage schema and repositories", () => {
   });
 
   describe("SessionRepository pullSources", () => {
-    it("defaults to ['telegram-reply'] for a fresh session", () => {
+    it("defaults to ['chat-reply'] for a fresh session", () => {
       const storage = createStorage();
       storage.sessions.upsert({
         sessionId: "sess-fresh",
@@ -384,7 +384,7 @@ describe("storage schema and repositories", () => {
 
       const session = storage.sessions.get("sess-fresh");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["telegram-reply"]);
+      expect(session!.pullSources).toEqual(["chat-reply"]);
       storage.db.close();
     });
 
@@ -396,12 +396,12 @@ describe("storage schema and repositories", () => {
         notify: true,
       }, 1_000);
 
-      const updated = storage.sessions.setPullSources("sess-custom", ["telegram-reply", "swarm"], 2_000);
+      const updated = storage.sessions.setPullSources("sess-custom", ["chat-reply", "swarm"], 2_000);
       expect(updated).toBe(true);
 
       const session = storage.sessions.get("sess-custom");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["telegram-reply", "swarm"]);
+      expect(session!.pullSources).toEqual(["chat-reply", "swarm"]);
       expect(session!.updatedAt).toBe(2_000);
       storage.db.close();
     });
@@ -423,7 +423,7 @@ describe("storage schema and repositories", () => {
       storage.db.close();
     });
 
-    it("setPullSources with null resets column to NULL (defaulting to ['telegram-reply'])", () => {
+    it("setPullSources with null resets column to NULL (defaulting to ['chat-reply'])", () => {
       const storage = createStorage();
       storage.sessions.upsert({
         sessionId: "sess-reset",
@@ -439,7 +439,7 @@ describe("storage schema and repositories", () => {
 
       const session = storage.sessions.get("sess-reset");
       expect(session).not.toBeNull();
-      expect(session!.pullSources).toEqual(["telegram-reply"]);
+      expect(session!.pullSources).toEqual(["chat-reply"]);
       expect(session!.updatedAt).toBe(3_000);
 
       // Verify underlying column in DB is actually null
@@ -466,14 +466,14 @@ describe("storage schema and repositories", () => {
 
       // 1. Malformed JSON string
       storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run("{not-json", "sess-corrupt");
-      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["chat-reply"]);
 
       // 2. Non-array JSON (e.g. object or number)
       storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run(JSON.stringify({ not: "array" }), "sess-corrupt");
-      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["chat-reply"]);
 
       storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run("123", "sess-corrupt");
-      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["telegram-reply"]);
+      expect(storage.sessions.get("sess-corrupt")!.pullSources).toEqual(["chat-reply"]);
 
       // 3. Array with non-string and unknown elements filters to only allowed strings
       storage.db.prepare("UPDATE sessions SET pull_sources = ? WHERE session_id = ?").run(JSON.stringify([123, "invalid", "swarm", null]), "sess-corrupt");
@@ -962,7 +962,7 @@ describe("storage schema and repositories", () => {
 
         const session = storage1.sessions.get("legacy-sess");
         expect(session).not.toBeNull();
-        expect(session!.pullSources).toEqual(["telegram-reply"]);
+        expect(session!.pullSources).toEqual(["chat-reply"]);
 
         storage1.db.close();
 
