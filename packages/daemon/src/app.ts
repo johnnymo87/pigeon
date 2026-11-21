@@ -33,6 +33,7 @@ import type { RemoteLaunchRequester } from "./swarm/remote-launch-requester";
 import { hashPrompt } from "./hash-prompt";
 import { TgMessageBuilder } from "./telegram-message";
 import { buildRichMarkdown } from "./rich-markdown";
+import type { ChatTransportName } from "./chat-transport-state";
 import { tokenFingerprint } from "./adapters/direct-channel";
 import { PULL_BACKEND_KIND, isPullBackend } from "./adapters/goose-pull";
 import type { RemoteSessionsResult, WorkerResult } from "./worker/poller";
@@ -297,6 +298,12 @@ export interface TagLookup {
 
 export interface AppOptions {
   nowFn?: () => number;
+  /**
+   * The machine's persisted `whoami.transport` (pigeon-4ogz.5). Slack makes the stop path write
+   * Slack-dialect rich markdown and flags questions for the owner mention. Absent or Telegram:
+   * every payload is exactly what it was.
+   */
+  chatTransport?: () => ChatTransportName | undefined;
   tagLookup?: TagLookup;
   notifier?: StopNotifier;
   onSessionStart?: (sessionId: string, notify: boolean, label?: string | null) => Promise<WorkerResult | void> | void;
@@ -738,8 +745,13 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
     // A goose turn is offered rich whatever it contains (pigeon-6mkr): goose agents write
     // markdown and nothing strips it, unlike opencode's plugin. All goose stops (hook turns,
     // runner turns, runner notices) come through here on a goose-acp session.
+    // On Slack the markdown is written in Slack's dialect and says so (pigeon-4ogz.5): the
+    // worker sends rich only to a target whose dialect matches, and plain otherwise, so a flip
+    // between enqueue and send costs formatting, never the message.
+    const slackDialect = opts.chatTransport?.() === "slack";
     const richMarkdown = buildRichMarkdown(notification.header, notification.body, notification.footer, {
       requireTable: session.backendKind !== GOOSE_BACKEND_KIND,
+      ...(slackDialect ? { dialect: "slack" as const } : {}),
     });
     const notificationPayload = {
       messages: chunks.map(c => ({ text: c.text, entities: c.entities })),
@@ -748,7 +760,9 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
       title: effectiveTitle ?? undefined,
       dir: session.cwd ?? undefined,
       threaded: true,
-      ...(richMarkdown !== null ? { rich: { markdown: richMarkdown } } : {}),
+      ...(richMarkdown !== null
+        ? { rich: slackDialect ? { markdown: richMarkdown, dialect: "slack" } : { markdown: richMarkdown } }
+        : {}),
     };
 
     // The goose runner's answer to a swarm message (s:<sid>:swarm-<msgId>) waits behind that
@@ -873,6 +887,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         // a plain alert in General after at most five sends.
         let replyMarkup = keyboard;
         let thread = resolvedTopic?.messageThreadId;
+        // The chat the worker says the topic is in (pigeon-4ogz.5). Only a Slack address is
+        // passed on: a Telegram topic is in the notifier's own chat, and leaving it out keeps
+        // that send exactly as it was. Dropped together with the thread.
+        const slackChat = (t: { chatId?: string } | undefined) =>
+          t?.chatId?.startsWith("slack:") ? t.chatId : undefined;
+        let topicChat = slackChat(resolvedTopic);
         let createdThread = resolvedTopic?.created ? thread : undefined;
         let recreated = false;
         try {
@@ -881,12 +901,15 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
               await notifier.sendPlainAlert(text, severity, {
                 ...(replyMarkup ? { replyMarkup } : {}),
                 ...(thread !== undefined ? { messageThreadId: thread } : {}),
+                ...(thread !== undefined && topicChat !== undefined ? { chatId: topicChat } : {}),
                 timeoutMs: remaining(),
               });
               break;
             } catch (err) {
               if (!(err instanceof TelegramSendError && err.status === 400)) throw err;
-              if (thread !== undefined && !recreated && /thread not found/i.test(err.description ?? "")) {
+              const gone =
+                err.errorClass === "conversation_gone" || /thread not found/i.test(err.description ?? "");
+              if (thread !== undefined && !recreated && gone) {
                 // The topic was deleted out of band: have the worker drop the
                 // stale mapping and make a new one, then try once more in it.
                 recreated = true;
@@ -903,6 +926,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
                 }
                 console.warn(`[alert] topic thread ${thread} not found; ${again ? `recreated as ${again.messageThreadId}` : "posting to General"}`);
                 thread = again?.messageThreadId;
+                topicChat = slackChat(again);
                 createdThread = again?.created ? thread : undefined;
               } else if (replyMarkup) {
                 console.warn(`[alert] Telegram rejected the alert with buttons (${err.message}); resending without them`);
@@ -929,7 +953,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
 
         // Telegram pins the first message of a new topic. Clear it, best-effort
         // and off the response path.
-        if (createdThread !== undefined && thread === createdThread && notifier.unpinTopic) {
+        if (createdThread !== undefined && thread === createdThread && topicChat === undefined && notifier.unpinTopic) {
           notifier.unpinTopic(createdThread).catch((err: unknown) => {
             console.warn(`[alert] unpin of new topic ${createdThread} failed: ${err instanceof Error ? err.message : String(err)}`);
           });
@@ -2224,6 +2248,7 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           title?: string;
           dir?: string;
           threaded?: boolean;
+          notifyOwner?: true;
         };
 
         if (questions.length > 1) {
@@ -2267,6 +2292,10 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             threaded: !quiet,
           };
         }
+
+        // A question asks for the owner mention on Slack (D7, pigeon-4ogz.5); the worker's
+        // SLACK_NOTIFY_OWNER decides whether it becomes one. Telegram payloads are unchanged.
+        if (opts.chatTransport?.() === "slack") notificationPayload.notifyOwner = true;
 
         // Store in outbox — background sender will deliver to Telegram
         storage.outbox.upsert({

@@ -34,6 +34,7 @@ import {
 import { severityPrefix, type DirectTelegramAlarm } from "./direct-telegram-alarm";
 import type { WorkerMessageClient, WorkerSendOutcome } from "./worker/worker-message-client";
 import type { WorkerHealthAlertSink } from "./worker/worker-health";
+import type { ChatTransportName } from "./chat-transport-state";
 
 /** Worker-leg cap when a direct path exists. Above the worker's ~4s Telegram abort. */
 export const WORKER_LEG_MS = 5_000;
@@ -60,6 +61,12 @@ export interface AlertNotifierDeps {
   chatId: string;
   worker?: Pick<WorkerMessageClient, "sendMessage" | "unpinTopic">;
   direct?: Pick<DirectTelegramAlarm, "sendPlainAlert">;
+  /**
+   * The machine's persisted `whoami.transport` (pigeon-4ogz.5). On Slack an error-severity
+   * alert asks the worker for the owner mention (`notifyOwner`, D7; the worker's
+   * `SLACK_NOTIFY_OWNER` still decides). Absent or Telegram: the wire is unchanged.
+   */
+  transport?: () => ChatTransportName | undefined;
   /** Where the throttled "alerts are bypassing the worker" alert is recorded. */
   alerts?: WorkerHealthAlertSink;
   machineId?: string;
@@ -118,8 +125,9 @@ class AlertNotifier {
     const workerBudget = direct ? Math.min(WORKER_LEG_MS, total - DIRECT_RESERVE_MS) : total;
     const outcome = await worker.sendMessage(
       {
-        chatId: this.deps.chatId,
+        chatId: options?.chatId ?? this.deps.chatId,
         text: `${severityPrefix(severity)}${text}`,
+        ...(severity === "error" && this.deps.transport?.() === "slack" ? { notifyOwner: true } : {}),
         ...(options?.messageThreadId !== undefined ? { messageThreadId: options.messageThreadId } : {}),
         ...(options?.replyMarkup ? { urlButtons: options.replyMarkup.inline_keyboard } : {}),
         // Keep the worker's Telegram abort under our own cap, so a slow Telegram is a
@@ -139,6 +147,7 @@ class AlertNotifier {
         outcome.status,
         `Telegram sendMessage returned ${outcome.status} (via worker)`,
         outcome.description,
+        outcome.errorClass,
       );
     }
 

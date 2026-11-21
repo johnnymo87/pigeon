@@ -887,6 +887,22 @@ describe("/messages/send authorization", () => {
     expect(((await ok.json()) as { chatId: string }).chatId).toBe(chat);
   });
 
+  it("notifyOwner on a Slack send mentions the owner only under the errors category", async () => {
+    const m = await mkMachine({ slack: true });
+    const handle = await seedChannel(m.ws!.teamId, "CNOTIFY1");
+    const textOf = async (extra: Record<string, unknown>, body: Record<string, unknown>) => {
+      slackCalls.length = 0;
+      slack("chat.postMessage", posted("CNOTIFY1"));
+      const res = await send(envFor([m], extra), m.key, { chatId: slackChatId(m.ws!), messageThreadId: handle, ...body });
+      expect(res.status).toBe(200);
+      return slackOf("chat.postMessage")[0]?.params.get("text") ?? "";
+    };
+    expect(await textOf({}, { notifyOwner: true })).not.toContain("<@U0OWNER>");
+    expect(await textOf({ SLACK_NOTIFY_OWNER: "questions" }, { notifyOwner: true })).not.toContain("<@U0OWNER>");
+    expect(await textOf({ SLACK_NOTIFY_OWNER: "errors" }, { notifyOwner: true })).toContain("<@U0OWNER>");
+    expect(await textOf({ SLACK_NOTIFY_OWNER: "errors" }, {})).not.toContain("<@U0OWNER>");
+  });
+
   it("a team with no configured workspace is 403, even with a commands row", async () => {
     const m = await mkMachine({ slack: true });
     const chat = "slack:TNOWORKSPACE";

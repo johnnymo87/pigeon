@@ -228,6 +228,10 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
         ...(entities !== undefined ? { entities: entities as unknown[] } : {}),
         ...(addr.threadId !== undefined ? { messageThreadId: addr.threadId } : {}),
         ...(urlButtons && urlButtons.length > 0 ? { replyMarkup: { inline_keyboard: urlButtons } } : {}),
+        // `notifyOwner: true` (an error-severity alert, pigeon-4ogz.5) asks for the owner
+        // mention under the `errors` category; SLACK_NOTIFY_OWNER decides. Slack only: a
+        // Telegram send is called exactly as before.
+        ...(addr.slack && body.notifyOwner === true ? { notifyOwner: true, notifyCategory: "errors" as const } : {}),
         signal,
       }),
       (r) => ({ messageId: r.message_id }),

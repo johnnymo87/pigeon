@@ -5,6 +5,7 @@ import {
   DEFAULT_STUCK_ABORT_SILENCE_MS,
   DEFAULT_MAX_REQUEUES,
 } from "./swarm/delivery-watchdog";
+import { parseSlackWebhookUrl } from "./direct-slack-alarm";
 
 export interface DaemonConfig {
   port: number;
@@ -67,6 +68,26 @@ export interface DaemonConfig {
    * member of an allowed group chat, which is not the same thing as "the owner".
    */
   pullAllowedUserIds: string[];
+  /**
+   * The incoming-webhook URL of this machine's Slack `#alerts` (`PIGEON_SLACK_ALARM_WEBHOOK_URL`,
+   * pigeon-4ogz.5): the direct alarm path once the machine is on Slack. Empty counts as unset (the
+   * start script exports "" when the secret file is unreadable), and so does anything that is
+   * not an `https://hooks.slack.com/` URL.
+   */
+  slackAlarmWebhookUrl?: string;
+  /** The owner's Slack user id (`PIGEON_SLACK_OWNER_USER_ID`), for the direct alarm's mention. */
+  slackOwnerUserId?: string;
+  /**
+   * `PIGEON_SLACK_NOTIFY_OWNER=1`: the direct Slack alarm mentions the owner (D7: off by default,
+   * so nothing pushes).
+   */
+  slackNotifyOwner?: boolean;
+}
+
+/** A Slack user id (`U…`/`W…`), or undefined. */
+export function parseSlackUserId(value: string | undefined): string | undefined {
+  const v = value?.trim();
+  return v && /^[UW][A-Z0-9]{2,}$/.test(v) ? v : undefined;
 }
 
 const DEFAULT_PORT = 4731;
@@ -162,5 +183,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     swarmRelaySend: env.PIGEON_SWARM_RELAY_SEND?.trim() === "1",
     remoteLaunchFrom: parseMachineList(env.PIGEON_REMOTE_LAUNCH_FROM, env.CCR_MACHINE_ID?.trim()),
     remoteLaunchSend: env.PIGEON_REMOTE_LAUNCH_SEND?.trim() === "1",
+    slackAlarmWebhookUrl: parseSlackWebhookUrl(env.PIGEON_SLACK_ALARM_WEBHOOK_URL),
+    slackOwnerUserId: parseSlackUserId(env.PIGEON_SLACK_OWNER_USER_ID),
+    slackNotifyOwner: env.PIGEON_SLACK_NOTIFY_OWNER?.trim() === "1" ? true : undefined,
   };
 }

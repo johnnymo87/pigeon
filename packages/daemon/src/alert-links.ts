@@ -38,6 +38,12 @@ export interface TopicInfo {
   chatId: string;
   messageThreadId: number | null;
   state: "open" | "closed";
+  /**
+   * The conversation's link, from a worker that knows it (pigeon-4ogz.5): present only on Slack
+   * rows, `null` when the worker could not build one. Absent means a Telegram row, whose link
+   * the daemon builds itself (`topicUrl`).
+   */
+  url?: string | null;
 }
 
 export type TopicMap = Record<string, TopicInfo | null>;
@@ -117,7 +123,9 @@ export function buildAlertKeyboard(links: AlertLink[], topics: TopicMap): UrlKey
       ? topics[link.sessionId]
       : undefined;
     if (!isTopicInfo(topic)) continue;
-    const url = topicUrl(topic.chatId, topic.messageThreadId);
+    const url = "url" in topic && topic.url !== undefined
+      ? typeof topic.url === "string" && /^https:\/\/\S+$/.test(topic.url) ? topic.url : null
+      : topicUrl(topic.chatId, topic.messageThreadId);
     if (!url) continue;
     rows.push([{ text: link.label, url }]);
   }

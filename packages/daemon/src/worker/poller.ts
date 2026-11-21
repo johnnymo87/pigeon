@@ -27,7 +27,9 @@ export interface SendNotificationInput {
    * `text`/`entities` are still this chunk's plain rendering: the worker falls back to them on
    * a rich rejection, and a worker that predates rich ignores this field and sends them.
    */
-  rich?: { markdown: string };
+  rich?: { markdown: string; dialect?: "slack" };
+  /** Ask for the owner mention (Slack only; pigeon-4ogz.5). Sent only when true. */
+  notifyOwner?: boolean;
 }
 
 export type WorkerResultSuccess<T = unknown> = {
@@ -182,6 +184,11 @@ export interface PollerConfig {
    * `relayPollHeader`. Absent: no header, so the worker hands this daemon no relay items.
    */
   relayHeader?: string | null;
+  /**
+   * Read per poll instead of `relayHeader` when set (pigeon-4ogz.5): launch capability now
+   * depends on the persisted `whoami.transport`, so a flip changes the header without a restart.
+   */
+  relayHeaderFn?: () => string | null;
 }
 
 export interface ExecuteMessage {
@@ -447,7 +454,8 @@ export const POLL_AUTH_ALERT_THRESHOLD = 12;
 
 /** What the worker says this daemon's credential is (`GET /whoami`, pigeon-k0qn.8). */
 export type WorkerIdentity =
-  | { kind: "machine"; machineId: string }
+  /** `transport` is present only when the worker says the machine is on Slack (pigeon-4ogz.5). */
+  | { kind: "machine"; machineId: string; transport?: "slack" }
   | { kind: "shared" }
   | { kind: "rejected"; status: number }
   | { kind: "unsupported" }
@@ -549,6 +557,7 @@ export class Poller {
    */
   async pollNext(): Promise<{ msg: WorkerMessage | null; swarm: unknown[]; launches: unknown[] }> {
     const url = `${this.config.workerUrl}/machines/${encodeURIComponent(this.config.machineId)}/next`;
+    const relayHeader = this.config.relayHeaderFn ? this.config.relayHeaderFn() : this.config.relayHeader;
     const response = await this.fetchFn(url, {
       headers: {
         Authorization: `Bearer ${this.config.apiKey}`,
@@ -557,7 +566,7 @@ export class Poller {
         // empty value instead would be read as "I can serve nothing" and
         // refuse everything.
         ...(this.config.backends ? { [BACKENDS_HEADER]: this.config.backends } : {}),
-        ...(this.config.relayHeader ? { [SWARM_RELAY_HEADER]: this.config.relayHeader } : {}),
+        ...(relayHeader ? { [SWARM_RELAY_HEADER]: relayHeader } : {}),
       },
     });
 
@@ -605,9 +614,13 @@ export class Poller {
         return { kind: "rejected", status: response.status };
       }
       if (!response.ok) return { kind: "unknown", error: `status ${response.status}` };
-      const body = (await response.json()) as { credential?: unknown; machine_id?: unknown };
+      const body = (await response.json()) as { credential?: unknown; machine_id?: unknown; transport?: unknown };
       if (body.credential === "machine" && typeof body.machine_id === "string") {
-        return { kind: "machine", machineId: body.machine_id };
+        // Absent (or anything but "slack") in a 200 is Telegram: the worker adds the field only
+        // for a machine on Slack, so a Telegram machine's identity stays exactly what it was.
+        return body.transport === "slack"
+          ? { kind: "machine", machineId: body.machine_id, transport: "slack" }
+          : { kind: "machine", machineId: body.machine_id };
       }
       if (body.credential === "shared") return { kind: "shared" };
       return { kind: "unknown", error: "unrecognised whoami body" };
@@ -890,7 +903,7 @@ export class Poller {
   async resolveNamedTopic(
     req: { key: string; name: string; staleThreadId?: number },
     signal?: AbortSignal,
-  ): Promise<{ messageThreadId: number; created: boolean }> {
+  ): Promise<{ messageThreadId: number; created: boolean; chatId?: string }> {
     if (!this.config.chatId) throw new Error("no chat configured");
     const response = await this.fetchFn(`${this.config.workerUrl}/topics/named`, {
       method: "POST",
@@ -902,9 +915,15 @@ export class Poller {
       ...(signal ? { signal } : {}),
     });
     if (!response.ok) throw new Error(`topics/named returned ${response.status}`);
-    const body = (await response.json()) as { messageThreadId?: unknown; created?: unknown };
+    const body = (await response.json()) as { messageThreadId?: unknown; created?: unknown; chatId?: unknown };
     if (typeof body?.messageThreadId !== "number") throw new Error("topics/named returned no thread");
-    return { messageThreadId: body.messageThreadId, created: body.created === true };
+    // The worker resolves the chat itself (a machine on Slack gets its workspace whatever we
+    // sent), so the returned one is where the topic is (pigeon-4ogz.5).
+    return {
+      messageThreadId: body.messageThreadId,
+      created: body.created === true,
+      ...(typeof body.chatId === "string" && body.chatId.length > 0 ? { chatId: body.chatId } : {}),
+    };
   }
 
   /**
@@ -915,7 +934,7 @@ export class Poller {
   async bindNamedTopic(
     req: { sessionId: string; key: string; name: string },
     signal?: AbortSignal,
-  ): Promise<{ messageThreadId: number }> {
+  ): Promise<{ messageThreadId: number; chatId?: string }> {
     if (!this.config.chatId) throw new Error("no chat configured");
     const response = await this.fetchFn(`${this.config.workerUrl}/topics/named/bind`, {
       method: "POST",
@@ -936,11 +955,14 @@ export class Poller {
       }
       throw new Error(`topics/named/bind returned ${response.status}${errDetail}`);
     }
-    const body = (await response.json()) as { messageThreadId?: unknown; bound?: unknown };
+    const body = (await response.json()) as { messageThreadId?: unknown; bound?: unknown; chatId?: unknown };
     if (typeof body?.messageThreadId !== "number" || body?.bound !== true) {
       throw new Error("topics/named/bind returned invalid response");
     }
-    return { messageThreadId: body.messageThreadId };
+    return {
+      messageThreadId: body.messageThreadId,
+      ...(typeof body.chatId === "string" && body.chatId.length > 0 ? { chatId: body.chatId } : {}),
+    };
   }
 
   /**
@@ -1011,7 +1033,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich } = input;
+    const { sessionId, chatId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -1032,6 +1054,7 @@ export class Poller {
           ...(threaded !== undefined ? { threaded } : {}),
           ...(onTopicUnavailable !== undefined ? { onTopicUnavailable } : {}),
           ...(rich ? { rich } : {}),
+          ...(notifyOwner === true ? { notifyOwner: true } : {}),
         }),
       }),
     );
