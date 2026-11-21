@@ -100,6 +100,11 @@ at 13:36Z (after every flip): find out what they are before deleting the webhook
 - Delete `docs/runbooks/telegram-forum-migration.md`, Telegram sections of AGENTS.md and skills.
 
 ### Workstation (per host, only after positive evidence PR B runs THERE: oracle 1)
+- Evidence = the daemon's startup lines `[chat] Slack only (Telegram removed, pigeon-4ogz.13)` and
+  `[alert] direct path: slack=set`.
+- Rollback window: reverting PR B on a host is safe only while that host still exports
+  `TELEGRAM_CHAT_ID` (old code skips the outbox and alert notifier without it, silently). After the
+  workstation commit, there is no daemon rollback either.
 - Remove `TELEGRAM_*` exports and sops declarations (devbox, cloudbox), `telegram_*` keys from
   `secrets/devbox.yaml`, darwin Keychain reads + setup prompts, the Telegram owner id from
   `PIGEON_PULL_ALLOWED_USER_IDS` and the flake checks pinning it.
@@ -115,4 +120,7 @@ at 13:36Z (after every flip): find out what they are before deleting the webhook
 - Close `pigeon-4ogz.24` (superseded). Reconcile epic prose. `.14` unblocks.
 
 ## Progress log
-(append as PRs land)
+- PR A #245 merged 4c3e876, worker deployed b0303bac (2026-11-21 ~15:30Z). Webhook deleted, D1
+  purged (topics 2307, named_topics 41, messages 25674), `seen_updates` dropped, worker Telegram
+  secrets deleted. Deployed plain vars left inert.
+- PR B (daemon + plugin) opened.
