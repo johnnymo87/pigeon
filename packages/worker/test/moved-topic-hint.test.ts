@@ -70,7 +70,15 @@ async function namedTopic(chatId: string, key: string, thread: number, name: str
     .run();
 }
 
-async function bind(chatId: string, key: string, sessionId: string) {
+/** Bind `key` in `chatId` to `sessionId`, registered to `machineId` unless that is null (a dead binding). */
+async function bind(chatId: string, key: string, sessionId: string, machineId: string | null = "devbox") {
+  if (machineId !== null) {
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'coord', 0, 0)",
+    )
+      .bind(sessionId, machineId)
+      .run();
+  }
   await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, 0)")
     .bind(chatId, key, sessionId)
     .run();
@@ -125,7 +133,7 @@ describe("maybeAnswerInNamedTopic: a coordinator that moved transport", () => {
     expect(tgTexts).toEqual([
       movedTopicHintText("slack", "📋 chat-transport", "https://acme.slack.com/archives/C0CKM80JXD1"),
     ]);
-    expect(tgTexts[0]).toContain("moved to a Slack channel (📋 chat-transport)");
+    expect(tgTexts[0]).toContain("moved to a Slack channel (📋 chat-transport). It reads and answers there");
     expect(tgTexts[0]).not.toContain("digest");
 
     // The rate limit still holds: a second message inside the window gets no answer.
@@ -169,9 +177,15 @@ describe("maybeAnswerInNamedTopic: a coordinator that moved transport", () => {
     await namedTopic(TG_CHAT, key, oldThread, "📋 two");
     await slackChannel(a.ws, "CAAA", key);
     await slackChannel(b.ws, "CBBB", key);
-    const sa = `gse_${stamp()}`;
-    await bind(slackChatId(a.ws), key, sa);
-    await bind(slackChatId(b.ws), key, `gse_${stamp()}`);
+    await bind(slackChatId(a.ws), key, `gse_${stamp()}`, a.machineId);
+    await bind(slackChatId(b.ws), key, `gse_${stamp()}`, b.machineId);
+    // An older session of machine a posted here (the coordinator before a rotation).
+    const old = `gse_${stamp()}`;
+    await env.DB.prepare(
+      "INSERT INTO sessions (session_id, machine_id, label, created_at, updated_at) VALUES (?, ?, 'old', 0, 0)",
+    )
+      .bind(old, a.machineId)
+      .run();
 
     tgSend();
     expect(await maybeAnswerInNamedTopic(env.DB, envFor(a, b), TG_CHAT, oldThread)).toBe(true);
@@ -180,7 +194,7 @@ describe("maybeAnswerInNamedTopic: a coordinator that moved transport", () => {
     await env.DB.prepare(
       "INSERT INTO messages (chat_id, message_id, session_id, token, created_at) VALUES (?, ?, ?, 'tok', 0)",
     )
-      .bind(TG_CHAT, 900000 + counter, sa)
+      .bind(TG_CHAT, 900000 + counter, old)
       .run();
     await env.DB.prepare("UPDATE named_topics SET hint_at = NULL WHERE chat_id = ? AND topic_key = ?").bind(TG_CHAT, key).run();
     tgSend();
@@ -200,7 +214,7 @@ describe("maybeAnswerInNamedTopic: a coordinator that moved transport", () => {
     expect(tgTexts).toEqual([NAMED_TOPIC_HINT_TEXT]);
   });
 
-  it("key still bound in this chat (session row gone): the stock hint, not a redirect", async () => {
+  it("key still bound in this chat: the stock hint, not a redirect", async () => {
     const m = mkWs();
     const key = `stallwatch:here${stamp()}`;
     const oldThread = 28000 + counter;
@@ -208,6 +222,19 @@ describe("maybeAnswerInNamedTopic: a coordinator that moved transport", () => {
     await bind(TG_CHAT, key, `gse_${stamp()}`);
     await slackChannel(m.ws, "CHERE", key);
     await bind(slackChatId(m.ws), key, `gse_${stamp()}`);
+
+    tgSend();
+    expect(await maybeAnswerInNamedTopic(env.DB, envFor(m), TG_CHAT, oldThread)).toBe(true);
+    expect(tgTexts).toEqual([NAMED_TOPIC_HINT_TEXT]);
+  });
+
+  it("the other transport's binding is dead (no session row): the stock hint", async () => {
+    const m = mkWs();
+    const key = `stallwatch:dead${stamp()}`;
+    const oldThread = 29000 + counter;
+    await namedTopic(TG_CHAT, key, oldThread, "📋 dead");
+    await slackChannel(m.ws, "CDEAD", key);
+    await bind(slackChatId(m.ws), key, `gse_${stamp()}`, null);
 
     tgSend();
     expect(await maybeAnswerInNamedTopic(env.DB, envFor(m), TG_CHAT, oldThread)).toBe(true);

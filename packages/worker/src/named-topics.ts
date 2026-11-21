@@ -296,8 +296,8 @@ export function movedTopicHintText(to: "slack" | "telegram", name: string, url: 
   const where = to === "slack" ? "a Slack channel" : "a Telegram topic";
   const label = name.trim() ? ` (${name.trim()})` : "";
   return (
-    `The session that read this topic moved to ${where}${label}, and nothing reads messages typed here now. ` +
-    (url ? `Write to it there: ${url}` : "Write to it there.")
+    `The session that read this topic moved to ${where}${label}. It reads and answers there, not here` +
+    (url ? `: ${url}` : ".")
   );
 }
 
@@ -307,11 +307,12 @@ export function movedTopicHintText(to: "slack" | "telegram", name: string, url: 
  * back). The old conversation keeps its `named_topics` row as history, so without this a message
  * typed there got the digest hint, which reads as an outage for a coordinator.
  *
- * Null (the caller sends the stock hint) unless exactly one binding fits: the key bound in no
- * chat of THIS conversation, and bound in exactly one chat of the other transport, or, when
- * several machines bind the key there, exactly one whose session has posted into this chat (the
- * coordinator that used to answer here). The worker cannot tell whose chat a numeric id is, so a
- * guess between machines is never made. Decoration: any failure is logged and gives null.
+ * Null (the caller sends the stock hint) unless exactly one live binding fits: the key bound in
+ * no chat of THIS conversation, and bound to a registered session in exactly one chat of the other
+ * transport, or, when several chats there bind it, exactly one whose machine has posted into this
+ * chat. The worker cannot tell whose chat a numeric id is, so with a single candidate it assumes
+ * the key is one machine's (a `stallwatch:<tag>` key normally is); with several it never guesses.
+ * Decoration: any failure is logged and gives null.
  */
 async function movedTopicHint(
   db: D1Database,
@@ -324,13 +325,14 @@ async function movedTopicHint(
     const rows = (
       await db
         .prepare(
-          `SELECT b.chat_id, b.session_id, t.message_thread_id, t.name
+          `SELECT b.chat_id, s.machine_id, t.message_thread_id, t.name
              FROM named_topic_bindings b
              JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
+             JOIN sessions s ON s.session_id = b.session_id
             WHERE b.topic_key = ?`,
         )
         .bind(key)
-        .all<{ chat_id: string; session_id: string; message_thread_id: number; name: string }>()
+        .all<{ chat_id: string; machine_id: string; message_thread_id: number; name: string }>()
     ).results;
     if (rows.some((r) => r.chat_id === chatId)) return null;
     const here = isSlackChatId(chatId);
@@ -338,9 +340,13 @@ async function movedTopicHint(
     if (candidates.length > 1) {
       const posted: typeof candidates = [];
       for (const c of candidates) {
+        // By machine, not session, so a coordinator rotated since the flip still matches.
         const hit = await db
-          .prepare("SELECT 1 AS one FROM messages WHERE chat_id = ? AND session_id = ? LIMIT 1")
-          .bind(chatId, c.session_id)
+          .prepare(
+            `SELECT 1 AS one FROM messages m JOIN sessions s ON s.session_id = m.session_id
+              WHERE m.chat_id = ? AND s.machine_id = ? LIMIT 1`,
+          )
+          .bind(chatId, c.machine_id)
           .first<{ one: number }>();
         if (hit) posted.push(c);
       }
