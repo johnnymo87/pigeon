@@ -1,7 +1,7 @@
 /**
- * Egress guard for Slack (bead pigeon-4ogz.3): like `src/telegram.ts` for Telegram, `src/slack.ts`
- * is the only file that knows Slack's host. A new direct call belongs in that client, so it is
- * timed, logged and error-mapped like the rest. Sibling of egress-guard.test.ts.
+ * Egress guard for Slack (bead pigeon-4ogz.3): `src/slack.ts` is the only file that knows Slack's
+ * host. A new direct call belongs in that client, so it is timed, logged and error-mapped like the
+ * rest. (It was a sibling of the Telegram guard, which went with the Telegram client.)
  */
 import { describe, test, expect } from "vitest";
 

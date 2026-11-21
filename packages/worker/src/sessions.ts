@@ -1,7 +1,7 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs, refusedCsvForSql, type Principal } from "./credentials";
-import { transportForChat } from "./chat";
-import { topicsEnabled, getBySession, markClosed } from "./topics";
+import { isSlackChatId, transportForChat } from "./chat";
+import { getBySession, markClosed } from "./topics";
 import { withD1, StorageError } from "./d1";
 
 export const MAX_SESSIONS = 5000;
@@ -211,9 +211,11 @@ async function unregisterSession(
 ): Promise<Response> {
   const body = (await request.json()) as Record<string, unknown>;
   const sessionId = body.sessionId as string | undefined;
-  // Default-DEFER (pigeon-xehy). Closing a forum topic makes Telegram post a service message
-  // that marks the topic UNREAD, so closes are batched into a daily window
-  // (`shouldCloseOrphans`). This endpoint used to close unconditionally, which meant every
+  // Default-DEFER (pigeon-xehy). Closing a Telegram forum topic made Telegram post a service
+  // message that marked the topic UNREAD, so closes were batched into a daily window
+  // (`shouldCloseOrphans`). Slack has no unread mark (a close archives the channel), so the
+  // batching is no longer needed for its original reason; it is kept as a harmless daily batch.
+  // This endpoint used to close unconditionally, which meant every
   // NON-INTERACTIVE unregister — the daemon's hourly session reaper, dead-session cleanup, the
   // outbox's compensating unregister — closed a topic off-window and defeated that batching.
   //
@@ -270,33 +272,33 @@ async function unregisterSession(
   // Topic closing runs AFTER the deletes, and the order is load-bearing.
   //
   // Deleting the session is this endpoint's primary job; closing the topic is auxiliary. If the
-  // topic block throws (the realistic case: the flag is flipped on before the `topics` DDL has
-  // been applied, so `getBySession` hits a missing table) we still want the session gone.
+  // topic block throws (the realistic case: the `topics` DDL has not been applied, so
+  // `getBySession` hits a missing table) we still want the session gone.
   //
   // The failure then self-heals rather than wedging: T2.11's orphan-closer selects open topics
   // whose `sessions` row is ABSENT, which is exactly the state this leaves behind. Running the
   // block first would instead 500 the request, leave the session row in place, and give the
   // daemon's session-reaper a call that fails identically on every retry.
-  if (immediate && topicsEnabled(env)) {
+  if (immediate) {
     const topic = await getBySession(db, sessionId);
     // `state === "open"` guard: `markClosed` is unconditional, so re-closing an already-closed
     // topic rewrites `closed_at` and restarts the 30-day reap clock, keeping a dead topic alive
     // indefinitely if anything unregisters the same session twice.
     if (topic && topic.state === "open") {
-      // Mark closed in D1 before touching Telegram, so a failed/timed-out Telegram call still
+      // Mark closed in D1 before touching the provider, so a failed/timed-out call still
       // leaves a row the reaper will collect.
       await markClosed(db, { sessionId, chatId: topic.chat_id });
-      // A reservation row (NULL thread id) has no Telegram topic yet; closeForumTopic on it is a
-      // guaranteed 400.
-      if (topic.message_thread_id !== null) {
+      // A reservation row (NULL thread id) has no conversation yet, and a numeric (Telegram-era)
+      // row has no provider to close it in: D1 is all there is to update.
+      if (topic.message_thread_id !== null && isSlackChatId(topic.chat_id)) {
         try {
-          const client = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+          const client = transportForChat(topic.chat_id, { env, db });
           await client.closeForumTopic({
             chatId: topic.chat_id,
             messageThreadId: topic.message_thread_id,
           });
         } catch {
-          // best-effort Telegram call
+          // best-effort provider call
         }
       }
     }

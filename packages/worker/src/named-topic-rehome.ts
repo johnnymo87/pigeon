@@ -1,48 +1,45 @@
 /**
- * POST /topics/named/rehome: the binding half of a Slack flip (bead pigeon-4ogz.6; spec
- * docs/plans/2026-11-20-slack-transport-design.md §3 "What the flip carries over" and "Flip and
- * unflip move bindings explicitly"; script packages/worker/scripts/slack-flip.mjs).
+ * POST /topics/named/rehome: move a machine's named-topic bindings into its Slack workspace (bead
+ * pigeon-4ogz.6; spec docs/plans/2026-11-20-slack-transport-design.md §3 "What the flip carries
+ * over"; script packages/worker/scripts/slack-flip.mjs).
  *
- * A bound named topic (a stall-watch coordinator's) cannot follow a flip lazily: the session's own
- * notifications go through `getBindingForSession`, never a key resolve, so a binding left in the
- * old chat sends every coordinator post unthreaded to `#alerts`. This route moves a machine's
- * bindings to the transport that machine is on NOW, creating each Slack channel at the flip so the
- * coordinator can be talked to from Slack straight away.
+ * A bound named topic (a stall-watch coordinator's) cannot follow a change of workspace lazily: the
+ * session's own notifications go through `getBindingForSession`, never a key resolve, so a binding
+ * left in the old chat sends every coordinator post unthreaded to `#alerts`. This route moves a
+ * machine's bindings to the workspace that machine is on NOW, creating each Slack channel at the
+ * move so the coordinator can be talked to from Slack straight away. It is used when a machine
+ * first gets a workspace and when its team changes.
  *
- *   {machine, expect: "slack"|"telegram", telegramChatId?, after?, limit?, dryRun?}
- *   200 {transport, pending, results: [{sessionId, key, outcome, chatId?, messageThreadId?, created?, reason?}],
+ *   {machine, after?, limit?, dryRun?}
+ *   200 {workspace, pending, results: [{sessionId, key, outcome, chatId?, messageThreadId?, created?, reason?}],
  *        next, retryAfter?}
- *   400 bad body · 401 no machine credential · 409 {error: "transport_mismatch", transport} · 409 topics disabled
+ *   400 bad body · 401 no machine credential · 409 {error: "no_workspace"}
  *
- * `dryRun: true` moves nothing, calls no provider, and is answered whatever the transport.
+ * `workspace` is whether this isolate sees a `SLACK_WORKSPACE_<MACHINE>` secret for the machine.
+ * (Deployed scripts also send `expect: "slack"`, which is ignored.)
+ *
+ * `dryRun: true` moves nothing, calls no provider, and is answered whether or not the machine has
+ * a workspace yet (without one, `pending` counts every binding not in a Slack chat).
  *
  * Three things are deliberate:
  *
  * - **It only ever converges, and never takes another machine's binding.** The target is the
- *   machine's transport as this isolate sees it (its `SLACK_WORKSPACE_<MACHINE>` secret), and
- *   `expect` must agree or the answer is 409; a 409 right after a secret put or delete is
- *   propagation, and the script retries it. On Slack the target chat is the machine's own
- *   workspace. On Telegram the worker cannot tell whose chat a numeric id is, so a key already
- *   bound there to ANOTHER machine's session is reported `failed` and left alone (a bind would
+ *   machine's own workspace as this isolate sees it; a machine with none is a 409, which right
+ *   after a secret put is propagation, and the script retries it. A key already bound in the
+ *   target chat to ANOTHER machine's session is reported `failed` and left alone (a bind would
  *   otherwise hand that machine's topic to this coordinator), and `_`-prefixed keys are never
- *   moved onto Slack (they are the worker's own, like `_alerts`). With those two rules any machine
- *   key may call it for any machine, which the flip needs (it runs on devbox for all three).
+ *   moved (they are the worker's own, like `_alerts`). With those two rules any machine key may
+ *   call it for any machine, which the flip needs (it runs on devbox for all three).
  * - **Paged and resumable.** At most `limit` bindings per call, in session-id order after the
  *   `after` cursor; `next` is the cursor to pass back, or null when the page reached the end. A
  *   Slack 429 stops the page with `retryAfter` and a cursor BEFORE the limited binding, so it is
  *   retried rather than skipped. `conversations.create` is Tier 2, which a coordinator fleet of 30
  *   can exceed.
- * - **Unflip needs a Telegram chat.** The worker does not know a machine's Telegram chat. A binding
- *   moves back to the one Telegram chat that already holds a topic for its key (the flip leaves the
- *   old topic in place); with `telegramChatId` it goes there, creating a topic if needed. Otherwise
- *   it is reported `unplaced` and left where it is, and the daemon's next re-bind (which sends its
- *   configured chat) places it.
+ * - **Nothing is left behind silently.** A binding that could not move is reported `failed`.
  */
 import { MACHINE_ID_PATTERN, requireMachinePrincipal } from "./credentials";
-import { isAllowedChatId } from "./chat/allowlist";
 import { slackChatId, slackWorkspaceForMachine } from "./chat/slack-config";
 import { resolveNamedTopic, writeBinding } from "./named-topics";
-import { topicsEnabled } from "./topics";
 
 export const REHOME_DEFAULT_LIMIT = 5;
 export const REHOME_MAX_LIMIT = 20;
@@ -63,8 +60,6 @@ function isRateLimit(res: { ok: false; kind: string; details?: unknown }): boole
 /** A dry run lists at most this many pending bindings (the count is exact). */
 const DRY_RUN_LIST_CAP = 200;
 
-type Transport = "slack" | "telegram";
-
 interface PendingRow {
   session_id: string;
   chat_id: string;
@@ -75,7 +70,7 @@ interface PendingRow {
 export interface RehomeResult {
   sessionId: string;
   key: string;
-  outcome: "moved" | "failed" | "unplaced" | "pending";
+  outcome: "moved" | "failed" | "pending";
   chatId?: string;
   messageThreadId?: number;
   created?: boolean;
@@ -85,38 +80,28 @@ export interface RehomeResult {
 const bad = (error: string) => Response.json({ error }, { status: 400 });
 
 /**
- * The bindings of `machine`'s sessions that are not where they belong: on Slack, every binding not
- * in the workspace's chat; on Telegram, every binding in a `slack:` chat. A binding whose session
- * has no worker `sessions` row is inert (every lookup joins it) and is not moved. A dry run of a
- * flip to Slack before the secret exists has no target yet, and counts every non-Slack binding.
+ * The bindings of `machine`'s sessions that are not where they belong: every binding not in the
+ * workspace's chat. A binding whose session has no worker `sessions` row is inert (every lookup
+ * joins it) and is not moved. A dry run before the secret exists has no target yet, and counts
+ * every non-Slack binding.
  */
-function pendingSql(transport: Transport, targetKnown: boolean, cursor: boolean, limit: boolean): string {
+function pendingSql(targetKnown: boolean, cursor: boolean, limit: boolean): string {
   return `SELECT b.session_id, b.chat_id, b.topic_key, t.name
             FROM named_topic_bindings b
             JOIN sessions s ON s.session_id = b.session_id
             LEFT JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
            WHERE s.machine_id = ?
-             AND ${transport === "telegram" ? "b.chat_id LIKE 'slack:%'" : targetKnown ? "b.chat_id <> ?" : "b.chat_id NOT LIKE 'slack:%'"}
+             AND ${targetKnown ? "b.chat_id <> ?" : "b.chat_id NOT LIKE 'slack:%'"}
              ${cursor ? "AND b.session_id > ?" : ""}
            ORDER BY b.session_id
            ${limit ? "LIMIT ?" : ""}`;
 }
 
-async function countPending(db: D1Database, machine: string, transport: Transport, target: string | null): Promise<number> {
-  const sql = `SELECT COUNT(*) AS n FROM (${pendingSql(transport, target !== null, false, false)})`;
+async function countPending(db: D1Database, machine: string, target: string | null): Promise<number> {
+  const sql = `SELECT COUNT(*) AS n FROM (${pendingSql(target !== null, false, false)})`;
   const stmt = db.prepare(sql);
   const row = await (target !== null ? stmt.bind(machine, target) : stmt.bind(machine)).first<{ n: number }>();
   return row?.n ?? 0;
-}
-
-/** The single Telegram chat that already has a topic for `key`, or null (none, or ambiguous). */
-async function existingTelegramChat(db: D1Database, key: string, env: Env): Promise<string | null> {
-  const { results } = await db
-    .prepare("SELECT DISTINCT chat_id FROM named_topics WHERE topic_key = ? AND chat_id NOT LIKE 'slack:%'")
-    .bind(key)
-    .all<{ chat_id: string }>();
-  const allowed = (results ?? []).filter((r) => isAllowedChatId(r.chat_id, env));
-  return allowed.length === 1 ? allowed[0]!.chat_id : null;
 }
 
 /**
@@ -148,8 +133,6 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
 
   const machine = typeof body.machine === "string" ? body.machine : "";
   if (!MACHINE_ID_PATTERN.test(machine)) return bad("machine must be a machine id");
-  const expect = body.expect;
-  if (expect !== "slack" && expect !== "telegram") return bad('expect must be "slack" or "telegram"');
   const limit = body.limit === undefined ? REHOME_DEFAULT_LIMIT : body.limit;
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1 || limit > REHOME_MAX_LIMIT) {
     return bad(`limit must be an integer from 1 to ${REHOME_MAX_LIMIT}`);
@@ -158,46 +141,33 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
   if (after !== null && (typeof after !== "string" || after.length === 0 || after.length > 128)) {
     return bad("after must be a session id");
   }
-  const tgRaw = body.telegramChatId;
-  let telegramChatId: string | null = null;
-  if (tgRaw !== undefined && tgRaw !== null) {
-    if (expect !== "telegram") return bad("telegramChatId is only for expect: telegram");
-    if ((typeof tgRaw !== "string" && typeof tgRaw !== "number") || !isAllowedChatId(String(tgRaw), env)) {
-      return bad("telegramChatId must be an allowlisted Telegram chat id");
-    }
-    telegramChatId = String(tgRaw);
-  }
   const dryRun = body.dryRun === true;
 
   const ws = slackWorkspaceForMachine(env, machine);
-  const transport: Transport = ws ? "slack" : "telegram";
-  if (!topicsEnabled(env)) return Response.json({ error: "topics disabled" }, { status: 409 });
 
   if (dryRun) {
-    // Allowed against either transport, so the script can preview a flip before it puts or
-    // deletes the secret. `transport` reports what this isolate sees; `pending` is for `expect`.
-    const dryTarget = expect === "slack" && ws ? slackChatId(ws) : null;
-    const stmt = db.prepare(pendingSql(expect, dryTarget !== null, false, true));
+    // Allowed without a workspace, so the script can preview a flip before it puts the secret.
+    const dryTarget = ws ? slackChatId(ws) : null;
+    const stmt = db.prepare(pendingSql(dryTarget !== null, false, true));
     const { results } = await (dryTarget !== null
       ? stmt.bind(machine, dryTarget, DRY_RUN_LIST_CAP)
       : stmt.bind(machine, DRY_RUN_LIST_CAP)
     ).all<PendingRow>();
     return Response.json({
-      transport,
-      pending: await countPending(db, machine, expect, dryTarget),
+      workspace: ws !== null,
+      pending: await countPending(db, machine, dryTarget),
       results: (results ?? []).map((r) => ({ sessionId: r.session_id, key: r.topic_key, outcome: "pending" })),
       next: null,
     });
   }
 
-  if (transport !== expect) {
-    return Response.json({ error: "transport_mismatch", transport }, { status: 409 });
+  if (!ws) {
+    return Response.json({ error: "no_workspace" }, { status: 409 });
   }
-  const target = ws ? slackChatId(ws) : null;
+  const target = slackChatId(ws);
 
-  const stmt = db.prepare(pendingSql(transport, target !== null, after !== null, true));
-  const args: unknown[] = [machine];
-  if (transport === "slack") args.push(target);
+  const stmt = db.prepare(pendingSql(true, after !== null, true));
+  const args: unknown[] = [machine, target];
   if (after !== null) args.push(after);
   args.push(limit);
   const { results: rows } = await stmt.bind(...args).all<PendingRow>();
@@ -208,18 +178,8 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
   let retryAfter: number | undefined;
 
   for (const row of page) {
-    const chatId = target ?? telegramChatId ?? (await existingTelegramChat(db, row.topic_key, env));
-    if (!chatId) {
-      results.push({
-        sessionId: row.session_id,
-        key: row.topic_key,
-        outcome: "unplaced",
-        reason: "no single Telegram topic for this key; pass telegramChatId",
-      });
-      cursor = row.session_id;
-      continue;
-    }
-    if (transport === "slack" && row.topic_key.startsWith("_")) {
+    const chatId = target;
+    if (row.topic_key.startsWith("_")) {
       results.push({ sessionId: row.session_id, key: row.topic_key, outcome: "failed", reason: "reserved key" });
       cursor = row.session_id;
       continue;
@@ -239,7 +199,6 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
       chatId,
       key: row.topic_key,
       name: row.name ?? row.topic_key,
-      botToken: env.TELEGRAM_BOT_TOKEN,
       env,
     });
     if (!res.ok && isRateLimit(res)) {
@@ -265,8 +224,8 @@ export async function handleNamedTopicRehome(db: D1Database, env: Env, request: 
 
   const reachedEnd = retryAfter === undefined && page.length < limit;
   return Response.json({
-    transport,
-    pending: await countPending(db, machine, transport, target),
+    workspace: true,
+    pending: await countPending(db, machine, target),
     results,
     next: reachedEnd ? null : cursor,
     ...(retryAfter !== undefined ? { retryAfter } : {}),

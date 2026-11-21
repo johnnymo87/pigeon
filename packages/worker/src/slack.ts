@@ -1,13 +1,12 @@
 /**
  * The Slack Web API client (bead pigeon-4ogz.3; plan docs/plans/2026-11-20-slack-outbound-plan.md,
- * "Slack API client"). The worker's only door to Slack, as `src/telegram.ts` is its only door to
- * Telegram: the egress guard test (`test/slack-egress.test.ts`) fails if Slack's host appears in
- * any other source file. A new call belongs here, as a function, so it is timed, logged and
+ * "Slack API client"). The worker's only door to Slack: the egress guard test
+ * (`test/slack-egress.test.ts`) fails if Slack's host appears in any other source file. A new call belongs here, as a function, so it is timed, logged and
  * error-mapped like the rest.
  *
- * Results are mapped onto `TgResult` because the worker's seam (`./chat/transport.ts`) is
+ * Results are mapped onto `ChatResult` because the worker's seam (`./chat/transport.ts`) is
  * Telegram-shaped. Every failure carries a `response` of
- * `{ok:false, error, errorClass, error_code, description}`, which `getTelegramErrorDetails`
+ * `{ok:false, error, errorClass, error_code, description}`, which `failureDetails`
  * returns as the 502 body's `details`: a legacy daemon that reads `details.error_code` keeps
  * working, and a new one can read `errorClass`. The classes:
  *
@@ -18,7 +17,7 @@
  *                     retried, never relocated, because misjudging a permanent failure as
  *                     transient costs a delayed message and the reverse misfiles one (pigeon-bit4).
  */
-import type { TgResult } from "./telegram";
+import type { ChatResult } from "./chat/transport";
 
 const SLACK_API = "https://slack.com/api/";
 
@@ -64,7 +63,7 @@ const REJECTED_ERRORS = new Set([
 
 const DEFAULT_RETRY_AFTER_SECONDS = 1;
 
-/** A Slack call at or above this many milliseconds is logged at `warn` (same rule as Telegram). */
+/** A Slack call at or above this many milliseconds is logged at `warn` (a coarser filter than a numeric predicate over a structured field). */
 export const SLACK_SLOW_CALL_MS = 5_000;
 
 /**
@@ -89,7 +88,7 @@ export function errorClassOf(details: unknown): string | undefined {
 }
 
 /** The error class of a failed result, or undefined for a success or a non-Slack failure. */
-export function slackErrorClass(result: TgResult<unknown>): string | undefined {
+export function slackErrorClass(result: ChatResult<unknown>): string | undefined {
   return result.ok ? undefined : errorClassOf(result.response);
 }
 
@@ -117,7 +116,7 @@ function failureResponse(error: string, errorClass: SlackErrorClass, errorCode: 
   return { ok: false as const, error, errorClass, error_code: errorCode, description };
 }
 
-function upstream<T>(error: string, errorCode = 502): TgResult<T> {
+function upstream<T>(error: string, errorCode = 502): ChatResult<T> {
   const description = `slack error: ${error}`;
   return {
     ok: false,
@@ -128,7 +127,7 @@ function upstream<T>(error: string, errorCode = 502): TgResult<T> {
   };
 }
 
-function rateLimited<T>(error: string, retryAfter: number): TgResult<T> {
+function rateLimited<T>(error: string, retryAfter: number): ChatResult<T> {
   return {
     ok: false,
     kind: "rate_limited",
@@ -137,8 +136,8 @@ function rateLimited<T>(error: string, retryAfter: number): TgResult<T> {
   };
 }
 
-/** Maps one Slack response (status + parsed body, or null when unparseable) onto a TgResult. */
-async function mapResponse<T>(res: Response, method: string, rateLimitIsTransient: boolean): Promise<TgResult<T>> {
+/** Maps one Slack response (status + parsed body, or null when unparseable) onto a ChatResult. */
+async function mapResponse<T>(res: Response, method: string, rateLimitIsTransient: boolean): Promise<ChatResult<T>> {
   const data = (await res.json().catch(() => null)) as SlackBody | null;
   const body = data !== null && typeof data === "object" && !Array.isArray(data) ? data : null;
   const error = typeof body?.error === "string" ? body.error : undefined;
@@ -156,7 +155,7 @@ async function mapResponse<T>(res: Response, method: string, rateLimitIsTransien
 
   if (body === null) {
     // A 200 whose body will not parse: Slack may well have processed the call, so this is
-    // retried like any transient fault (the duplicate is the better-placed risk, as for Telegram).
+    // retried like any transient fault (the duplicate is the better-placed risk).
     console.warn("[worker] slack unparseable response", { method, status: res.status });
     return upstream("unparseable_response");
   }
@@ -187,7 +186,7 @@ async function mapResponse<T>(res: Response, method: string, rateLimitIsTransien
 /**
  * The single place a Slack Web API call is made, so the timing cannot be bypassed.
  *
- * Same contract as `callTelegram`: the clock is in a `finally` so a call that throws is timed
+ * The clock is in a `finally` so a call that throws is timed
  * too, `elapsedMs` covers reading the body, and a thrown fetch (a transport fault, or an abort)
  * propagates for the caller's boundary to deal with. A non-throwing failure is returned, mapped.
  */
@@ -196,7 +195,7 @@ export async function callSlack<T = SlackBody>(
   method: string,
   args: Record<string, unknown>,
   opts: CallSlackOptions = {},
-): Promise<TgResult<T>> {
+): Promise<ChatResult<T>> {
   const startedAt = Date.now();
   let outcome = "threw";
   try {
@@ -290,7 +289,7 @@ export async function uploadToSlack(
   uploadUrl: string,
   blob: Blob,
   opts: UploadToSlackOptions = {},
-): Promise<TgResult<true>> {
+): Promise<ChatResult<true>> {
   const startedAt = Date.now();
   let outcome = "threw";
   try {
@@ -300,7 +299,7 @@ export async function uploadToSlack(
       body: blob,
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
-    let result: TgResult<true>;
+    let result: ChatResult<true>;
     if (res.status === 429) {
       result = rateLimited("ratelimited", retryAfterSeconds(res));
     } else if (res.ok) {

@@ -94,12 +94,11 @@ describe("slack-flip.mjs", () => {
     expect(() => script.parseArgs(["devbox", "sideways"])).toThrow(/usage/);
     expect(() => script.parseArgs(["Dev Box", "on"])).toThrow(/usage/);
     expect(() => script.parseArgs(["devbox", "on", "--bogus"])).toThrow(/unknown argument/);
-    expect(() => script.parseArgs(["devbox", "on", "--telegram-chat", "123"])).toThrow(/only for off/);
-    expect(() => script.parseArgs(["devbox", "off", "--config", "-"])).toThrow(/only for on/);
-    expect(() => script.parseArgs(["devbox", "off", "--telegram-chat", "x"])).toThrow(/numeric/);
+    // There is no way back to Telegram: `off` and `--telegram-chat` are gone.
+    expect(() => script.parseArgs(["devbox", "off"])).toThrow(/usage/);
+    expect(() => script.parseArgs(["devbox", "on", "--telegram-chat", "123"])).toThrow(/unknown argument/);
     expect(script.parseArgs(["devbox", "on", "--config", "-", "--dry-run"])).toMatchObject({
       machine: "devbox",
-      direction: "on",
       config: "-",
       dryRun: true,
     });
@@ -110,11 +109,11 @@ describe("slack-flip.mjs", () => {
     let page = 0;
     const f = fakeDeps({
       rehome: (b) => {
-        if (b.dryRun) return { status: 200, body: { transport: "slack", pending: 0, results: [], next: null } };
+        if (b.dryRun) return { status: 200, body: { workspace: true, pending: 0, results: [], next: null } };
         page++;
-        if (page === 1) return { status: 409, body: { error: "transport_mismatch", transport: "telegram" } };
-        if (page === 2) return { status: 200, body: { transport: "slack", pending: 1, results: [moved("gse_a", "stallwatch:a")], next: "gse_a" } };
-        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_b", "stallwatch:b")], next: null } };
+        if (page === 1) return { status: 409, body: { error: "no_workspace" } };
+        if (page === 2) return { status: 200, body: { workspace: true, pending: 1, results: [moved("gse_a", "stallwatch:a")], next: "gse_a" } };
+        return { status: 200, body: { workspace: true, pending: 0, results: [moved("gse_b", "stallwatch:b")], next: null } };
       },
     });
     const code = await script.flip(base(["devbox", "on"]), f.deps);
@@ -132,7 +131,7 @@ describe("slack-flip.mjs", () => {
     expect(f.calls.findIndex((c) => c.args[1] === "d1")).toBeLessThan(f.calls.indexOf(put));
 
     expect(f.posts.filter((p) => !p.dryRun).map((p) => p.after ?? null)).toEqual([null, null, "gse_a"]);
-    expect(f.posts.every((p) => p.machine === "devbox" && p.expect === "slack")).toBe(true);
+    expect(f.posts.every((p) => p.machine === "devbox" && !("expect" in p))).toBe(true);
     // Nothing secret is ever logged.
     for (const line of f.log) for (const s of SECRET_BITS) expect(line).not.toContain(s);
     expect(f.log.at(-1)).toMatch(/devbox is on slack: 2 binding\(s\) moved, 0 not, 0 still pending/);
@@ -157,70 +156,40 @@ describe("slack-flip.mjs", () => {
     const f = fakeDeps({
       rehome: (b) => {
         expect(b.dryRun).toBe(true);
-        return { status: 200, body: { transport: "telegram", pending: 1, results: [{ sessionId: "gse_a", key: "stallwatch:a", outcome: "pending" }], next: null } };
+        return { status: 200, body: { workspace: false, pending: 1, results: [{ sessionId: "gse_a", key: "stallwatch:a", outcome: "pending" }], next: null } };
       },
     });
     expect(await script.flip(base(["devbox", "on", "--config", "-", "--dry-run"]), f.deps)).toBe(0);
     expect(f.calls.some((c) => c.args[1] === "secret")).toBe(false);
-    expect(f.log.join("\n")).toMatch(/would put SLACK_WORKSPACE_DEVBOX.*on telegram; 1 binding/);
+    expect(f.log.join("\n")).toMatch(/would put SLACK_WORKSPACE_DEVBOX.*does not yet see a workspace for devbox; 1 binding/);
   });
 
   it("honours a Slack backoff and gives up waiting for propagation after the timeout", async () => {
     let n = 0;
     const f = fakeDeps({
       rehome: (b) => {
-        if (b.dryRun) return { status: 200, body: { transport: "slack", pending: 0, results: [], next: null } };
+        if (b.dryRun) return { status: 200, body: { workspace: true, pending: 0, results: [], next: null } };
         n++;
-        if (n === 1) return { status: 200, body: { transport: "slack", pending: 1, results: [], next: null, retryAfter: 30 } };
-        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
+        if (n === 1) return { status: 200, body: { workspace: true, pending: 1, results: [], next: null, retryAfter: 30 } };
+        return { status: 200, body: { workspace: true, pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
       },
     });
     expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(0);
     expect(f.sleeps).toContain(30_000);
 
-    const stuck = fakeDeps({ rehome: () => ({ status: 409, body: { error: "transport_mismatch", transport: "telegram" } }) });
-    await expect(script.flip(base(["devbox", "on", "--config", "-"]), stuck.deps)).rejects.toThrow(/still sees devbox on telegram/);
+    const stuck = fakeDeps({ rehome: () => ({ status: 409, body: { error: "no_workspace" } }) });
+    await expect(script.flip(base(["devbox", "on", "--config", "-"]), stuck.deps)).rejects.toThrow(/still sees no workspace for devbox/);
   });
 
   it("exits 1 when a binding is left behind", async () => {
     const f = fakeDeps({
       rehome: (b) =>
         b.dryRun
-          ? { status: 200, body: { transport: "slack", pending: 1, results: [], next: null } }
-          : { status: 200, body: { transport: "slack", pending: 1, results: [{ sessionId: "gse_a", key: "stallwatch:a", outcome: "failed", reason: "create_failed" }], next: null } },
+          ? { status: 200, body: { workspace: true, pending: 1, results: [], next: null } }
+          : { status: 200, body: { workspace: true, pending: 1, results: [{ sessionId: "gse_a", key: "stallwatch:a", outcome: "failed", reason: "create_failed" }], next: null } },
     });
     expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(1);
     expect(f.log.join("\n")).toMatch(/Re-run to retry/);
-  });
-
-  it("off: deletes the secret first, then moves bindings back, passing --telegram-chat", async () => {
-    const f = fakeDeps({
-      rehome: (b) =>
-        b.dryRun
-          ? { status: 200, body: { transport: "telegram", pending: 0, results: [], next: null } }
-          : {
-              status: 200,
-              body: { transport: "telegram", pending: 0, results: [{ ...moved("gse_a", "stallwatch:a"), chatId: "-100123", messageThreadId: 41 }], next: null },
-            },
-    });
-    expect(await script.flip(base(["devbox", "off", "--telegram-chat", "-100123"]), f.deps)).toBe(0);
-    expect(f.calls.map((c) => c.args.slice(0, 4).join(" "))).toEqual([
-      "wrangler secret list --format",
-      "wrangler secret delete SLACK_WORKSPACE_DEVBOX",
-    ]);
-    expect(f.calls.some((c) => c.cmd === "sudo" || c.cmd === "nix")).toBe(false);
-    expect(f.posts[0]).toMatchObject({ expect: "telegram", telegramChatId: "-100123" });
-  });
-
-  it("off: an absent secret is skipped (re-running off reaches the bindings); a failed delete stops", async () => {
-    const ok = fakeDeps({ secrets: ["CCR_API_KEY"], rehome: () => ({ status: 200, body: { transport: "telegram", pending: 0, results: [], next: null } }) });
-    expect(await script.flip(base(["devbox", "off"]), ok.deps)).toBe(0);
-    expect(ok.calls.some((c) => c.args[2] === "delete")).toBe(false);
-    expect(ok.log.join("\n")).toMatch(/already absent/);
-
-    const bad = fakeDeps({ secretDeleteFails: "Authentication error [code: 10000]", rehome: () => ({ status: 200, body: null }) });
-    await expect(script.flip(base(["devbox", "off"]), bad.deps)).rejects.toThrow(/Authentication error/);
-    expect(bad.posts).toHaveLength(0);
   });
 
   it("sweeps again after the settle wait when a binding moved back", async () => {
@@ -231,10 +200,10 @@ describe("slack-flip.mjs", () => {
         if (b.dryRun) {
           previews++;
           // After the settle wait a stale-isolate re-bind has moved one back; the re-sweep fixes it.
-          return { status: 200, body: { transport: "slack", pending: previews === 1 ? 1 : 0, results: [], next: null } };
+          return { status: 200, body: { workspace: true, pending: previews === 1 ? 1 : 0, results: [], next: null } };
         }
         sweeps++;
-        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
+        return { status: 200, body: { workspace: true, pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
       },
     });
     expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(0);
@@ -247,12 +216,12 @@ describe("slack-flip.mjs", () => {
     let n = 0;
     const f = fakeDeps({
       rehome: (b) => {
-        if (b.dryRun) return { status: 200, body: { transport: "slack", pending: 0, results: [], next: null } };
+        if (b.dryRun) return { status: 200, body: { workspace: true, pending: 0, results: [], next: null } };
         n++;
         // Five long Slack backoffs, then one stale-isolate 409, then done.
-        if (n <= 5) return { status: 200, body: { transport: "slack", pending: 1, results: [], next: null, retryAfter: 60 } };
-        if (n === 6) return { status: 409, body: { error: "transport_mismatch", transport: "telegram" } };
-        return { status: 200, body: { transport: "slack", pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
+        if (n <= 5) return { status: 200, body: { workspace: true, pending: 1, results: [], next: null, retryAfter: 60 } };
+        if (n === 6) return { status: 409, body: { error: "no_workspace" } };
+        return { status: 200, body: { workspace: true, pending: 0, results: [moved("gse_a", "stallwatch:a")], next: null } };
       },
     });
     expect(await script.flip(base(["devbox", "on", "--config", "-"]), f.deps)).toBe(0);

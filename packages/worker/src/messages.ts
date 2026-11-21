@@ -2,42 +2,46 @@
  * Session-free sends: `POST /messages/send` and `POST /topics/unpin` (chat-transport phase 1,
  * bead pigeon-lenr.1; design docs/plans/2026-11-20-telegram-single-egress-design.md).
  *
- * These exist so the daemon never has to call Telegram itself for command replies and
- * operational alerts. The worker's TelegramClient is then the only normal caller of the Bot
- * API, and replacing Telegram means replacing it.
+ * These exist so the daemon never has to call the chat provider itself for command replies and
+ * operational alerts: the worker's `ChatTransport` is the only caller of the provider.
  *
  * THE RESULT CONTRACT is what the daemon's alert fallback hinges on, so it is narrower than
- * `/notifications/send`'s on purpose:
+ * `/notifications/send`'s on purpose (the `telegram` key and `telegram_*` error values are the
+ * wire format of the daemon's contract, kept as they were for deployed daemons):
  *
- *   200 {ok:true, ...}                                   posted
- *   200 {ok:false, telegram:{status:400, description}}   Telegram refused the payload; nothing
+ *   200 {ok:true, chatId, messageId}                     posted
+ *   200 {ok:false, telegram:{status:400, description}}   the provider refused the payload; nothing
  *                                                        was posted. "thread not found" lands
  *                                                        here, description intact, so the
  *                                                        daemon's /alert ladder still sees it.
  *   200 {ok:false, telegram:{status:429, retryAfter}}    rate limited
- *   403 {error:"chat_not_allowed"}                       chatId not in ALLOWED_CHAT_IDS
+ *   403 {error:"chat_not_allowed"}                       the address is not one the caller may
+ *                                                        post to (no workspace, another team's
+ *                                                        conversation, a numeric address with a
+ *                                                        Telegram-era thread id)
  *   502 {ok:false, error, telegram?}                     the worker could not deliver: any other
- *                                                        Telegram status (401/403/404 mean the
- *                                                        worker's own bot token is broken), an
- *                                                        unparseable Telegram body, a timeout, a
+ *                                                        status, an unparseable body, a timeout, a
  *                                                        transport error.
  *
- * Only a Telegram answer that a different sender would get too rides in a 200. Everything that
- * is specific to this worker being broken is non-2xx, which is the daemon's cue to send direct.
+ * Only an answer that a different sender would get too rides in a 200. Everything that is
+ * specific to this worker being broken is non-2xx, which is the daemon's cue to send direct.
  *
  * Unlike `/notifications/send`, nothing here writes a `messages` row: these posts are not
- * reply-routable, as they were not when the daemon sent them itself. Nor is the topics-enabled
- * gate applied: a caller that names a thread gets that thread, as before.
+ * reply-routable, as they were not when the daemon sent them itself.
+ *
+ * `chatId` is optional: a machine with a workspace that omits it posts to its own `#alerts` (or
+ * to the handle in `messageThreadId`). A numeric `chatId` from such a machine is mapped as it
+ * always was (no thread: `#alerts`; a Slack handle: that conversation).
  */
 
 import { authenticate } from "./credentials";
 import { unauthorized } from "./auth";
-import { type TgResult } from "./telegram";
+import type { ChatResult } from "./chat/transport";
 import { transportForChat } from "./chat";
 import { authorizeStoredAddress } from "./chat/address";
 import { errorClassOf } from "./slack";
 
-/** Default bound on the Telegram call. Below the daemon's ~5 s worker leg for alerts. */
+/** Default bound on the provider call. Below the daemon's ~5 s worker leg for alerts. */
 export const MESSAGES_SEND_DEFAULT_TIMEOUT_MS = 4_000;
 /** Ceiling on a caller-supplied `timeoutMs`. Command replies ask for long bounds; not unbounded. */
 export const MESSAGES_SEND_MAX_TIMEOUT_MS = 30_000;
@@ -76,7 +80,7 @@ function parseTimeout(v: unknown): number | null | undefined {
 
 type UrlButtons = Array<Array<{ text: string; url: string }>>;
 
-/** URL buttons only, rebuilt as `{text, url}` so no other button field can reach Telegram. */
+/** URL buttons only, rebuilt as `{text, url}` so no other button field can reach the provider. */
 function parseUrlButtons(v: unknown): UrlButtons | null | undefined {
   if (v == null) return undefined;
   if (!Array.isArray(v)) return null;
@@ -102,20 +106,24 @@ function descriptionOf(res: { response?: unknown; description?: string }): strin
 }
 
 /**
- * Map a client result onto the contract above. `okBody` is the success payload. For a Slack
- * result (`slack`) the same contract holds, with the Slack failure's class added at top level and
- * the resolved address on success; Telegram's responses are byte-for-byte what they were.
+ * Map a client result onto the contract above. `okBody` is the success payload; the resolved
+ * address rides on success, and the failure's class at top level on failure.
  */
 function toResponse<T>(
-  res: TgResult<T>,
+  res: ChatResult<T>,
   okBody: (result: T) => Record<string, unknown>,
-  slack?: { chatId: string },
+  chatId: string,
 ): Response {
-  if (res.ok) return Response.json({ ok: true, ...okBody(res.result), ...(slack ? { chatId: slack.chatId } : {}) });
+  if (res.ok) return Response.json({ ok: true, ...okBody(res.result), chatId });
+
+  // `no_transport` never becomes a Telegram-shaped body (a synthetic 400 would read to a deployed
+  // daemon as "the provider refused the payload"). Addresses are authorized before they get here,
+  // so this is unreachable; it answers the existing refusal.
+  if (res.kind === "no_transport") return Response.json({ error: "chat_not_allowed" }, { status: 403 });
 
   const description = descriptionOf(res);
   const withDescription = description !== undefined ? { description } : {};
-  const errorClass = slack ? { errorClass: errorClassOf(res.response) ?? "upstream" } : {};
+  const errorClass = { errorClass: errorClassOf(res.response) ?? "upstream" };
 
   if (res.kind === "rate_limited") {
     return Response.json({
@@ -124,7 +132,7 @@ function toResponse<T>(
       ...errorClass,
     });
   }
-  // A 400 counts as Telegram speaking only when Telegram's JSON body came back. A bare HTTP 400
+  // A 400 counts as the provider speaking only when its JSON body came back. A bare HTTP 400
   // with an unparseable body (an intermediary's error page) says nothing about the payload, so
   // it is a delivery failure like any other.
   if (
@@ -147,8 +155,8 @@ function toResponse<T>(
 }
 
 /**
- * Run one bounded Telegram call. A timeout or transport error becomes a 502 rather than
- * escaping: `callTelegram` throws on both, and an unhandled throw would be a 500 the daemon
+ * Run one bounded provider call. A timeout or transport error becomes a 502 rather than
+ * escaping: the transport throws on both, and an unhandled throw would be a 500 the daemon
  * cannot tell from a worker bug.
  */
 async function bounded(
@@ -174,7 +182,7 @@ async function bounded(
     const error = controller.signal.aborted
       ? `telegram call timed out after ${timeoutMs}ms`
       : `telegram call failed: ${err instanceof Error ? err.message : String(err)}`;
-    console.warn("[worker] session-free telegram call failed", { error });
+    console.warn("[worker] session-free chat call failed", { error });
     return Response.json({ ok: false, error }, { status: 502 });
   } finally {
     if (timer !== undefined) clearTimeout(timer);
@@ -182,7 +190,7 @@ async function bounded(
 }
 
 /**
- * Time left of the caller's bound. The clock starts at handler entry, not at the Telegram call,
+ * Time left of the caller's bound. The clock starts at handler entry, not at the provider call,
  * so auth (a D1 lookup on a cache miss) is charged against it too and the daemon's slightly
  * longer worker leg sees a definite answer rather than racing an in-flight post.
  */
@@ -197,14 +205,16 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
   const body = await readBody(request);
   if (body instanceof Response) return body;
 
-  const chatId = parseChatId(body.chatId);
+  // `chatId` is optional (absent or null): the machine's own workspace. Present but malformed is a 400.
+  const chatGiven = body.chatId !== undefined && body.chatId !== null;
+  const chatId = chatGiven ? parseChatId(body.chatId) : null;
   const text = typeof body.text === "string" ? body.text : "";
   const urlButtons = parseUrlButtons(body.urlButtons);
   const timeoutMs = parseTimeout(body.timeoutMs);
   const thread = body.messageThreadId ?? undefined;
   const entities = body.entities ?? undefined;
   if (
-    !chatId ||
+    (chatGiven && !chatId) ||
     !text ||
     urlButtons === null ||
     timeoutMs === null ||
@@ -212,14 +222,14 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
     (entities !== undefined && !Array.isArray(entities))
   ) {
     return Response.json(
-      { error: "chatId and text are required; messageThreadId, entities, urlButtons and timeoutMs must be well-formed" },
+      { error: "text is required; chatId, messageThreadId, entities, urlButtons and timeoutMs must be well-formed" },
       { status: 400 },
     );
   }
   const addr = await authorizeStoredAddress(env, env.DB, principal, chatId, thread as number | undefined);
   if (!addr.ok) return addr.response;
 
-  const tg = transportForChat(addr.chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
+  const tg = transportForChat(addr.chatId, { env, db: env.DB });
   return bounded(remaining(startedAt, timeoutMs ?? MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
     toResponse(
       await tg.sendMessage({
@@ -229,41 +239,24 @@ export async function handleSendMessage(env: Env, request: Request): Promise<Res
         ...(addr.threadId !== undefined ? { messageThreadId: addr.threadId } : {}),
         ...(urlButtons && urlButtons.length > 0 ? { replyMarkup: { inline_keyboard: urlButtons } } : {}),
         // `notifyOwner: true` (an error-severity alert, pigeon-4ogz.5) asks for the owner
-        // mention under the `errors` category; SLACK_NOTIFY_OWNER decides. Slack only: a
-        // Telegram send is called exactly as before.
-        ...(addr.slack && body.notifyOwner === true ? { notifyOwner: true, notifyCategory: "errors" as const } : {}),
+        // mention under the `errors` category; SLACK_NOTIFY_OWNER decides.
+        ...(body.notifyOwner === true ? { notifyOwner: true, notifyCategory: "errors" as const } : {}),
         signal,
       }),
       (r) => ({ messageId: r.message_id }),
-      addr.slack ? { chatId: addr.chatId } : undefined,
+      addr.chatId,
     ),
   );
 }
 
+/**
+ * `POST /topics/unpin`: a constant `200 {ok:true}`. Telegram auto-pinned the first message of a new
+ * topic and the daemon asked the worker to clear it; Slack pins nothing, so there is nothing to do
+ * and no provider call to make. Deployed daemons still call it after creating a topic, so the route
+ * stays until they are gone (removed with the numeric-`chatId` mapping).
+ */
 export async function handleUnpinTopic(env: Env, request: Request): Promise<Response> {
-  const startedAt = Date.now();
   const principal = await authenticate(request, env);
   if (!principal) return unauthorized();
-  const body = await readBody(request);
-  if (body instanceof Response) return body;
-
-  const chatId = parseChatId(body.chatId);
-  const thread = body.messageThreadId;
-  if (!chatId || !isPositiveInt(thread)) {
-    return Response.json({ error: "chatId and a positive messageThreadId are required" }, { status: 400 });
-  }
-  const addr = await authorizeStoredAddress(env, env.DB, principal, chatId, thread);
-  if (!addr.ok) return addr.response;
-
-  // Slack pins nothing on its own, so there is nothing to clear: no call, and no need for the
-  // handle to resolve.
-  if (addr.slack) return Response.json({ ok: true });
-
-  const tg = transportForChat(addr.chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db: env.DB });
-  return bounded(remaining(startedAt, MESSAGES_SEND_DEFAULT_TIMEOUT_MS), async (signal) =>
-    toResponse(
-      await tg.unpinAllForumTopicMessages({ chatId: addr.chatId, messageThreadId: thread, signal }),
-      () => ({}),
-    ),
-  );
+  return Response.json({ ok: true });
 }

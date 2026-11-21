@@ -23,8 +23,11 @@
  * sentinel exists precisely so the last of those cannot matter, and the first
  * two want a `wrangler dev` script rather than vitest.
  */
-import { env, SELF, fetchMock } from "cloudflare:test";
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { env, fetchMock, createExecutionContext } from "cloudflare:test";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import worker from "../src/index";
+import { slackChatId } from "../src/chat/slack-config";
+import { envWith, mkSlackMachine, seedAlerts, type SlackMachine } from "./slack-harness";
 // The REAL schema, not a copy of it. `worker.test.ts` inlines its own
 // transcription; that is a second source of truth which can drift from
 // production without failing anything, so this file reads the shipped file.
@@ -35,8 +38,20 @@ import { advertisedBackends, BACKENDS_HEADER as DAEMON_BACKENDS_HEADER } from ".
 import { BACKENDS_HEADER as WORKER_BACKENDS_HEADER } from "../src/poll";
 
 const MACHINE = "seam-machine";
-const CHAT_ID = "8248645256";
 const WORKER_URL = "https://example.com";
+
+/**
+ * A refusal is posted to the launch command's own chat, so the worker needs a Slack workspace for
+ * it. The test env cannot carry one globally (other files assert the dark path), so requests go to
+ * the real router with an env that has it, in place of `SELF.fetch`.
+ */
+let machine: SlackMachine;
+let CHAT_ID = "";
+let testEnv: Env;
+const SELF = {
+  fetch: (input: string | Request, init?: RequestInit) =>
+    worker.fetch(new Request(input, init), testEnv, createExecutionContext()),
+};
 
 /** `poll()` touches no callback; a launch is never dispatched here. */
 const NO_CALLBACKS = {} as unknown as PollerCallbacks;
@@ -63,13 +78,13 @@ function makePoller(backends: string | undefined) {
  * fail for reasons unrelated to draining.
  */
 let seedClock = Date.now();
-async function seedLaunch(commandId: string, metadataJson: string | null): Promise<void> {
+async function seedLaunch(commandId: string, metadataJson: string | null, chatId: string = CHAT_ID): Promise<void> {
   await env.DB.prepare(
     `INSERT INTO commands (command_id, machine_id, session_id, command_type, command,
                            chat_id, directory, metadata_json, status, created_at)
      VALUES (?, ?, NULL, 'launch', 'do the thing', ?, '/home/dev/projects/pigeon', ?, 'pending', ?)`,
   )
-    .bind(commandId, MACHINE, CHAT_ID, metadataJson, seedClock++)
+    .bind(commandId, MACHINE, chatId, metadataJson, seedClock++)
     .run();
 }
 
@@ -90,18 +105,14 @@ async function statusOf(commandId: string): Promise<string | undefined> {
  * makes the second send of a burst fail as an unmatched request -- surfacing as
  * a 500 from the worker rather than as anything resembling its cause.
  */
-function interceptTelegram(sent: string[], reply: { code: number; body: unknown }) {
+function interceptSlack(sent: string[], reply: { code: number; body: unknown; headers?: Record<string, string> }) {
   fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: /\/bot.*\/sendMessage/ })
+    .get("https://slack.com")
+    .intercept({ method: "POST", path: "/api/chat.postMessage" })
     .reply(reply.code, (opts: { body?: unknown }) => {
-      try {
-        sent.push((JSON.parse(String(opts.body)) as { text: string }).text);
-      } catch {
-        sent.push(String(opts.body));
-      }
+      sent.push(new URLSearchParams(String(opts.body)).get("text") ?? "");
       return JSON.stringify(reply.body);
-    }, { headers: { "Content-Type": "application/json" } })
+    }, { headers: { "Content-Type": "application/json", ...(reply.headers ?? {}) } })
     .persist();
 }
 
@@ -113,6 +124,10 @@ describe("backend capability gate, across the real wire", () => {
     for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
       await env.DB.prepare(statement).run();
     }
+    machine = await mkSlackMachine({ teamId: "TSEAMGATE" });
+    CHAT_ID = slackChatId(machine.ws);
+    testEnv = envWith([machine]);
+    await seedAlerts(machine.ws);
     fetchMock.activate();
     fetchMock.disableNetConnect();
   });
@@ -123,7 +138,7 @@ describe("backend capability gate, across the real wire", () => {
 
   afterEach(() => {
     try {
-      fetchMock.get("https://api.telegram.org").cleanMocks();
+      fetchMock.get("https://slack.com").cleanMocks();
     } catch {
       /* no interceptor was registered */
     }
@@ -131,7 +146,7 @@ describe("backend capability gate, across the real wire", () => {
 
   it("refuses a goose launch to a daemon advertising only opencode, and tells the human", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 200, body: { ok: true, result: { message_id: 1 } } });
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
     await seedLaunch("cmd-refuse", JSON.stringify({ backend: "goose" }));
 
     const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
@@ -167,7 +182,7 @@ describe("backend capability gate, across the real wire", () => {
    */
   it("refuses a goose launch to a pre-gate daemon, which sends no header at all", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 200, body: { ok: true, result: { message_id: 1 } } });
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
     await seedLaunch("cmd-legacy", JSON.stringify({ backend: "goose" }));
 
     const res = await SELF.fetch(`${WORKER_URL}/machines/${MACHINE}/next`, {
@@ -202,7 +217,7 @@ describe("backend capability gate, across the real wire", () => {
    */
   it("refuses even an ordinary launch when the daemon advertises nothing", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 200, body: { ok: true, result: { message_id: 1 } } });
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
     await seedLaunch("cmd-none", null);
 
     const poller = makePoller(advertisedBackends({ opencode: false, goose: false }));
@@ -215,12 +230,12 @@ describe("backend capability gate, across the real wire", () => {
   /**
    * A refusal that could not be delivered must NOT be acked. Acking an
    * undelivered refusal destroys the command silently, which is the exact
-   * failure this gate was built to eliminate -- so a transient Telegram failure
+   * failure this gate was built to eliminate -- so a transient provider failure
    * has to leave the row leased for the ordinary 60s-lease retry.
    */
   it("leaves the command leased when the refusal cannot be delivered", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 429, body: { ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 5 } } });
+    interceptSlack(sent, { code: 429, body: { ok: false, error: "ratelimited" }, headers: { "retry-after": "5" } });
     await seedLaunch("cmd-transient", JSON.stringify({ backend: "goose" }));
 
     const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
@@ -234,12 +249,55 @@ describe("backend capability gate, across the real wire", () => {
    */
   it("acks the command when the refusal fails permanently", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 200, body: { ok: false, error_code: 400, description: "Bad Request: chat not found" } });
+    interceptSlack(sent, { code: 200, body: { ok: false, error: "invalid_blocks" } });
     await seedLaunch("cmd-permanent", JSON.stringify({ backend: "goose" }));
 
     const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
     expect(await poller.poll()).toBeNull();
     expect(await statusOf("cmd-permanent")).toBe("acked");
+  });
+
+  /**
+   * A launch typed in the Telegram days still queued under a numeric chat: there is no transport to
+   * tell the human with. It is not retried (no transport will ever appear) and not an error: the
+   * refusal is only logged, and the command is acked.
+   */
+  it("acks a refused launch of a numeric (Telegram-era) chat with nothing sent, only logged", async () => {
+    const sent: string[] = [];
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
+    await seedLaunch("cmd-numeric", JSON.stringify({ backend: "goose" }), "-1001234567890");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
+    expect(await poller.poll()).toBeNull();
+
+    expect(await statusOf("cmd-numeric")).toBe("acked");
+    expect(sent).toHaveLength(0);
+    expect(errors.mock.calls.some((c) => c[0] === "[poll] refused launch: daemon cannot serve backend")).toBe(true);
+    errors.mockRestore();
+  });
+
+  /** The refusal goes into the command's own thread, with no gate on any flag. */
+  it("posts a refusal into the command's own conversation", async () => {
+    const channels: string[] = [];
+    fetchMock
+      .get("https://slack.com")
+      .intercept({ method: "POST", path: "/api/chat.postMessage" })
+      .reply(200, (opts: { body?: unknown }) => {
+        channels.push(new URLSearchParams(String(opts.body)).get("channel") ?? "");
+        return JSON.stringify({ ok: true, ts: "1700000000.000100", channel: "CTHREADGATE" });
+      }, { headers: { "Content-Type": "application/json" } });
+    await seedLaunch("cmd-thread", JSON.stringify({ backend: "goose" }));
+    await env.DB.prepare("INSERT INTO slack_conversations (team_id, channel_id, created_at, owner_invited) VALUES (?, 'CTHREADGATE', ?, 1)")
+      .bind(machine.ws.teamId, Date.now())
+      .run();
+    const row = await env.DB.prepare("SELECT handle FROM slack_conversations WHERE channel_id = 'CTHREADGATE'").first<{ handle: number }>();
+    await env.DB.prepare("UPDATE commands SET message_thread_id = ? WHERE command_id = 'cmd-thread'").bind(row!.handle).run();
+
+    const poller = makePoller(advertisedBackends({ opencode: true, goose: false }));
+    expect(await poller.poll()).toBeNull();
+    expect(await statusOf("cmd-thread")).toBe("acked");
+    expect(channels).toEqual(["CTHREADGATE"]);
   });
 
   /**
@@ -250,7 +308,7 @@ describe("backend capability gate, across the real wire", () => {
    */
   it("drains several refusals in one poll so real work is not held up", async () => {
     const sent: string[] = [];
-    interceptTelegram(sent, { code: 200, body: { ok: true, result: { message_id: 1 } } });
+    interceptSlack(sent, { code: 200, body: { ok: true, ts: "1700000000.000100", channel: "C1" } });
     for (let i = 0; i < 3; i++) {
       await seedLaunch(`cmd-burst-${i}`, JSON.stringify({ backend: "goose" }));
     }

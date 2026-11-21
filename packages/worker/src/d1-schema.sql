@@ -50,12 +50,6 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_notification_id
   ON messages(notification_id) WHERE notification_id IS NOT NULL;
 
--- Seen updates: Telegram deduplication (replaces DO seen_updates)
-CREATE TABLE IF NOT EXISTS seen_updates (
-  update_id     INTEGER PRIMARY KEY,
-  created_at    INTEGER NOT NULL
-);
-
 -- Machines: track daemon last-poll time for online detection
 CREATE TABLE IF NOT EXISTS machines (
   machine_id    TEXT PRIMARY KEY,

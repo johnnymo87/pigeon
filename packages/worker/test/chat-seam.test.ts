@@ -4,19 +4,21 @@
  * on session commands. Spec: docs/plans/2026-11-20-slack-transport-design.md §1, §5.
  */
 import { env, fetchMock } from "cloudflare:test";
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import d1Schema from "../src/d1-schema.sql?raw";
-import { createTelegramClient } from "../src/telegram";
+import { fakeTransport } from "./slack-harness";
 import { isSlackChatId, transportForChat, type ChatTransport } from "../src/chat";
+import { failureDetails, isPermanentTopicFailure } from "../src/chat/failures";
 import { parseChatCommand, SESSION_REF_RE } from "../src/chat/commands";
 import { resolveSessionRef } from "../src/chat/session-ref";
 import { deleteBySession, finalize, getBySession, markOpen, renameProvisional, reserve } from "../src/topics";
 import { resolveTopic } from "../src/topic-manager";
-import { handleTelegramWebhook } from "../src/webhook";
-import { touchMachine } from "../src/d1-ops";
 
+/** A numeric chat id of the Telegram days: no transport exists for it. */
 const TG_CHAT = "8248645256";
 const SLACK_CHAT = "slack:T0SEAM";
+/** A second chat of the same transport: the CAS tests only need two distinct addresses. */
+const OTHER_CHAT = "slack:T0OTHER";
 
 beforeAll(async () => {
   for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
@@ -46,23 +48,9 @@ describe("transportForChat", () => {
     expect(isSlackChatId("slackT123")).toBe(false);
   });
 
-  it("routes a Telegram chat id to the Telegram Bot API", async () => {
-    let path = "";
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bottok-seam\/sendMessage/ })
-      .reply(200, (opts: { path: string }) => {
-        path = opts.path;
-        return { ok: true, result: { message_id: 7 } };
-      });
-    const res = await transportForChat(TG_CHAT, "tok-seam").sendMessage({ chatId: TG_CHAT, text: "hi" });
-    expect(res.ok).toBe(true);
-    expect(path).toContain("/bottok-seam/sendMessage");
-  });
-
-  it("never sends a slack address to Telegram, and reports a transient (non-4xx) failure", async () => {
+  it("never sends a slack address anywhere without a workspace, and reports a transient (non-4xx) failure", async () => {
     // disableNetConnect: any fetch would throw, so a resolved result proves nothing was called.
-    const t = transportForChat(SLACK_CHAT, "tok-seam");
+    const t = transportForChat(SLACK_CHAT);
     const res = await t.sendMessage({ chatId: SLACK_CHAT, text: "hi" });
     expect(res.ok).toBe(false);
     if (!res.ok && res.kind === "error") {
@@ -75,25 +63,54 @@ describe("transportForChat", () => {
     expect(created.ok).toBe(false);
   });
 
-  it("uses an injected Telegram transport for Telegram addresses only", async () => {
+  it("answers every call to a numeric address with a distinct no_transport result, and calls nothing", async () => {
+    // disableNetConnect again: a resolved result proves no fetch was attempted.
+    const t = transportForChat(TG_CHAT);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const blob = new Blob(["x"]);
+    const results = await Promise.all([
+      t.sendMessage({ chatId: TG_CHAT, text: "hi" }),
+      t.sendRichMessage({ chatId: TG_CHAT, markdown: "hi" }),
+      t.editMessageText({ chatId: TG_CHAT, messageId: 1, text: "hi" }),
+      t.sendPhoto({ chatId: TG_CHAT, photo: blob, filename: "a.png" }),
+      t.sendDocument({ chatId: TG_CHAT, document: blob, filename: "a.txt" }),
+      t.createForumTopic({ chatId: TG_CHAT, name: "x" }),
+      t.editForumTopic({ chatId: TG_CHAT, messageThreadId: 1, name: "x" }),
+      t.closeForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.reopenForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.deleteForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+    ]);
+    for (const res of results) expect(res).toEqual({ ok: false, kind: "no_transport" });
+    expect(warn).toHaveBeenCalled();
+    // The kind is permanent, and its details never read as a 4xx from a provider.
+    expect(isPermanentTopicFailure(results[0]!)).toBe(true);
+    expect(JSON.stringify(failureDetails(results[0]!))).not.toContain("error_code");
+    // A numeric address with a Slack context is still no transport: the context is for slack: only.
+    const ctx = { env: env as unknown as Env, db: env.DB };
+    expect(await transportForChat(TG_CHAT, ctx).sendMessage({ chatId: TG_CHAT, text: "hi" })).toEqual({
+      ok: false,
+      kind: "no_transport",
+    });
+  });
+
+  it("uses an injected transport for any address, a Slack one included", async () => {
     const calls: string[] = [];
-    const fake: ChatTransport = {
-      ...createTelegramClient("unused"),
-      sendMessage: async () => {
-        calls.push("fake");
+    const { client } = fakeTransport({
+      sendMessage: (o) => {
+        calls.push(String(o.chatId));
         return { ok: true, result: { message_id: 1 } };
       },
-    };
-    await transportForChat(TG_CHAT, "tok", fake).sendMessage({ chatId: TG_CHAT, text: "a" });
-    const slackRes = await transportForChat(SLACK_CHAT, "tok", fake).sendMessage({ chatId: SLACK_CHAT, text: "b" });
-    expect(calls).toEqual(["fake"]);
-    expect(slackRes.ok).toBe(false);
+    });
+    await transportForChat(TG_CHAT, undefined, client).sendMessage({ chatId: TG_CHAT, text: "a" });
+    const slackRes = await transportForChat(SLACK_CHAT, undefined, client).sendMessage({ chatId: SLACK_CHAT, text: "b" });
+    expect(calls).toEqual([TG_CHAT, SLACK_CHAT]);
+    expect(slackRes.ok).toBe(true);
   });
 });
 
 // ─── Chat-scoped topic CAS ─────────────────────────────────────────────────
 
-/** What a supersede (.3) does to the row: replace it with a reservation in the other transport. */
+/** What happens to the row while a create is in flight: it moves to another chat. */
 async function supersede(sessionId: string, toChat: string): Promise<void> {
   await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(sessionId).run();
   await reserve(env.DB, { sessionId, machineId: "devbox", chatId: toChat, name: "slack row" });
@@ -103,7 +120,7 @@ describe("topic CAS scoped to chat_id", () => {
   it("finalize with a chatId does not write into a row in another chat", async () => {
     const sessionId = uniq("ses_cas_fin_");
     await reserve(env.DB, { sessionId, machineId: "devbox", chatId: SLACK_CHAT, name: "s" });
-    expect(await finalize(env.DB, { sessionId, chatId: TG_CHAT, messageThreadId: 41, name: "tg" })).toBe(false);
+    expect(await finalize(env.DB, { sessionId, chatId: OTHER_CHAT, messageThreadId: 41, name: "tg" })).toBe(false);
     const row = await getBySession(env.DB, sessionId);
     expect(row?.message_thread_id).toBeNull();
     expect(row?.name).toBe("s");
@@ -113,7 +130,7 @@ describe("topic CAS scoped to chat_id", () => {
   it("deleteBySession with a chatId does not delete a reservation in another chat", async () => {
     const sessionId = uniq("ses_cas_del_");
     await reserve(env.DB, { sessionId, machineId: "devbox", chatId: SLACK_CHAT, name: "s" });
-    expect(await deleteBySession(env.DB, sessionId, TG_CHAT)).toBe(false);
+    expect(await deleteBySession(env.DB, sessionId, OTHER_CHAT)).toBe(false);
     expect(await getBySession(env.DB, sessionId)).not.toBeNull();
     expect(await deleteBySession(env.DB, sessionId, SLACK_CHAT)).toBe(true);
   });
@@ -123,20 +140,19 @@ describe("topic CAS scoped to chat_id", () => {
     await reserve(env.DB, { sessionId, machineId: "devbox", chatId: SLACK_CHAT, name: "s" });
     await finalize(env.DB, { sessionId, chatId: SLACK_CHAT, messageThreadId: 43, name: "s", provisional: true });
     await env.DB.prepare("UPDATE topics SET state = 'closed', closed_at = 1 WHERE session_id = ?").bind(sessionId).run();
-    await markOpen(env.DB, { sessionId, chatId: TG_CHAT });
-    expect(await renameProvisional(env.DB, { sessionId, chatId: TG_CHAT, name: "other" })).toBe(false);
+    await markOpen(env.DB, { sessionId, chatId: OTHER_CHAT });
+    expect(await renameProvisional(env.DB, { sessionId, chatId: OTHER_CHAT, name: "other" })).toBe(false);
     const row = await getBySession(env.DB, sessionId);
     expect(row?.state).toBe("closed");
     expect(row?.name_provisional).toBe(1);
   });
 
-  it("a Telegram create that finishes after a supersede does not touch the new row (late finalize)", async () => {
+  it("a create that finishes after the row moved to another chat does not touch the new row (late finalize)", async () => {
     const sessionId = uniq("ses_cas_late_");
     const deleted: number[] = [];
-    const tg: ChatTransport = {
-      ...createTelegramClient("unused"),
+    const { client: tg } = fakeTransport({
       createForumTopic: async (o) => {
-        // The 57 s create (pigeon-iqpd): while it is in flight the row moves to Slack.
+        // The 57 s create (pigeon-iqpd): while it is in flight the row moves to another chat.
         await supersede(sessionId, SLACK_CHAT);
         return { ok: true, result: { message_thread_id: 9001, name: o.name, icon_color: 0 } };
       },
@@ -144,42 +160,41 @@ describe("topic CAS scoped to chat_id", () => {
         deleted.push(o.messageThreadId);
         return { ok: true, result: true };
       },
-    };
+    });
     const res = await resolveTopic(env.DB, {
       sessionId,
       machineId: "devbox",
-      chatId: TG_CHAT,
+      chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
       botToken: "unused",
-      tgClient: tg,
+      transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);
     expect(row?.chat_id).toBe(SLACK_CHAT);
     expect(row?.message_thread_id).toBeNull();
     expect(row?.name).toBe("slack row");
-    // The orphan Telegram topic is cleaned up, and this notification does not use the Slack row.
+    // The orphan topic is cleaned up, and this notification does not use the Slack row.
     expect(deleted).toEqual([9001]);
     expect(res).toMatchObject({ ok: true, messageThreadId: null, reason: "topic_in_other_chat" });
   });
 
-  it("a failed Telegram create does not delete a reservation that moved to another chat (loser cleanup)", async () => {
+  it("a failed create does not delete a reservation that moved to another chat (loser cleanup)", async () => {
     const sessionId = uniq("ses_cas_fail_");
-    const tg: ChatTransport = {
-      ...createTelegramClient("unused"),
+    const { client: tg } = fakeTransport({
       createForumTopic: async () => {
         await supersede(sessionId, SLACK_CHAT);
         return { ok: false, kind: "error", errorCode: 500, description: "boom" };
       },
-    };
+    });
     await resolveTopic(env.DB, {
       sessionId,
       machineId: "devbox",
-      chatId: TG_CHAT,
+      chatId: OTHER_CHAT,
       dir: "~/p",
       title: "T",
       botToken: "unused",
-      tgClient: tg,
+      transport: tg,
     });
     const row = await getBySession(env.DB, sessionId);
     expect(row?.chat_id).toBe(SLACK_CHAT);
@@ -296,136 +311,6 @@ describe("resolveSessionRef", () => {
 
   it("reports none for an unknown id", async () => {
     expect((await resolveSessionRef(env.DB, "ses_doesnotexist0000")).kind).toBe("none");
-  });
-});
-
-// ─── Webhook: /kill <session-id> and friends ───────────────────────────────
-
-function webhook(text: string, extra: Record<string, unknown> = {}): Request {
-  const id = ++counter + 50_000_000;
-  return new Request("https://worker/webhook/telegram", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret" },
-    body: JSON.stringify({
-      update_id: id,
-      message: { message_id: id, chat: { id: Number(TG_CHAT) }, from: { id: Number(TG_CHAT) }, text, ...extra },
-    }),
-  });
-}
-
-// One persistent interceptor for the file: a second one would never be reached.
-const sentTexts: string[] = [];
-let sendsIntercepted = false;
-function captureSends(): string[] {
-  sentTexts.length = 0;
-  if (sendsIntercepted) return sentTexts;
-  sendsIntercepted = true;
-  const texts = sentTexts;
-  fetchMock
-    .get("https://api.telegram.org")
-    .intercept({ method: "POST", path: /\/sendMessage/ })
-    .reply(200, (opts: { body?: unknown }) => {
-      texts.push(JSON.parse(String(opts.body)).text);
-      return { ok: true, result: { message_id: 1 } };
-    })
-    .persist();
-  return texts;
-}
-
-async function commandsFor(machineId: string) {
-  const { results } = await env.DB.prepare(
-    "SELECT session_id, command, command_type, chat_id FROM commands WHERE machine_id = ? ORDER BY created_at",
-  ).bind(machineId).all<{ session_id: string; command: string; command_type: string; chat_id: string }>();
-  return results ?? [];
-}
-
-describe("session commands with a leading <session-id>", () => {
-  it("/kill <id> typed in General (no reply, no topic) queues a kill for that session", async () => {
-    const machineId = uniq("m_kill_");
-    const sessionId = uniq("ses_killtarget");
-    await seedSession(sessionId, machineId);
-    await touchMachine(env.DB, machineId);
-    const sends = captureSends();
-
-    const res = await handleTelegramWebhook(env.DB, env as Env, webhook(`/kill ${sessionId}`));
-    expect(res.status).toBe(200);
-    expect(await commandsFor(machineId)).toEqual([
-      { session_id: sessionId, command: "", command_type: "kill", chat_id: TG_CHAT },
-    ]);
-    expect(sends.at(-1)).toContain(`Killing session \`${sessionId}\` on ${machineId}`);
-  });
-
-  it("/kill with an ambiguous prefix is refused with the candidates and queues nothing", async () => {
-    const machineId = uniq("m_amb_");
-    const base = uniq("ses_ambkill");
-    await seedSession(`${base}1`, machineId);
-    await seedSession(`${base}2`, machineId);
-    await touchMachine(env.DB, machineId);
-    const sends = captureSends();
-
-    await handleTelegramWebhook(env.DB, env as Env, webhook(`/kill ${base}`));
-    expect(await commandsFor(machineId)).toEqual([]);
-    const reply = sends.at(-1) ?? "";
-    expect(reply).toMatch(/ambiguous/i);
-    expect(reply).toContain(`${base}1`);
-    expect(reply).toContain(`${base}2`);
-  });
-
-  it("/kill with a malformed argument answers with usage and injects nothing", async () => {
-    const machineId = uniq("m_usage_");
-    const sessionId = uniq("ses_usagetarget");
-    await seedSession(sessionId, machineId);
-    await touchMachine(env.DB, machineId);
-    const sends = captureSends();
-    await handleTelegramWebhook(env.DB, env as Env, webhook("/kill now"));
-    expect(sends.at(-1)).toMatch(/^Usage/);
-    expect(await commandsFor(machineId)).toEqual([]);
-  });
-
-  it("/kill <unknown id> answers and queues nothing", async () => {
-    const sends = captureSends();
-    await handleTelegramWebhook(env.DB, env as Env, webhook("/kill ses_nosuchsession00"));
-    expect(sends.at(-1)).toMatch(/No session matches/);
-  });
-
-  it("an explicit target wins over the replied-to session", async () => {
-    const machineId = uniq("m_win_");
-    const target = uniq("ses_wintarget");
-    await seedSession(target, machineId);
-    await touchMachine(env.DB, machineId);
-    captureSends();
-
-    await handleTelegramWebhook(
-      env.DB,
-      env as Env,
-      webhook(`/mcp ${target} enable slack`, { reply_to_message: { message_id: 123456789 } }),
-    );
-    expect(await commandsFor(machineId)).toEqual([
-      { session_id: target, command: "slack", command_type: "mcp_enable", chat_id: TG_CHAT },
-    ]);
-  });
-
-  it("/model <id> provider/model sets the model for that session", async () => {
-    const machineId = uniq("m_model_");
-    const target = uniq("ses_modeltarget");
-    await seedSession(target, machineId);
-    await touchMachine(env.DB, machineId);
-    captureSends();
-
-    await handleTelegramWebhook(env.DB, env as Env, webhook(`/model ${target} anthropic/opus`));
-    expect(await commandsFor(machineId)).toEqual([
-      { session_id: target, command: "anthropic/opus", command_type: "model_set", chat_id: TG_CHAT },
-    ]);
-  });
-
-  it("refuses a target whose machine is not recently seen", async () => {
-    const machineId = uniq("m_stale_");
-    const target = uniq("ses_staletarget");
-    await seedSession(target, machineId);
-    const sends = captureSends();
-    await handleTelegramWebhook(env.DB, env as Env, webhook(`/compact ${target}`));
-    expect(await commandsFor(machineId)).toEqual([]);
-    expect(sends.at(-1)).toBe(`${machineId} is not recently seen.`);
   });
 });
 

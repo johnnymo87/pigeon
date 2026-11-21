@@ -8,6 +8,7 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import worker from "../src/index";
 import {
   SLACK_HANDLE_MIN,
+  allSlackWorkspaces,
   clearSlackConfigWarnings,
   slackChatId,
   slackWorkspaceForMachine,
@@ -100,6 +101,24 @@ describe("slackWorkspaceForTeam", () => {
     expect(slackWorkspaceForTeam(e, "T1")?.teamId).toBe("T1");
     expect(slackWorkspaceForTeam(e, "T3")).toBeNull();
     expect(slackWorkspaceForTeam(e, "T9")).toBeNull();
+  });
+});
+
+describe("allSlackWorkspaces", () => {
+  it("lists every valid workspace once per team id, skipping broken secrets", () => {
+    const e = {
+      ...env,
+      SLACK_WORKSPACE_DEVBOX: JSON.stringify(WS),
+      SLACK_WORKSPACE_CLOUDBOX: JSON.stringify(WS), // the same team under another machine
+      SLACK_WORKSPACE_MACBOOK: JSON.stringify({ ...WS, teamId: "T0OTHER" }),
+      SLACK_WORKSPACE_BROKEN: "not json",
+      SLACK_NOTIFY_OWNER: "errors",
+    } as unknown as Env;
+    expect(allSlackWorkspaces(e).map((w) => w.teamId).sort()).toEqual(["T0CFG", "T0OTHER"]);
+  });
+
+  it("is empty with no workspace secret", () => {
+    expect(allSlackWorkspaces(env as unknown as Env)).toEqual([]);
   });
 });
 

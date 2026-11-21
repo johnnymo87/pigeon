@@ -1,14 +1,13 @@
 import { unauthorized } from "./auth";
 import { authenticate, checkActsAs } from "./credentials";
 import { withD1, StorageError } from "./d1";
-import { getTelegramErrorDetails } from "./telegram";
-import { transportForChat } from "./chat";
+import { failureDetails } from "./chat/failures";
+import { isSlackChatId, transportForChat } from "./chat";
 import {
   getBySession,
   isPlaceholderTitle,
   rename as renameTopic,
   topicName,
-  topicsEnabled,
   type TopicRow,
 } from "./topics";
 
@@ -22,7 +21,7 @@ export async function editTopicName(
     return { ok: false, error: "topic has no message thread" };
   }
 
-  const tg = transportForChat(topic.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+  const tg = transportForChat(topic.chat_id, { env, db });
   const editRes = await tg.editForumTopic({
     chatId: topic.chat_id,
     messageThreadId: topic.message_thread_id,
@@ -30,15 +29,15 @@ export async function editTopicName(
     sessionId: topic.session_id,
   });
 
-  // TOPIC_NOT_MODIFIED means Telegram's name already equals the requested one, so the
+  // TOPIC_NOT_MODIFIED means the provider's name already equals the requested one, so the
   // rename is effectively done — treat it as success and fall through to the D1 writes.
   // This matches the reopen path (topic-manager.ts:77) and matters for two reasons:
   // repeating /rename with the same title must not report a failure, and because the
-  // Telegram edit deliberately precedes the D1 writes, a crash in between leaves D1
+  // provider edit deliberately precedes the D1 writes, a crash in between leaves D1
   // stale — re-issuing the command is the repair, and it only converges if this is
   // not treated as an error.
   if (!editRes.ok && editRes.kind !== "topic_not_modified") {
-    return { ok: false, error: getTelegramErrorDetails(editRes) };
+    return { ok: false, error: failureDetails(editRes) };
   }
 
   await withD1("topics.rename", renameTopic(db, { sessionId: topic.session_id, chatId: topic.chat_id, name }));
@@ -134,14 +133,15 @@ export async function handleTopicRename(
       return Response.json({ error: "bound_session" }, { status: 409 });
     }
 
-    if (!topicsEnabled(env)) {
-      return Response.json({ renamed: false, reason: "topics_disabled" });
-    }
-
     const topic = await withD1(
       "topicRename.getTopic",
       getBySession(db, sessionId),
     );
+    // A numeric row is a Telegram-era topic: nothing can rename it, and it answers as if the
+    // session were unknown rather than as a provider refusal.
+    if (topic && !isSlackChatId(topic.chat_id)) {
+      return Response.json({ error: "unknown_session" }, { status: 404 });
+    }
     if (!topic || topic.message_thread_id === null) {
       return Response.json({ renamed: false, reason: "no_topic" });
     }

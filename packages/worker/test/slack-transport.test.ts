@@ -15,7 +15,6 @@ import { SLACK_HANDLE_MIN, slackChatId, type SlackWorkspace } from "../src/chat/
 import { parseNotifyCategories } from "../src/chat/slack-notify";
 import { createSlackTransport, slugify } from "../src/chat/slack-transport";
 import type { ChatTransport } from "../src/chat";
-import { createTelegramClient } from "../src/telegram";
 
 beforeAll(async () => {
   for (const statement of d1Schema.split(";").map((s) => s.trim()).filter(Boolean)) {
@@ -160,7 +159,6 @@ describe("createForumTopic", () => {
     const res = await transport(ws).createForumTopic({
       chatId: slackChatId(ws),
       name,
-      iconColor: 7322096,
       sessionId: "ses_ABCDEF1234567890",
     });
     expect(res.ok).toBe(true);
@@ -881,14 +879,6 @@ describe("conversation lifecycle", () => {
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.kind).toBe("topic_not_modified");
   });
-
-  it("unpinAllForumTopicMessages is a successful no-op", async () => {
-    const ws = mkWs();
-    const handle = await seedChannel(ws, "CLC4");
-    const res = await transport(ws).unpinAllForumTopicMessages({ chatId: slackChatId(ws), messageThreadId: handle });
-    expect(res).toEqual({ ok: true, result: true });
-    expect(calls).toEqual([]);
-  });
 });
 
 // ─── signal ────────────────────────────────────────────────────────────────
@@ -939,7 +929,7 @@ describe("transportForChat routing", () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CRT1");
     slack("chat.postMessage", posted);
-    const t = transportForChat(slackChatId(ws), "tg-token", undefined, { env: envWith(ws), db: env.DB });
+    const t = transportForChat(slackChatId(ws), { env: envWith(ws), db: env.DB });
     const res = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" });
     expect(res.ok).toBe(true);
     expect(calls[0]!.params.get("channel")).toBe("CRT1");
@@ -953,7 +943,7 @@ describe("transportForChat routing", () => {
       urls.push(url);
       return new Response(JSON.stringify(posted), { headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;
-    const t = transportForChat(slackChatId(ws), "tg", undefined, { env: envWith(ws), db: env.DB, fetchFn });
+    const t = transportForChat(slackChatId(ws), { env: envWith(ws), db: env.DB, fetchFn });
     expect((await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: handle, text: "hi" })).ok).toBe(true);
     expect(urls).toEqual(["https://slack.com/api/chat.postMessage"]);
   });
@@ -962,10 +952,10 @@ describe("transportForChat routing", () => {
     const ws = mkWs();
     const stranger = mkWs();
     const cases = [
-      transportForChat(slackChatId(ws), "tg"),
-      transportForChat(slackChatId(ws), "tg", undefined, { env: envWith(stranger), db: env.DB }),
-      transportForChat(slackChatId(ws), "tg", undefined, { env: env as unknown as Env, db: env.DB }),
-      transportForChat("slack:", "tg", undefined, { env: envWith(ws), db: env.DB }),
+      transportForChat(slackChatId(ws)),
+      transportForChat(slackChatId(ws), { env: envWith(stranger), db: env.DB }),
+      transportForChat(slackChatId(ws), { env: env as unknown as Env, db: env.DB }),
+      transportForChat("slack:", { env: envWith(ws), db: env.DB }),
     ];
     for (const t of cases) {
       const res = await t.sendMessage({ chatId: slackChatId(ws), text: "x" });
@@ -978,25 +968,6 @@ describe("transportForChat routing", () => {
       }
     }
     expect(calls).toEqual([]);
-  });
-
-  it("leaves numeric addresses on Telegram, ignoring a slack context, and honours an injected fake", async () => {
-    const ws = mkWs();
-    let path = "";
-    fetchMock
-      .get("https://api.telegram.org")
-      .intercept({ method: "POST", path: /\/bottok-route\/sendMessage/ })
-      .reply(200, (opts: { path: string }) => {
-        path = opts.path;
-        return { ok: true, result: { message_id: 4 } };
-      });
-    const t = transportForChat("8248645256", "tok-route", undefined, { env: envWith(ws), db: env.DB });
-    expect((await t.sendMessage({ chatId: "8248645256", text: "hi" })).ok).toBe(true);
-    expect(path).toContain("/bottok-route/sendMessage");
-
-    const marker = { ok: true, result: { message_id: 1 } } as const;
-    const fake = { sendMessage: async () => marker } as unknown as ChatTransport;
-    expect(transportForChat("8248645256", "tok", fake, { env: envWith(ws), db: env.DB })).toBe(fake);
   });
 });
 
@@ -1403,42 +1374,6 @@ describe("signal on every operation that carries one", () => {
       "files.completeUploadExternal",
     ]);
     for (const s of seen) expect(s.signal).toBe(ac.signal);
-  });
-});
-
-describe("Telegram requests are unchanged by the new option fields", () => {
-  it("sends byte-identical bodies with or without signal / notifyOwner (and text on a rich message)", async () => {
-    const bodies: Array<{ method: string; body: unknown }> = [];
-    const spy = vi.spyOn(globalThis, "fetch").mockImplementation((async (url: string, init?: RequestInit) => {
-      const body = init?.body;
-      bodies.push({
-        method: String(url).split("/").pop()!,
-        body:
-          body instanceof FormData
-            ? [...body.entries()].map(([k, v]) => [k, typeof v === "string" ? v : `file:${(v as File).name}:${(v as File).size}`])
-            : body,
-      });
-      return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
-    }) as typeof fetch);
-    try {
-      const tg = createTelegramClient("tok-byte");
-      const ac = new AbortController();
-      const run = async (extra: Record<string, unknown>, richExtra: Record<string, unknown> = {}) => {
-        bodies.length = 0;
-        await tg.sendRichMessage({ chatId: "1", markdown: "m", messageThreadId: 5, replyMarkup: { a: 1 }, ...extra, ...richExtra });
-        await tg.editMessageText({ chatId: "1", messageId: 2, text: "t", entities: [{ type: "bold" }], ...extra });
-        await tg.sendPhoto({ chatId: "1", photo: new Blob(["abc"]), filename: "p.png", messageThreadId: 5, replyToMessageId: 3, ...extra });
-        await tg.sendDocument({ chatId: "1", document: new Blob(["abc"]), filename: "d.txt", ...extra });
-        await tg.sendMessage({ chatId: "1", text: "t", ...extra });
-        return structuredClone(bodies);
-      };
-      const plain = await run({});
-      const extended = await run({ signal: ac.signal, notifyOwner: true }, { text: "plain" });
-      expect(extended).toEqual(plain);
-      expect(plain).toHaveLength(5);
-    } finally {
-      spy.mockRestore();
-    }
   });
 });
 

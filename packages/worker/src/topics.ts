@@ -1,5 +1,5 @@
 /**
- * D1 repo module for Telegram forum topics (`topics` table).
+ * D1 repo module for session conversations (`topics` table: forum topics once, Slack channels now).
  */
 
 export interface TopicRow {
@@ -54,25 +54,6 @@ export function hasPlaceholderName(name: string | null | undefined): boolean {
   if (typeof name !== "string") return false;
   return /^New session - \d{4}-\d{2}-\d{2}T/.test(name.trim());
 }
-
-/**
- * Returns true if TELEGRAM_TOPICS_ENABLED is set to "true" (exact match).
- * Returns false if "false", absent/undefined, or any other value (fail-safe).
- */
-export function topicsEnabled(env: { TELEGRAM_TOPICS_ENABLED?: string }): boolean {
-  return env.TELEGRAM_TOPICS_ENABLED === "true";
-}
-
-/**
- * Machine icon color mapping for Telegram forum topics.
- * Fixed map rather than a hash to prevent trivial collisions between machine names.
- */
-export const MACHINE_ICON_COLORS: Record<string, number> = {
-  devbox: 7322096, // 0x6FB9F0 blue
-  cloudbox: 9367192, // 0x8EEE98 green
-  macbook: 13338331, // 0xCB86DB purple
-};
-export const DEFAULT_ICON_COLOR = 16766590; // 0xFFD67E yellow
 
 /**
  * Clamp `s` to at most `max` UTF-16 code units without splitting a surrogate pair.
@@ -209,12 +190,12 @@ export async function reserve(
  * The `AND chat_id = ?` clause a topic CAS carries when the caller names its chat
  * (chat-transport phase 2, pigeon-4ogz.1, spec §1 "Every topic CAS is scoped to chat_id").
  *
- * A session's row can move between chats while a provider call is in flight: a machine that
- * flips to Slack supersedes its sessions' Telegram rows with Slack ones, and a Telegram create can
- * take 57s (pigeon-iqpd). Unscoped, that late create's finalize would write a Telegram thread id
- * into the Slack row, and its failure cleanup would delete the Slack reservation. Scoped, both
- * miss. The chat is optional only so the long-standing direct calls in the Telegram test suite
- * keep their meaning; `resolveTopic` always passes it.
+ * A session's row can move between chats while a provider call is in flight: a numeric
+ * (Telegram-era) row is replaced by a Slack one, and a create can take 57s (pigeon-iqpd).
+ * Unscoped, that late create's finalize would write its thread id into the other row, and its
+ * failure cleanup would delete the other row's reservation. Scoped, both miss. The chat is
+ * optional only so the long-standing direct calls in the test suite keep their meaning;
+ * `resolveTopic` always passes it.
  */
 function chatScope(chatId: string | undefined): { sql: string; binds: string[] } {
   return chatId === undefined ? { sql: "", binds: [] } : { sql: " AND chat_id = ?", binds: [chatId] };
@@ -478,6 +459,23 @@ export async function listReapable(
     .bind(opts.closedBefore, opts.updatedBefore, opts.limit)
     .all<TopicRow>();
   return results ?? [];
+}
+
+/**
+ * Delete open numeric (non-`slack:`, Telegram-era) topic rows that match the orphan predicate of
+ * `listOrphaned`, in one statement and with no provider call. Returns how many rows went.
+ */
+export async function deleteNumericOrphans(db: D1Database, updatedBefore: number): Promise<number> {
+  const res = await db
+    .prepare(
+      `DELETE FROM topics
+       WHERE state = 'open' AND chat_id NOT LIKE 'slack:%'
+         AND (NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = topics.session_id)
+              OR EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = topics.session_id AND s.updated_at < ?))`,
+    )
+    .bind(updatedBefore)
+    .run();
+  return res.meta.changes ?? 0;
 }
 
 /**

@@ -6,6 +6,7 @@
  */
 
 import { transportForChat } from "./chat";
+import { allSlackWorkspaces, slackChatId } from "./chat/slack-config";
 import { MAX_SESSIONS } from "./sessions";
 
 export const LEASE_TIMEOUT_MS = 60_000; // 60s lease expiry
@@ -290,35 +291,15 @@ export async function cleanupCommands(
   };
 }
 
-// ─── cleanupSeenUpdates ───────────────────────────────────────────────────────
-
-/**
- * Cleanup old seen_updates entries older than 24 hours.
- * Returns the count of deleted rows.
- */
-export async function cleanupSeenUpdates(
-  db: D1Database,
-  now: number = Date.now(),
-): Promise<number> {
-  const oneDayAgo = now - 24 * 60 * 60 * 1000;
-
-  const result = await db
-    .prepare("DELETE FROM seen_updates WHERE created_at < ?")
-    .bind(oneDayAgo)
-    .run();
-
-  return result.meta.rows_written ?? 0;
-}
-
 // ─── checkSessionHighWaterAlert ───────────────────────────────────────────────
 
 /**
  * High-water alert check for session capacity.
  * If session count >= thresholdRatio (default 80%) of maxSessions (default MAX_SESSIONS),
- * sends a Telegram alert to the first chat ID in env.ALLOWED_CHAT_IDS.
- * Rejections inside sendMessage are caught and logged so cron execution stays alive.
+ * posts an alert to the `#alerts` of every configured Slack workspace (one post per team id, however
+ * many machines share it). A failed post is caught and logged so cron execution stays alive.
  *
- * Returns the session count and whether an alert was sent.
+ * Returns the session count and whether an alert was sent (to at least one workspace).
  */
 export async function checkSessionHighWaterAlert(
   db: D1Database,
@@ -341,18 +322,12 @@ export async function checkSessionHighWaterAlert(
     return { count, alerted: false };
   }
 
-  const raw = env.ALLOWED_CHAT_IDS || "";
-  const allowed = raw
-    .split(",")
-    .map((id) => id.trim())
-    .filter((id) => id.length > 0);
-  const firstChatId = allowed[0];
-
-  if (!firstChatId) {
+  const workspaces = allSlackWorkspaces(env);
+  if (workspaces.length === 0) {
     // Over threshold with nowhere to send. Silence here would mean the alert is disabled
     // by misconfiguration and nobody ever finds out, which is worse than no alert at all.
     console.error(
-      `Session high-water alert suppressed: ${count} / ${cap} sessions but ALLOWED_CHAT_IDS is empty`,
+      `Session high-water alert suppressed: ${count} / ${cap} sessions but no Slack workspace is configured`,
     );
     return { count, alerted: false };
   }
@@ -361,16 +336,19 @@ export async function checkSessionHighWaterAlert(
   const text = `⚠️ Session count high: ${count} / ${cap} sessions (${pct}%)`;
 
   let alerted = false;
-  try {
-    const client = transportForChat(firstChatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
-    const res = await client.sendMessage({ chatId: firstChatId, text });
-    if (res.ok) {
-      alerted = true;
-    } else {
-      console.error("Failed to send session high-water alert:", res);
+  for (const ws of workspaces) {
+    const chatId = slackChatId(ws);
+    try {
+      // No thread: an unthreaded post is the workspace's #alerts.
+      const res = await transportForChat(chatId, { env, db }).sendMessage({ chatId, text });
+      if (res.ok) {
+        alerted = true;
+      } else {
+        console.error("Failed to send session high-water alert:", { chatId, res });
+      }
+    } catch (err) {
+      console.error("Failed to send session high-water alert:", { chatId, err });
     }
-  } catch (err) {
-    console.error("Failed to send session high-water alert:", err);
   }
 
   return { count, alerted };

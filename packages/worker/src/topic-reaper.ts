@@ -1,11 +1,11 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import {
+  deleteNumericOrphans,
   listOrphaned,
   listReapable,
   deleteTopicBySession,
   markClosed,
-  topicsEnabled,
 } from "./topics";
 
 export const REAP_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
@@ -16,9 +16,11 @@ export const DEFAULT_ORPHAN_CAP = 30;
 /**
  * pigeon-4890 / pigeon-ln8z — the orphan-closer runs on exactly ONE hourly tick per day.
  *
- * Closing a forum topic makes Telegram post a service message into it, which marks the topic
- * UNREAD. Running the closer on every hourly cron therefore trickled newly-unread topics into the
- * sidebar around the clock. Gating it to a single tick turns that into a single moment of the day.
+ * Closing a Telegram forum topic made Telegram post a service message into it, which marked the
+ * topic UNREAD, and running the closer on every hourly cron trickled newly-unread topics into the
+ * sidebar around the clock. Gating it to a single tick turned that into a single moment of the
+ * day. Slack has no such unread mark (closing archives the channel), so the gate is no longer
+ * needed for its original reason; it is kept as a harmless daily batch rather than redesigned.
  *
  * It is one tick, not a multi-hour window. pigeon-4890 shipped a 4-hour window (12–15 UTC) whose
  * trailing hours were meant as a stateless catch-up that would "find zero orphans" on an ordinary
@@ -26,7 +28,7 @@ export const DEFAULT_ORPHAN_CAP = 30;
  * hour, and the daemon's hourly reaper defers unregisters to this closer), so every trailing tick
  * found and closed a few more — observed 12/2/4/5 closes at 12/13/14/15 UTC on 2026-09-30.
  *
- * The cost of one tick: a run cut short by a Telegram 429, or a backlog over DEFAULT_ORPHAN_CAP,
+ * The cost of one tick: a run cut short by a provider 429, or a backlog over DEFAULT_ORPHAN_CAP,
  * waits until tomorrow's tick. That is NOT rare: the loop is unpaced and each close posts into the
  * same group, so busy days likely hit Telegram's per-group limit around ~20 closes (2026-09-23 ran
  * 21/21/15 across the old window). Spill is still one batch per night, just a day later — harmless
@@ -54,29 +56,22 @@ export function shouldCloseOrphans(now: number): boolean {
 }
 
 export interface ReapTopicsOptions {
-  botToken: string;
   now?: number;
   reapTtlMs?: number;
   orphanTtlMs?: number;
   limit?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
-  /** The worker env, which a Slack row needs for its workspace secret. */
-  env?: Env;
 }
 
 export interface ReapResult {
   reaped: number;
-  rateLimited: boolean;
 }
 
 export interface CloseOrphanedTopicsOptions {
-  botToken: string;
   now?: number;
   orphanTtlMs?: number;
   limit?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for any Slack row's address (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack row needs for its workspace secret. */
   env?: Env;
 }
@@ -92,8 +87,8 @@ export interface RunTopicReaperOptions {
   orphanTtlMs?: number;
   reapCap?: number;
   orphanCap?: number;
-  /** Replaces the Telegram transport (tests); a Slack row never reaches it. */
-  tgClient?: ChatTransport;
+  /** Replaces the transport for any Slack row's address (tests). */
+  transport?: ChatTransport;
   /** The worker env, which a Slack row needs for its workspace secret. */
   env?: Env;
   /**
@@ -110,9 +105,10 @@ export interface TopicReaperResult {
 }
 
 /**
- * Job 1 — reap. Delete topics with state='closed' AND closed_at < now - 30 days.
- * Capped at limit per run (default 5). On thread_not_found, drops the D1 row anyway.
- * NULL message_thread_id rows skip Telegram entirely, and so do Slack rows (nothing to delete).
+ * Job 1 — reap. Forget topics with state='closed' AND closed_at < now - 30 days.
+ * Capped at limit per run (default 5). Slack has nothing to delete (a channel can only be
+ * archived), so every row, NULL message_thread_id or finalized, numeric or Slack, is just dropped
+ * from D1 with no provider call.
  */
 export async function reapTopics(
   db: D1Database,
@@ -127,49 +123,27 @@ export async function reapTopics(
 
   const rows = await listReapable(db, { closedBefore, updatedBefore, limit });
   if (rows.length === 0) {
-    return { reaped: 0, rateLimited: false };
+    return { reaped: 0 };
   }
 
-  // Rows of every chat are mixed here, so the transport is picked per row, by its address.
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
   let reaped = 0;
 
+  // The row is just forgotten: Slack has no delete and a numeric (Telegram-era) row has no
+  // provider left to call.
   for (const row of rows) {
-    if (row.message_thread_id === null) {
-      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, null);
-      if (deleted) reaped++;
-      continue;
-    }
-
-    // Slack has nothing to delete: a channel can only be archived (which the orphan-closer did
-    // when the row closed), never removed. The row is just forgotten, with no provider call.
-    if (isSlackChatId(row.chat_id)) {
-      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
-      if (deleted) reaped++;
-      continue;
-    }
-
-    const res = await tgFor(row.chat_id).deleteForumTopic({
-      chatId: row.chat_id,
-      messageThreadId: row.message_thread_id,
-    });
-
-    if (res.ok || res.kind === "thread_not_found") {
-      const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
-      if (deleted) reaped++;
-    } else if (res.kind === "rate_limited") {
-      return { reaped, rateLimited: true };
-    }
+    const deleted = await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
+    if (deleted) reaped++;
   }
 
-  return { reaped, rateLimited: false };
+  return { reaped };
 }
 
 /**
  * Job 2 — close orphans. Close state='open' topics whose sessions row is absent,
  * or whose sessions.updated_at is older than session TTL (7 days).
  * Capped at limit per run (default 5).
- * NULL message_thread_id rows skip Telegram entirely.
+ * NULL message_thread_id rows skip the provider entirely, and a numeric (Telegram-era) row is
+ * just deleted from D1: no provider can take the call, and it is not counted as closed.
  */
 export async function closeOrphanedTopics(
   db: D1Database,
@@ -180,27 +154,34 @@ export async function closeOrphanedTopics(
   const limit = opts.limit ?? DEFAULT_ORPHAN_CAP;
   const updatedBefore = now - orphanTtlMs;
 
+  // Numeric (Telegram-era) orphans have no provider call to make and are not counted as closed, so
+  // they are dropped first in one statement. Left in `listOrphaned`'s oldest-first window they would
+  // eat the cap ahead of the Slack orphans that actually need an archive.
+  await deleteNumericOrphans(db, updatedBefore);
+
   const rows = await listOrphaned(db, { updatedBefore, limit });
   if (rows.length === 0) {
     return { closedOrphans: 0, rateLimited: false };
   }
 
-  const tgFor = (chatId: string) => transportForChat(chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
+  const tgFor = (chatId: string) => transportForChat(chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
   let closedOrphans = 0;
-  // A 429 limits ONE provider, so it stops that transport's remaining rows and no others: Slack
-  // being limited must not leave Telegram orphans open until tomorrow's tick, nor the reverse.
-  // Telegram-only (or Slack-only) runs therefore behave exactly as the single flag did.
-  const limited = new Set<"slack" | "telegram">();
+  // A 429 stops the remaining provider calls of this run (rows with no call to make still go).
+  let limited = false;
 
   for (const row of rows) {
+    if (!isSlackChatId(row.chat_id)) {
+      await deleteTopicBySession(db, row.session_id, row.chat_id, row.message_thread_id);
+      continue;
+    }
+
     if (row.message_thread_id === null) {
       await markClosed(db, { sessionId: row.session_id, chatId: row.chat_id, now });
       closedOrphans++;
       continue;
     }
 
-    const transport = isSlackChatId(row.chat_id) ? "slack" : "telegram";
-    if (limited.has(transport)) continue;
+    if (limited) continue;
 
     const res = await tgFor(row.chat_id).closeForumTopic({
       chatId: row.chat_id,
@@ -208,7 +189,7 @@ export async function closeOrphanedTopics(
     });
 
     if (!res.ok && res.kind === "rate_limited") {
-      limited.add(transport);
+      limited = true;
       continue;
     }
 
@@ -227,26 +208,18 @@ export async function closeOrphanedTopics(
     closedOrphans++;
   }
 
-  return { closedOrphans, rateLimited: limited.size > 0 };
+  return { closedOrphans, rateLimited: limited };
 }
 
 /**
  * Entry point called by scheduled cron.
- * Gated on topicsEnabled(env). Flag off => returns immediately with zeros.
  * Executes reapTopics then closeOrphanedTopics. Stops early if rate_limited.
  */
 export async function runTopicReaper(
   db: D1Database,
-  env: { TELEGRAM_TOPICS_ENABLED?: string; TELEGRAM_BOT_TOKEN: string },
   opts: RunTopicReaperOptions = {},
 ): Promise<TopicReaperResult> {
-  if (!topicsEnabled(env)) {
-    return { reaped: 0, closedOrphans: 0, rateLimited: false };
-  }
-
-  const botToken = env.TELEGRAM_BOT_TOKEN;
   const reapRes = await reapTopics(db, {
-    botToken,
     now: opts.now,
     reapTtlMs: opts.reapTtlMs,
     // Must be forwarded: it is the reaper's session-liveness cutoff. Omitting it silently split the
@@ -254,30 +227,18 @@ export async function runTopicReaper(
     // back to the 7d default — which is exactly the drift the shared constant exists to prevent.
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.reapCap,
-    tgClient: opts.tgClient,
-    env: opts.env,
   });
 
-  if (reapRes.rateLimited) {
-    return {
-      reaped: reapRes.reaped,
-      closedOrphans: 0,
-      rateLimited: true,
-    };
-  }
-
-  // Reaping stays on the hourly cadence: deleteForumTopic removes the topic outright and posts
-  // no service message, so it is silent in the sidebar and there is nothing to batch.
+  // Reaping stays on the hourly cadence: it only forgets D1 rows, which nothing can see.
   if (opts.closeOrphans === false) {
     return { reaped: reapRes.reaped, closedOrphans: 0, rateLimited: false };
   }
 
   const orphanRes = await closeOrphanedTopics(db, {
-    botToken,
     now: opts.now,
     orphanTtlMs: opts.orphanTtlMs,
     limit: opts.orphanCap,
-    tgClient: opts.tgClient,
+    transport: opts.transport,
     env: opts.env,
   });
 

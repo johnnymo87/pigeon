@@ -1,20 +1,20 @@
 #!/usr/bin/env node
 /**
- * Flip one machine's pigeon chat transport between Telegram and Slack (bead pigeon-4ogz.6). Spec:
- * docs/plans/2026-11-20-slack-transport-design.md §3 "Flip and unflip move bindings explicitly"
- * and §9; runbook docs/runbooks/slack-workspace-setup.md "At the flip".
+ * Put one machine on its Slack workspace (bead pigeon-4ogz.6). Spec:
+ * docs/plans/2026-11-20-slack-transport-design.md §3; runbook docs/runbooks/slack-workspace-setup.md
+ * "At the flip". Slack is the only transport (pigeon-4ogz.13): there is no direction to choose and
+ * no way back to Telegram.
  *
- *   node packages/worker/scripts/slack-flip.mjs <machine> on  [--dry-run] [--config <file>|-]
- *   node packages/worker/scripts/slack-flip.mjs <machine> off [--dry-run] [--telegram-chat <id>]
+ *   node packages/worker/scripts/slack-flip.mjs <machine> on [--dry-run] [--config <file>|-]
  *
- *   on:  check the D1 Slack tables exist, put the worker secret SLACK_WORKSPACE_<MACHINE>, then
- *        move every named-topic binding of that machine's sessions (the stall-watch coordinators)
- *        to Slack, creating each coordinator's channel now (POST /topics/named/rehome).
- *   off: delete the secret, then move those bindings back to their Telegram topics.
+ *   check the D1 Slack tables exist, put the worker secret SLACK_WORKSPACE_<MACHINE>, then move
+ *   every named-topic binding of that machine's sessions (the stall-watch coordinators) into the
+ *   workspace, creating each coordinator's channel now (POST /topics/named/rehome). Also the way to
+ *   move a machine to a different workspace.
  *
- * Both are idempotent: re-run one that stopped part-way. The worker refuses to move a binding
- * against the transport it sees, so a run that starts before the secret change has reached the
- * worker just waits (up to two minutes).
+ * Idempotent: re-run one that stopped part-way. The worker has nothing to move a binding to until
+ * it sees the secret, so a run that starts before the secret change has reached the worker just
+ * waits (up to two minutes).
  *
  * Runs on devbox for every machine, because all three workspace configs live in devbox's sops
  * (workstation secrets/devbox.yaml, key pigeon_slack_workspace_<machine>). The config is
@@ -56,24 +56,22 @@ export const secretName = (machine) => `SLACK_WORKSPACE_${machine.toUpperCase().
 export const sopsKey = (machine) => `pigeon_slack_workspace_${machine}`;
 
 export const USAGE =
-  "usage: slack-flip.mjs <machine> on|off [--dry-run] [--config <file>|-] [--telegram-chat <id>] " +
+  "usage: slack-flip.mjs <machine> on [--dry-run] [--config <file>|-] " +
   "[--sops-file <path>] [--worker-url <url>] [--key-file <path>]";
 
 export function parseArgs(argv) {
   const [machine, direction, ...rest] = argv;
   if (!machine || !MACHINE_ID_PATTERN.test(machine)) throw new Error(USAGE);
-  if (direction !== "on" && direction !== "off") throw new Error(USAGE);
+  if (direction !== "on") throw new Error(USAGE);
   const opts = {
     machine,
-    direction,
     dryRun: false,
     config: null,
-    telegramChat: null,
     sopsFile: DEFAULT_SOPS_FILE,
     workerUrl: DEFAULT_BASE_URL,
     keyFile: DEFAULT_KEY_FILE,
   };
-  const valued = { "--config": "config", "--telegram-chat": "telegramChat", "--sops-file": "sopsFile", "--worker-url": "workerUrl", "--key-file": "keyFile" };
+  const valued = { "--config": "config", "--sops-file": "sopsFile", "--worker-url": "workerUrl", "--key-file": "keyFile" };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === "--dry-run") opts.dryRun = true;
@@ -83,9 +81,6 @@ export function parseArgs(argv) {
       opts[valued[a]] = v;
     } else throw new Error(`unknown argument ${JSON.stringify(a)}\n${USAGE}`);
   }
-  if (opts.direction === "on" && opts.telegramChat !== null) throw new Error("--telegram-chat is only for off");
-  if (opts.direction === "off" && opts.config !== null) throw new Error("--config is only for on");
-  if (opts.telegramChat !== null && !/^-?\d+$/.test(opts.telegramChat)) throw new Error("--telegram-chat must be a numeric chat id");
   return opts;
 }
 
@@ -176,29 +171,6 @@ function putSecret(machine, cfg, deps) {
   if (r.status !== 0) throw new Error(`wrangler secret put ${secretName(machine)} failed: ${lastLine(r.stderr)}`);
 }
 
-/** Whether the worker has `name`, from `wrangler secret list` (names only; values are never listed). */
-export function hasSecret(name, deps) {
-  const r = deps.run("npx", ["wrangler", "secret", "list", "--format", "json"], { cwd: WORKER_DIR });
-  if (r.status !== 0) throw new Error(`wrangler secret list failed: ${lastLine(r.stderr)}`);
-  let list;
-  try {
-    list = JSON.parse(r.stdout);
-  } catch {
-    throw new Error("could not read wrangler secret list --format json output");
-  }
-  if (!Array.isArray(list)) throw new Error("wrangler secret list did not answer a list");
-  return list.some((x) => x && x.name === name);
-}
-
-/** Deletes the secret if it exists, so a re-run of `off` gets past this step to the bindings. */
-function deleteSecret(machine, deps) {
-  if (!hasSecret(secretName(machine), deps)) return false;
-  // Non-interactive (stdin is not a TTY), so wrangler takes its "yes" fallback for the prompt.
-  const r = deps.run("npx", ["wrangler", "secret", "delete", secretName(machine)], { cwd: WORKER_DIR });
-  if (r.status !== 0) throw new Error(`wrangler secret delete ${secretName(machine)} failed: ${lastLine(r.stderr)}`);
-  return true;
-}
-
 async function callRehome(opts, deps, body) {
   const key = deps.readFile(opts.keyFile).trim();
   const res = await deps.fetch(`${opts.workerUrl.replace(/\/+$/, "")}/topics/named/rehome`, {
@@ -217,24 +189,23 @@ async function callRehome(opts, deps, body) {
 
 /**
  * Page through the rehome route until every binding has been tried once. Returns the results.
- * 409 transport_mismatch = the secret change has not reached the worker yet: wait and retry.
+ * 409 no_workspace = the secret change has not reached the worker yet: wait and retry.
  */
-export async function rehomeAll(opts, deps, expect) {
+export async function rehomeAll(opts, deps) {
   let waitingSince = null; // start of the current run of 409s, so Slack backoffs do not count
   const results = [];
   let after = null;
   for (let page = 0; page < MAX_PAGES; page++) {
-    const body = { expect, ...(after ? { after } : {}), ...(opts.telegramChat ? { telegramChatId: opts.telegramChat } : {}) };
-    const r = await callRehome(opts, deps, body);
-    if (r.status === 409 && r.body?.error === "transport_mismatch") {
+    const r = await callRehome(opts, deps, after ? { after } : {});
+    if (r.status === 409 && r.body?.error === "no_workspace") {
       waitingSince ??= deps.now();
       if (deps.now() - waitingSince > PROPAGATION_TIMEOUT_MS) {
         throw new Error(
-          `the worker still sees ${opts.machine} on ${r.body.transport} after ${PROPAGATION_TIMEOUT_MS / 1000}s; ` +
+          `the worker still sees no workspace for ${opts.machine} after ${PROPAGATION_TIMEOUT_MS / 1000}s; ` +
             "check the secret (npx wrangler secret list) and re-run",
         );
       }
-      deps.log(`  worker still sees ${r.body.transport}; waiting for the secret change to propagate`);
+      deps.log("  worker does not see the workspace yet; waiting for the secret change to propagate");
       await deps.sleep(PROPAGATION_POLL_MS);
       page--; // not a page
       continue;
@@ -259,46 +230,38 @@ export async function rehomeAll(opts, deps, expect) {
   throw new Error(`gave up after ${MAX_PAGES} pages; re-run (it is idempotent)`);
 }
 
-async function preview(opts, deps, expect) {
-  const r = await callRehome(opts, deps, { expect, dryRun: true });
+async function preview(opts, deps) {
+  const r = await callRehome(opts, deps, { dryRun: true });
   if (r.status !== 200 || !r.body) throw new Error(`dry-run rehome answered ${r.status}: ${JSON.stringify(r.body?.error ?? r.body)}`);
   return r.body;
 }
 
 /** Runs the flip. Returns the process exit code: 0 ok, 1 something left for a human. */
 export async function flip(opts, deps = realDeps) {
-  const { machine, direction } = opts;
-  const expect = direction === "on" ? "slack" : "telegram";
+  const { machine } = opts;
 
-  if (direction === "on") {
-    const cfg = loadConfig(opts, deps);
-    deps.log(`${machine}: workspace team ${cfg.teamId}, app ${cfg.appId}, https://${cfg.domain}.slack.com, owner ${cfg.ownerUserId}`);
-    checkSlackTables(deps);
-    if (opts.dryRun) {
-      const p = await preview(opts, deps, expect);
-      deps.log(`dry run: would put ${secretName(machine)}; worker now sees ${machine} on ${p.transport}; ${p.pending} binding(s) would move to Slack:`);
-      for (const x of p.results) deps.log(`  ${x.key}  ${x.sessionId}`);
-      return 0;
-    }
-    putSecret(machine, cfg, deps);
-    deps.log(`put ${secretName(machine)}`);
-  } else {
-    if (opts.dryRun) {
-      const p = await preview(opts, deps, expect);
-      deps.log(`dry run: would delete ${secretName(machine)}; worker now sees ${machine} on ${p.transport}; ${p.pending} binding(s) would move to Telegram:`);
-      for (const x of p.results) deps.log(`  ${x.key}  ${x.sessionId}`);
-      return 0;
-    }
-    deps.log(deleteSecret(machine, deps) ? `deleted ${secretName(machine)}` : `${secretName(machine)} was already absent`);
+  const cfg = loadConfig(opts, deps);
+  deps.log(`${machine}: workspace team ${cfg.teamId}, app ${cfg.appId}, https://${cfg.domain}.slack.com, owner ${cfg.ownerUserId}`);
+  checkSlackTables(deps);
+  if (opts.dryRun) {
+    const p = await preview(opts, deps);
+    deps.log(
+      `dry run: would put ${secretName(machine)}; worker ${p.workspace ? "already sees" : "does not yet see"} a workspace for ${machine}; ` +
+        `${p.pending} binding(s) would move to Slack:`,
+    );
+    for (const x of p.results) deps.log(`  ${x.key}  ${x.sessionId}`);
+    return 0;
   }
+  putSecret(machine, cfg, deps);
+  deps.log(`put ${secretName(machine)}`);
 
-  deps.log(`moving ${machine}'s named-topic bindings to ${expect}:`);
-  const results = await rehomeAll(opts, deps, expect);
+  deps.log(`moving ${machine}'s named-topic bindings to Slack:`);
+  const results = await rehomeAll(opts, deps);
   deps.log(`waiting ${SETTLE_MS / 1000}s for every worker isolate to see the change, then checking again`);
   await deps.sleep(SETTLE_MS);
-  if ((await preview(opts, deps, expect)).pending > 0) {
+  if ((await preview(opts, deps)).pending > 0) {
     deps.log("some bindings moved back or were left; sweeping again:");
-    const again = await rehomeAll(opts, deps, expect);
+    const again = await rehomeAll(opts, deps);
     // The second sweep's outcome supersedes the first's for the same binding.
     for (const x of again) {
       const i = results.findIndex((y) => y.sessionId === x.sessionId);
@@ -306,16 +269,14 @@ export async function flip(opts, deps = realDeps) {
       else results.push(x);
     }
   }
-  const left = (await preview(opts, deps, expect)).pending;
+  const left = (await preview(opts, deps)).pending;
   const bad = results.filter((x) => x.outcome !== "moved");
   deps.log(
-    `${machine} is on ${expect}: ${results.length - bad.length} binding(s) moved, ${bad.length} not, ${left} still pending.`,
+    `${machine} is on slack: ${results.length - bad.length} binding(s) moved, ${bad.length} not, ${left} still pending.`,
   );
   if (bad.length || left) {
     deps.log(
-      direction === "off" && bad.some((x) => x.outcome === "unplaced")
-        ? "Re-run with --telegram-chat <the machine's TELEGRAM_CHAT_ID> to place the unplaced ones, or let the daemon re-bind them."
-        : "Re-run to retry (it is idempotent); a binding left behind posts its coordinator's messages to #alerts/General.",
+      "Re-run to retry (it is idempotent); a binding left behind posts its coordinator's messages to #alerts.",
     );
     return 1;
   }

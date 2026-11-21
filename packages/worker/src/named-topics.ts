@@ -18,15 +18,13 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
 import { resolveWorkerTarget } from "./chat/address";
-import { topicsEnabled } from "./topics";
-import { getTelegramErrorDetails } from "./telegram";
-import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
-import { topicUrl } from "./mention-links";
+import { failureDetails } from "./chat/failures";
+import { transportForChat, type ChatTransport } from "./chat";
 
 /** Caller-chosen key. Validated on both sides of the wire (daemon and here). */
 export const NAMED_TOPIC_KEY_RE = /^[A-Za-z0-9:._-]{1,64}$/;
 
-/** Telegram's limit on a forum topic name. */
+/** Telegram's limit on a forum topic name, kept as the bound on a conversation's name. */
 export const MAX_TOPIC_NAME_CHARS = 128;
 
 /** How often an existing named topic is re-opened, at most. A closed topic still accepts posts. */
@@ -104,16 +102,15 @@ export async function resolveNamedTopic(
     key: string;
     name: string;
     staleThreadId?: number;
-    botToken: string;
     now?: number;
-    /** Replaces the Telegram transport (tests); a Slack address never reaches it. */
-    tgClient?: ChatTransport;
+    /** Replaces the transport for ANY address, Slack included (tests). */
+    transport?: ChatTransport;
     /** The worker env, which a Slack address needs for its workspace secret. */
     env?: Env;
   },
 ): Promise<ResolveNamedTopicResult> {
   const now = opts.now ?? Date.now();
-  const tg = transportForChat(opts.chatId, opts.botToken, opts.tgClient, opts.env ? { env: opts.env, db } : undefined);
+  const tg = transportForChat(opts.chatId, opts.env ? { env: opts.env, db } : undefined, opts.transport);
 
   let row = await getNamedTopic(db, opts.chatId, opts.key);
 
@@ -150,8 +147,7 @@ export async function resolveNamedTopic(
   }
 
   const name = truncateName(opts.name.trim() || opts.key);
-  // `channelKey` and `topic` are Slack's: the key becomes the channel's name and the human name
-  // its topic line. Telegram's client reads neither.
+  // `channelKey` and `topic`: the key becomes the channel's name and the human name its topic line.
   const created = await tg.createForumTopic({ chatId: opts.chatId, name, channelKey: opts.key, topic: name });
   if (!created.ok) {
     if (created.kind === "rate_limited") {
@@ -159,9 +155,9 @@ export async function resolveNamedTopic(
     }
     console.warn("[worker] named topic creation failed", {
       key: opts.key,
-      details: getTelegramErrorDetails(created),
+      details: failureDetails(created),
     });
-    return { ok: false, kind: "create_failed", details: getTelegramErrorDetails(created) };
+    return { ok: false, kind: "create_failed", details: failureDetails(created) };
   }
 
   const threadId = created.result.message_thread_id;
@@ -190,7 +186,7 @@ export async function resolveNamedTopic(
 /**
  * POST /topics/named  {chatId, key, name, staleThreadId?}
  *   200 {chatId, messageThreadId, created}
- *   400 bad input · 403 chat not allowed · 409 topics disabled · 429 rate limited · 502 create failed
+ *   400 bad input · 403 no workspace for the caller · 429 rate limited · 502 create failed
  *
  * Every non-200 is a fail-open signal to the daemon: it posts the alert to General instead.
  */
@@ -212,14 +208,13 @@ export async function handleNamedTopic(
     return Response.json({ error: "invalid body" }, { status: 400 });
   }
 
-  const requestedChatId = typeof body.chatId === "string" || typeof body.chatId === "number" ? String(body.chatId) : "";
   const key = typeof body.key === "string" ? body.key : "";
   const name = typeof body.name === "string" ? body.name : "";
   const stale = body.staleThreadId;
-  // A machine on Slack needs no chat id: its target is its workspace.
-  const target = resolveWorkerTarget(env, principal, requestedChatId);
-  if ((!requestedChatId && !target.ok) || !NAMED_TOPIC_KEY_RE.test(key)) {
-    return Response.json({ error: "chatId and a valid key are required" }, { status: 400 });
+  // A machine needs no chat id: its target is its workspace, whatever it sent.
+  const target = resolveWorkerTarget(env, principal);
+  if (!NAMED_TOPIC_KEY_RE.test(key)) {
+    return Response.json({ error: "a valid key is required" }, { status: 400 });
   }
   if (stale !== undefined && !(typeof stale === "number" && Number.isInteger(stale) && stale > 0)) {
     return Response.json({ error: "staleThreadId must be a positive integer" }, { status: 400 });
@@ -227,13 +222,10 @@ export async function handleNamedTopic(
   if (!target.ok) {
     return Response.json({ error: "Chat ID not allowed" }, { status: 403 });
   }
-  const chatId = String(target.chatId);
-  if (target.slack && key.startsWith("_")) {
-    // `_`-prefixed keys are the worker's own (`_alerts`), so a caller may not take one on Slack.
+  const chatId = target.chatId;
+  if (key.startsWith("_")) {
+    // `_`-prefixed keys are the worker's own (`_alerts`), so a caller may not take one.
     return Response.json({ error: "keys starting with _ are reserved" }, { status: 400 });
-  }
-  if (!topicsEnabled(env)) {
-    return Response.json({ error: "topics disabled" }, { status: 409 });
   }
 
   const res = await resolveNamedTopic(db, {
@@ -241,7 +233,6 @@ export async function handleNamedTopic(
     key,
     name,
     staleThreadId: stale as number | undefined,
-    botToken: env.TELEGRAM_BOT_TOKEN,
     env,
   });
   if (res.ok) {
@@ -268,8 +259,7 @@ export async function maybeAnswerInNamedTopic(
   messageThreadId: number | undefined,
   now: number = Date.now(),
 ): Promise<boolean> {
-  // TELEGRAM_TOPICS_ENABLED is Telegram's switch; a Slack channel is always a conversation.
-  if ((!isSlackChatId(chatId) && !topicsEnabled(env)) || messageThreadId === undefined) return false;
+  if (messageThreadId === undefined) return false;
   const row = await getNamedTopicByThread(db, chatId, messageThreadId);
   if (!row) return false;
 
@@ -281,89 +271,13 @@ export async function maybeAnswerInNamedTopic(
     .bind(now, chatId, row.topic_key, now - NAMED_TOPIC_HINT_INTERVAL_MS)
     .run();
   if ((claimed.meta?.changes ?? 0) > 0) {
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
-    const text = (await movedTopicHint(db, env, chatId, messageThreadId, row.topic_key)) ?? NAMED_TOPIC_HINT_TEXT;
-    const res = await tg.sendMessage({ chatId, messageThreadId, text });
+    const tg = transportForChat(chatId, { env, db });
+    const res = await tg.sendMessage({ chatId, messageThreadId, text: NAMED_TOPIC_HINT_TEXT });
     if (!res.ok) {
-      console.warn("[worker] named topic hint failed", { key: row.topic_key, details: getTelegramErrorDetails(res) });
+      console.warn("[worker] named topic hint failed", { key: row.topic_key, details: failureDetails(res) });
     }
   }
   return true;
-}
-
-/** The hint for a named topic whose session moved to the other transport (`movedTopicHint`). */
-export function movedTopicHintText(to: "slack" | "telegram", name: string, url: string | null): string {
-  const where = to === "slack" ? "a Slack channel" : "a Telegram topic";
-  const label = name.trim() ? ` (${name.trim()})` : "";
-  return (
-    `The session that read this topic moved to ${where}${label}. It reads and answers there, not here` +
-    (url ? `: ${url}` : ".")
-  );
-}
-
-/**
- * The hint for an unbound named topic whose key is bound on the OTHER transport (bead
- * pigeon-4ogz.22): a stall-watch coordinator after `slack-flip` moved its binding (or moved it
- * back). The old conversation keeps its `named_topics` row as history, so without this a message
- * typed there got the digest hint, which reads as an outage for a coordinator.
- *
- * Null (the caller sends the stock hint) unless exactly one live binding fits: the key bound in
- * no chat of THIS conversation, and bound to a registered session in exactly one chat of the other
- * transport, or, when several chats there bind it, exactly one whose machine has posted into this
- * chat. The worker cannot tell whose chat a numeric id is, so with a single candidate it assumes
- * the key is one machine's (a `stallwatch:<tag>` key normally is); with several it never guesses.
- * Decoration: any failure is logged and gives null.
- */
-async function movedTopicHint(
-  db: D1Database,
-  env: Env,
-  chatId: string,
-  messageThreadId: number,
-  key: string,
-): Promise<string | null> {
-  try {
-    const rows = (
-      await db
-        .prepare(
-          `SELECT b.chat_id, s.machine_id, t.message_thread_id, t.name
-             FROM named_topic_bindings b
-             JOIN named_topics t ON t.chat_id = b.chat_id AND t.topic_key = b.topic_key
-             JOIN sessions s ON s.session_id = b.session_id
-            WHERE b.topic_key = ?`,
-        )
-        .bind(key)
-        .all<{ chat_id: string; machine_id: string; message_thread_id: number; name: string }>()
-    ).results;
-    if (rows.some((r) => r.chat_id === chatId)) return null;
-    const here = isSlackChatId(chatId);
-    let candidates = rows.filter((r) => isSlackChatId(r.chat_id) !== here);
-    if (candidates.length > 1) {
-      const posted: typeof candidates = [];
-      for (const c of candidates) {
-        // By machine, not session, so a coordinator rotated since the flip still matches.
-        const hit = await db
-          .prepare(
-            `SELECT 1 AS one FROM messages m JOIN sessions s ON s.session_id = m.session_id
-              WHERE m.chat_id = ? AND s.machine_id = ? LIMIT 1`,
-          )
-          .bind(chatId, c.machine_id)
-          .first<{ one: number }>();
-        if (hit) posted.push(c);
-      }
-      candidates = posted;
-    }
-    const target = candidates.length === 1 ? candidates[0] : undefined;
-    if (!target) return null;
-    const url = await topicUrl(db, env, target.chat_id, target.message_thread_id);
-    return movedTopicHintText(here ? "telegram" : "slack", target.name, url);
-  } catch (err) {
-    console.warn("[worker] moved-topic hint lookup failed; sending the stock hint", {
-      key,
-      messageThreadId,
-      error: String(err),
-    });
-    return null;
-  }
 }
 
 /**
@@ -452,7 +366,7 @@ export async function unbindSession(db: D1Database, sessionId: string): Promise<
 /**
  * POST /topics/named/bind  {chatId, key, name, sessionId}
  *   200 {chatId, messageThreadId, created, bound: true, sessionId}
- *   400 bad input · 403 chat not allowed · 409 topics disabled · 409 session not registered · 429/502
+ *   400 bad input · 403 no workspace for the caller · 409 session not registered · 429/502
  */
 export async function handleNamedTopicBind(
   db: D1Database,
@@ -472,24 +386,20 @@ export async function handleNamedTopicBind(
     return Response.json({ error: "invalid body" }, { status: 400 });
   }
 
-  const requestedChatId = typeof body.chatId === "string" || typeof body.chatId === "number" ? String(body.chatId) : "";
   const key = typeof body.key === "string" ? body.key : "";
   const name = typeof body.name === "string" ? body.name : "";
   const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
 
-  const target = resolveWorkerTarget(env, principal, requestedChatId);
-  if ((!requestedChatId && !target.ok) || !NAMED_TOPIC_KEY_RE.test(key) || !sessionId || sessionId.length > 128) {
-    return Response.json({ error: "chatId, a valid key, and sessionId (1-128 chars) are required" }, { status: 400 });
+  const target = resolveWorkerTarget(env, principal);
+  if (!NAMED_TOPIC_KEY_RE.test(key) || !sessionId || sessionId.length > 128) {
+    return Response.json({ error: "a valid key and sessionId (1-128 chars) are required" }, { status: 400 });
   }
   if (!target.ok) {
     return Response.json({ error: "Chat ID not allowed" }, { status: 403 });
   }
-  const chatId = String(target.chatId);
-  if (target.slack && key.startsWith("_")) {
+  const chatId = target.chatId;
+  if (key.startsWith("_")) {
     return Response.json({ error: "keys starting with _ are reserved" }, { status: 400 });
-  }
-  if (!topicsEnabled(env)) {
-    return Response.json({ error: "topics disabled" }, { status: 409 });
   }
 
   const sessionRow = await db
@@ -504,7 +414,6 @@ export async function handleNamedTopicBind(
     chatId,
     key,
     name,
-    botToken: env.TELEGRAM_BOT_TOKEN,
     env,
   });
   if (!res.ok) {

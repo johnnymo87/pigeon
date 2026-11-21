@@ -201,8 +201,9 @@ export async function handleWhoami(request: Request, env: Env): Promise<Response
   const principal = await authenticate(request, env);
   if (!principal) return unauthorized();
   if (principal.kind !== "machine") return Response.json({ credential: "shared", machine_id: null });
-  // `transport` appears only for a machine on Slack, so a Telegram machine's answer is exactly
-  // what it was before Slack existed; a daemon reads its absence in a 200 as Telegram.
+  // `transport` appears only for a machine with a Slack workspace: the wire shape deployed
+  // daemons already read. A machine with none still answers without it (an old daemon reads that
+  // as Telegram; there is no Telegram any more, so it is simply a machine with nowhere to post).
   return Response.json(
     slackWorkspaceForMachine(env, principal.machineId)
       ? { credential: "machine", machine_id: principal.machineId, transport: "slack" }

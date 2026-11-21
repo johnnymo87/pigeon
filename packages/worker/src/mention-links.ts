@@ -2,7 +2,7 @@
  * "Jump to session" buttons for the sessions a notification mentions (pigeon-ylx3).
  *
  * A coordinator reporting on its workers writes their ids into its answer, usually shortened
- * (`ses_e71285de`). Any notification whose text mentions a session that has a forum topic gets
+ * (`ses_e71285de`). Any notification whose text mentions a session that has a conversation gets
  * one url button per such session, so the reader can tap straight into that worker's thread,
  * the same buttons stall-watch's digests get through the daemon's `POST /alert` `links`.
  *
@@ -58,7 +58,7 @@ export function buttonLabel(topicName: string | null, mentionedId: string): stri
   return chars.length <= MAX_LABEL_CHARS ? label : `${chars.slice(0, MAX_LABEL_CHARS - 1).join("")}…`;
 }
 
-/** A conversation's link: `t.me/c/...` for a Telegram forum thread, the archive URL for Slack. */
+/** A conversation's link: the archive URL for Slack. A row in any other chat has none. */
 export async function topicUrl(
   db: D1Database,
   env: Env | undefined,
@@ -67,10 +67,8 @@ export async function topicUrl(
 ): Promise<string | null> {
   // A Slack row's link needs the channel id and the workspace's domain; without an env (a caller
   // that has no secrets) there is no way to build it, so it gets no button.
-  if (isSlackChatId(chatId)) return env ? slackConversationUrl(db, env, chatId, threadId) : null;
-  const m = /^-100(\d+)$/.exec(chatId);
-  if (!m || typeof threadId !== "number" || !Number.isInteger(threadId) || threadId <= 0) return null;
-  return `https://t.me/c/${m[1]}/${threadId}`;
+  if (!isSlackChatId(chatId)) return null;
+  return env ? slackConversationUrl(db, env, chatId, threadId) : null;
 }
 
 interface Row {

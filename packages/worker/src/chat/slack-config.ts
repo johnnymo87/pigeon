@@ -7,10 +7,10 @@
  * ids and credentials. There is no other switch, so with no such secret every path behaves
  * exactly as it did before Slack existed.
  *
- * A secret that does not parse, or lacks a field, is treated as ABSENT (the machine stays on
- * Telegram) and logged. It must never throw: this runs on the request path of every
- * notification, and a typo in a secret should degrade one machine to Telegram rather than turn
- * every request into a 500. The log names the key and never its value (the value holds tokens).
+ * A secret that does not parse, or lacks a field, is treated as ABSENT (the machine has no
+ * workspace) and logged. It must never throw: this runs on the request path of every
+ * notification, and a typo in a secret should degrade one machine rather than turn every
+ * request into a 500. The log names the key and never its value (the value holds tokens).
  */
 
 /**
@@ -110,7 +110,7 @@ export function slackSecretKeyForMachine(machineId: string): string {
   return SECRET_PREFIX + machineId.toUpperCase().replace(/-/g, "_");
 }
 
-/** The workspace a machine posts into, or null when it is on Telegram (or its secret is broken). */
+/** The workspace a machine posts into, or null when it has none (or its secret is broken). */
 export function slackWorkspaceForMachine(env: Env, machineId: string): SlackWorkspace | null {
   const key = slackSecretKeyForMachine(machineId);
   return parseWorkspace(key, bag(env)[key]);
@@ -128,6 +128,21 @@ export function slackWorkspaceForTeam(env: Env, teamId: string): SlackWorkspace 
     if (ws && ws.teamId === teamId) return ws;
   }
   return null;
+}
+
+/**
+ * Every configured workspace, one per team id (two machines may share a workspace, and each
+ * machine has its own secret). Order follows the env's key order; broken secrets are skipped.
+ */
+export function allSlackWorkspaces(env: Env): SlackWorkspace[] {
+  const all = bag(env);
+  const byTeam = new Map<string, SlackWorkspace>();
+  for (const key of Object.keys(all)) {
+    if (!key.startsWith(SECRET_PREFIX)) continue;
+    const ws = parseWorkspace(key, all[key]);
+    if (ws && !byTeam.has(ws.teamId)) byTeam.set(ws.teamId, ws);
+  }
+  return [...byTeam.values()];
 }
 
 /** True when the worker has at least one `SLACK_WORKSPACE_*` secret (valid or not): Slack is in play. */

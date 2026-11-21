@@ -1,10 +1,9 @@
 /**
  * Slash-command parsing shared by every chat ingress (chat-transport phase 2, bead pigeon-4ogz.1;
- * spec §5 "Slash commands"). Telegram's webhook uses it today; the Slack ingress (pigeon-4ogz.4)
- * will use the same parser, so a command means the same thing wherever it is typed.
+ * spec §5 "Slash commands"). The Slack ingress (pigeon-4ogz.4) uses it, as the
+ * Telegram webhook did before it was deleted (pigeon-4ogz.13).
  *
- * Input is the command text AFTER transport-specific normalisation (Telegram's `@BotName` suffix
- * is stripped by `parseTelegramCommand` first). Output names the command; resolving which session
+ * Input is the command text AFTER transport-specific normalisation. Output names the command; resolving which session
  * it is about, and replying, stay with the caller.
  *
  * `null` means "not one of our commands": the caller treats the text as an ordinary message,

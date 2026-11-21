@@ -8,7 +8,7 @@
  * into `slack_posts`. Both tables are scoped by team id, so a handle another team minted is
  * unknown here and answers `thread_not_found`.
  *
- * Failures come out of `callSlack` already mapped onto `TgResult` (see `../slack.ts`); this file
+ * Failures come out of `callSlack` already mapped onto `ChatResult` (see `../slack.ts`); this file
  * adds only the method-specific answers that are benign for ONE operation (`name_taken` is a
  * retry for create/rename, `already_archived` is success for archive, and so on).
  *
@@ -18,6 +18,8 @@
 import type { D1Database } from "@cloudflare/workers-types";
 import { callSlack, slackErrorClass, uploadToSlack, type SlackBody } from "../slack";
 import type {
+  ChatResult,
+  ChatTransport,
   CloseForumTopicOptions,
   CreateForumTopicOptions,
   DeleteForumTopicOptions,
@@ -29,13 +31,10 @@ import type {
   SendMessageOptions,
   SendPhotoOptions,
   SendRichMessageOptions,
-  TgResult,
-  UnpinAllForumTopicMessagesOptions,
-} from "../telegram";
+} from "./transport";
 import { slackChatId, type SlackWorkspace } from "./slack-config";
 import { shouldMention, type ConversationKind, type ExplicitNotifyCategory, type NotifyCategory } from "./slack-notify";
 import { buildSlackMessage, type SlackMessage } from "./slack-render";
-import type { ChatResult, ChatTransport } from "./transport";
 
 /** Slack's channel-name limit. */
 const CHANNEL_NAME_MAX = 80;
@@ -157,7 +156,7 @@ function topicText(o: { name?: string; sessionId?: string; topic?: string }): st
 // ─── Result helpers ────────────────────────────────────────────────────────
 
 /** Slack's own error string on a failed result, when it carries one. */
-function slackErr(result: TgResult<unknown>): string | undefined {
+function slackErr(result: ChatResult<unknown>): string | undefined {
   if (result.ok) return undefined;
   const error = (result.response as { error?: unknown } | undefined)?.error;
   return typeof error === "string" ? error : undefined;
@@ -360,10 +359,10 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
    */
   async function withChannelRecovery(
     channelId: string,
-    op: () => Promise<TgResult<SlackBody>>,
+    op: () => Promise<ChatResult<SlackBody>>,
     signal?: AbortSignal,
     unarchive = true,
-  ): Promise<TgResult<SlackBody>> {
+  ): Promise<ChatResult<SlackBody>> {
     const first = await op();
     if (first.ok) return first;
     const error = slackErr(first);
@@ -404,7 +403,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
    */
   async function findAlertsChannel(
     signal?: AbortSignal,
-  ): Promise<TgResult<{ id: string; archived: boolean } | undefined>> {
+  ): Promise<ChatResult<{ id: string; archived: boolean } | undefined>> {
     let cursor: string | undefined;
     for (let page = 0; page < ALERTS_LIST_PAGES; page++) {
       const res = await bot(
@@ -543,7 +542,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     signal?: AbortSignal;
   }
 
-  async function postOnce(target: Target, input: PostInput): Promise<TgResult<SlackBody>> {
+  async function postOnce(target: Target, input: PostInput): Promise<ChatResult<SlackBody>> {
     const notify = shouldMention({
       categories: notifyCategories,
       notifyOwner: input.notifyOwner,
@@ -672,8 +671,8 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
    */
   async function withUniqueName(
     parts: NameParts,
-    attempt: (name: string) => Promise<TgResult<SlackBody>>,
-  ): Promise<{ result: TgResult<SlackBody>; name: string } | { result: ChatResult<never>; name: null }> {
+    attempt: (name: string) => Promise<ChatResult<SlackBody>>,
+  ): Promise<{ result: ChatResult<SlackBody>; name: string } | { result: ChatResult<never>; name: null }> {
     for (let n = 1; n <= MAX_COLLISION_SUFFIX; n++) {
       const name = composeName(parts, n);
       const result = await attempt(name);
@@ -820,7 +819,7 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
       if (options.name === undefined && options.topic === undefined) return OK_TRUE;
       const target = await targetForHandle(options.messageThreadId);
       if (!target) return unknownHandle("conversation");
-      const channel = (op: () => Promise<TgResult<SlackBody>>) =>
+      const channel = (op: () => Promise<ChatResult<SlackBody>>) =>
         withChannelRecovery(target.channelId, op, undefined, false);
 
       const info = await channel(() => bot("conversations.info", { channel: target.channelId }));
@@ -890,11 +889,6 @@ export function createSlackTransport(deps: SlackTransportDeps): ChatTransport {
     async deleteForumTopic(options: DeleteForumTopicOptions) {
       // Bots cannot delete a channel. This is only used to retire a lost-race duplicate.
       return archive(options.messageThreadId);
-    },
-
-    async unpinAllForumTopicMessages(_options: UnpinAllForumTopicMessagesOptions) {
-      // Slack pins nothing on its own, so there is nothing to clear.
-      return OK_TRUE;
     },
   };
 }

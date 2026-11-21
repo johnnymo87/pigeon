@@ -1,25 +1,23 @@
 import { unauthorized } from "./auth";
 import { authenticate } from "./credentials";
-import { getTelegramErrorDetails, isPermanentTopicFailure, TgResult } from "./telegram";
+import { failureDetails, isPermanentTopicFailure } from "./chat/failures";
+import type { ChatResult } from "./chat/transport";
 import { isSlackChatId, transportForChat, type ChatTransport } from "./chat";
 import { machineSlackWorkspace, resolveWorkerTarget } from "./chat/address";
-import { isAllowedChatId } from "./chat/allowlist";
 import { slackWorkspaceForTeam, teamIdOfChat } from "./chat/slack-config";
 import { SLACK_MARKDOWN_MAX } from "./chat/slack-render";
 import { explicitCategory } from "./chat/slack-notify";
 import { errorClassOf } from "./slack";
 import { resolveTopic } from "./topic-manager";
-import { deleteTopicBySession, topicsEnabled } from "./topics";
+import { deleteTopicBySession } from "./topics";
 import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
 import { hasButtons, resolveMentionKeyboard } from "./mention-links";
 
-// Kept importable from here: the allowlist moved to a leaf module to break an import cycle.
-export { isAllowedChatId };
-
 interface SendNotificationBody {
   sessionId: string;
-  chatId: string | number;
+  /** Ignored: a machine's target is its own Slack workspace. Old daemons still send it. */
+  chatId?: string | number;
   text: string;
   replyMarkup?: unknown;
   media?: Array<{ key: string; mime: string; filename: string }>;
@@ -29,9 +27,13 @@ interface SendNotificationBody {
   dir?: string;
   threaded?: boolean;
   onTopicUnavailable?: "retry" | "general";
-  /** Send the whole notification as one Telegram rich message; `text` is the fallback (pigeon-p909). */
-  rich?: { markdown?: unknown; /** Absent = Telegram's markdown; `"slack"` = a Slack markdown block (pigeon-4ogz.3). */ dialect?: unknown };
-  /** Slack only: mention the workspace owner so this post notifies them. Telegram ignores it. */
+  /**
+   * Send the whole notification as one rich message; `text` is the fallback (pigeon-p909). Only
+   * `dialect: "slack"` is sent rich (a Slack markdown block, pigeon-4ogz.3): a dialect-less (old
+   * Telegram) body goes plain.
+   */
+  rich?: { markdown?: unknown; dialect?: unknown };
+  /** Mention the workspace owner so this post notifies them (gated by `SLACK_NOTIFY_OWNER`). */
   notifyOwner?: boolean;
 }
 
@@ -42,17 +44,14 @@ interface SendNotificationBody {
  */
 const RICH_ID_SUFFIX = "#rich";
 
-/** Telegram's limit on a rich message's text, in characters (code points). */
-export const RICH_MAX_CHARS = 32768;
-
 /**
- * Did Telegram refuse the rich message itself, such that the plain text may still go through?
+ * Did the provider refuse the rich message itself, such that the plain text may still go through?
  * Any 4xx except a rate limit (its own kind) and "thread not found" (a topic problem, which the
  * caller's topic recovery handles whichever mode it is in). A 5xx or an unparseable body says
  * nothing about the markdown, so it is NOT a rejection: it surfaces as a 502 and the outbox
  * retries the rich send.
  */
-function isRichRejection(result: TgResult<unknown>): boolean {
+function isRichRejection(result: ChatResult<unknown>): boolean {
   return (
     !result.ok &&
     result.kind === "error" &&
@@ -126,12 +125,8 @@ const json = (body: unknown, status = 200) =>
   });
 
 /**
- * Check if a chatId is in the ALLOWED_CHAT_IDS env var.
- * If no allowlist is configured, deny all.
- */
-/**
- * Tells the operator, at the moment it happens, that a notification went to the group's
- * General thread instead of its session topic.
+ * Tells the operator, at the moment it happens, that a notification went to the workspace's
+ * #alerts instead of its session channel.
  *
  * pigeon-bit4 made this *queryable* (messages.intended_thread_id / actual_thread_id) and
  * *logged* (a console.warn at each of five fallback sites). Neither is a consumer: nobody
@@ -143,24 +138,19 @@ const json = (body: unknown, status = 200) =>
  * would have to be built on the column pair, and the column pair is blind to exactly the
  * failure that matters most: the three `topic-manager.ts` paths (`create_failed`,
  * `finalize_lost_no_winner`, `poll_exhausted`) never resolve a thread id, so they record
- * NULL/NULL and are indistinguishable from a deliberately unthreaded send. `poll_exhausted`
- * in particular is the per-session, transient, silent case that arises under precisely the
- * Telegram latency that produced the pigeon-bit4 incident. An hourly count would have slept
- * through it. Working from the reason instead of the columns covers all five paths and needs
- * no window, no watermark, and no new state. Note: with `onTopicUnavailable: "retry"`,
- * transient topic-resolution failures are held for retry (returning 502) without relocating
- * or alerting; this alert only fires when a notification actually relocates to General (pigeon-iqpd).
+ * NULL/NULL and are indistinguishable from a deliberately unthreaded send. Working from the
+ * reason instead of the columns covers all five paths and needs no window, no watermark, and
+ * no new state. Note: with `onTopicUnavailable: "retry"`, transient topic-resolution failures
+ * are held for retry (returning 502) without relocating or alerting; this alert only fires when
+ * a notification actually relocates (pigeon-iqpd).
  *
- * Destination is the first entry of ALLOWED_CHAT_IDS, matching `checkSessionHighWaterAlert`.
- * In production that is a private chat with the bot, so the alert does not land in the very
- * General thread it is complaining about — but note that it is positional: reordering that
- * variable silently redirects operator alerts into the group.
+ * The alert goes into the same workspace's #alerts, through the transport the notification
+ * itself used.
  *
  * Best-effort by construction. The notification has already been delivered by the time this
  * runs, so nothing here may change its outcome; every failure is caught and logged.
  */
 export async function alertRelocation(
-  env: Env,
   tg: ChatTransport,
   opts: {
     sessionId: string;
@@ -170,59 +160,18 @@ export async function alertRelocation(
     label?: string | null;
   },
 ): Promise<boolean> {
-  if (isSlackChatId(opts.chatId)) {
-    // A Slack target has no General thread and no allowlist: the alert goes into the same
-    // workspace's #alerts, through the transport the notification itself used.
-    const alertText =
-      `⚠️ Notification went to #alerts, not its channel\n` +
-      `session: ${opts.sessionId}${opts.label ? ` (${opts.label})` : ""}\n` +
-      `reason: ${opts.reason}\n` +
-      `chat: ${opts.chatId} · message: ${opts.messageId}`;
-    try {
-      const res = await tg.sendMessage({ chatId: opts.chatId, text: alertText });
-      if (res.ok) return true;
-      console.error("[worker] relocation alert failed", { sessionId: opts.sessionId, res });
-      return false;
-    } catch (err) {
-      console.error("[worker] relocation alert threw", { sessionId: opts.sessionId, error: String(err) });
-      return false;
-    }
-  }
-
-  const allowed = (env.ALLOWED_CHAT_IDS || "")
-    .split(",")
-    .map((id) => id.trim())
-    .filter((id) => id.length > 0);
-  const destination = allowed[0];
-
-  if (!destination) {
-    // Mirrors the high-water alert: a misconfigured destination must not be the quiet
-    // failure, because that is the same shape of bug this alert exists to surface.
-    console.error("[worker] relocation alert suppressed: ALLOWED_CHAT_IDS is empty", {
-      sessionId: opts.sessionId,
-      reason: opts.reason,
-    });
-    return false;
-  }
-
-  const text =
-    `⚠️ Notification went to General, not its topic\n` +
+  const alertText =
+    `⚠️ Notification went to #alerts, not its channel\n` +
     `session: ${opts.sessionId}${opts.label ? ` (${opts.label})` : ""}\n` +
     `reason: ${opts.reason}\n` +
     `chat: ${opts.chatId} · message: ${opts.messageId}`;
-
   try {
-    const res = await tg.sendMessage({ chatId: destination, text });
-    if (res.ok) {
-      return true;
-    }
+    const res = await tg.sendMessage({ chatId: opts.chatId, text: alertText });
+    if (res.ok) return true;
     console.error("[worker] relocation alert failed", { sessionId: opts.sessionId, res });
     return false;
   } catch (err) {
-    console.error("[worker] relocation alert threw", {
-      sessionId: opts.sessionId,
-      error: String(err),
-    });
+    console.error("[worker] relocation alert threw", { sessionId: opts.sessionId, error: String(err) });
     return false;
   }
 }
@@ -299,7 +248,7 @@ function extractTokenFromCallbackData(replyMarkup: unknown): string | null {
 }
 
 /**
- * Media send outcome. The failure arm carries the Telegram error: collapsing it to a bare
+ * Media send outcome. The failure arm carries the provider error: collapsing it to a bare
  * `{ ok: false }` is what made a dropped attachment unexplainable (pigeon-bit4).
  */
 /** Bound on posting one outbound file (pigeon-4ogz.23). */
@@ -309,7 +258,7 @@ type MediaSendResult =
   | { ok: true; result: { message_id: number } }
   | { ok: false; details: unknown };
 
-async function sendTelegramPhoto(
+async function sendPhotoReply(
   tg: ChatTransport,
   chatId: string | number,
   photoBlob: Blob,
@@ -329,10 +278,10 @@ async function sendTelegramPhoto(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false, details: getTelegramErrorDetails(res) };
+  return { ok: false, details: failureDetails(res) };
 }
 
-async function sendTelegramDocument(
+async function sendDocumentReply(
   tg: ChatTransport,
   chatId: string | number,
   documentBlob: Blob,
@@ -352,7 +301,7 @@ async function sendTelegramDocument(
   if (res.ok) {
     return { ok: true, result: res.result };
   }
-  return { ok: false, details: getTelegramErrorDetails(res) };
+  return { ok: false, details: failureDetails(res) };
 }
 
 /**
@@ -375,10 +324,9 @@ export async function handleSendNotification(
     const holdForTopic = body.onTopicUnavailable === "retry";
 
     // Validate required fields
-    // A machine on Slack has no use for a chat id (its target is its workspace), so it is not
-    // required of it; everyone else still has to send one.
-    const onSlack = machineSlackWorkspace(env, principal) !== null;
-    if (!sessionId || (!requestedChatId && !onSlack) || !text) {
+    // A machine has no use for a chat id (its target is its workspace), so it is not required of
+    // it; the shared key (which can post nowhere) still has to send one.
+    if (!sessionId || (!requestedChatId && principal.kind !== "machine") || !text) {
       return json({ error: "sessionId, chatId, and text required" }, 400);
     }
 
@@ -395,22 +343,30 @@ export async function handleSendNotification(
     }
 
     // Where this notification goes. Resolved ONCE, here, and used for everything below: a
-    // machine on Slack targets its workspace whatever chat id its daemon sent, so a stale
-    // numeric id cannot pull one of its sessions back to Telegram. Everyone else keeps the
-    // allowlist rule (and a `slack:` chat id from them is refused).
-    const target = resolveWorkerTarget(env, principal, requestedChatId);
+    // machine on Slack targets its workspace whatever chat id its daemon sent. A machine with no
+    // workspace has nowhere to post: a configuration error, answered 503 with no `retryAfter` so
+    // the daemon's outbox neither pauses nor counts it (it retries to the TTL, and worker-health
+    // pages). The shared key can post nowhere either: the existing 403.
+    const target = resolveWorkerTarget(env, principal);
     if (!target.ok) {
+      if (principal.kind === "machine") {
+        console.error("[worker] machine has no Slack workspace, notification not sent", {
+          machineId: principal.machineId,
+          sessionId,
+        });
+        return json({ error: "no_transport" }, 503);
+      }
       return json({ error: "Chat ID not allowed" }, 403);
     }
     const chatId = target.chatId;
-    const isSlack = target.slack;
-    // Slack failures carry their class at top level so the daemon can tell a rejected payload
-    // from an outage without parsing Telegram-shaped details.
-    const slackClass = (details?: unknown, fallback = "upstream") =>
-      isSlack ? { errorClass: errorClassOf(details) ?? fallback } : {};
+    // Failures carry their class at top level so the daemon can tell a rejected payload from an
+    // outage without parsing Telegram-shaped details.
+    const slackClass = (details?: unknown, fallback = "upstream") => ({
+      errorClass: errorClassOf(details) ?? fallback,
+    });
 
     // Idempotency: if notificationId was provided and we already sent this notification,
-    // return the existing message data without calling Telegram again.
+    // return the existing message data without calling the provider again.
     //
     // A rich send is recorded under `<id>#rich` (pigeon-p909), so a retry of a request whose
     // response was lost can say it was rich, and the daemon then skips the remaining plain
@@ -447,10 +403,6 @@ export async function handleSendNotification(
     const token = extractTokenFromCallbackData(replyMarkup) ?? generateToken();
 
     let messageThreadId: number | undefined;
-    // Telegram auto-pins the first message posted into a freshly created forum topic. Track
-    // whether THIS request created the topic so the pin can be cleared after the send that
-    // caused it (pigeon-ud6s).
-    let topicJustCreated = false;
     // What resolveTopic asked for, kept separate from messageThreadId because that variable is
     // mutated by the recreate and relocation paths. The pair is recorded on the message row
     // (pigeon-bit4) so a relocation is queryable after the fact instead of invisible.
@@ -460,10 +412,7 @@ export async function handleSendNotification(
     // the intended/actual column pair (pigeon-t5bd).
     let relocationReason: string | undefined;
 
-    const bound =
-      topicsEnabled(env) && threaded !== false
-        ? await getBindingForSession(db, sessionId)
-        : null;
+    const bound = threaded !== false ? await getBindingForSession(db, sessionId) : null;
 
     if (bound && bound.chat_id !== String(chatId)) {
       // The session's named topic lives in another chat (pigeon-533h): its thread id means
@@ -480,21 +429,18 @@ export async function handleSendNotification(
     } else if (bound) {
       messageThreadId = bound.message_thread_id;
       intendedThreadId = bound.message_thread_id;
-    } else if (topicsEnabled(env) && threaded !== false) {
+    } else if (threaded !== false) {
       // Note: resolveTopic and deleteTopicBySession perform D1 queries on topics that are
       // intentionally NOT wrapped in withD1. A D1 error here falls to boundary catch as internal_error 500,
       // which triggers daemon retry identical to 503. Total D1 outage hits send.sessionLookup first (503).
-      // Wrapping resolveTopic wholesale would misclassify Telegram API errors as storage.
+      // Wrapping resolveTopic wholesale would misclassify provider errors as storage.
       const topicRes = await resolveTopic(db, {
         sessionId,
         machineId: session.machine_id,
         chatId: String(chatId),
         dir: dir ?? "",
         title: title ?? "",
-        botToken: env.TELEGRAM_BOT_TOKEN,
         env,
-        // Only the machine that owns the session may move its conversation between transports.
-        supersede: principal.kind === "machine" && principal.machineId === session.machine_id,
       });
 
       if (!topicRes.ok && topicRes.kind === "rate_limited") {
@@ -518,7 +464,7 @@ export async function handleSendNotification(
         };
         if (topicRes.createError !== undefined) {
           payload.createError = topicRes.createError;
-          const cls = isSlack ? errorClassOf(topicRes.createError) : undefined;
+          const cls = errorClassOf(topicRes.createError);
           if (cls) payload.errorClass = cls;
         }
         return json(payload, 502);
@@ -527,17 +473,16 @@ export async function handleSendNotification(
       if (topicRes.ok && topicRes.messageThreadId !== null) {
         messageThreadId = topicRes.messageThreadId;
         intendedThreadId = topicRes.messageThreadId;
-        topicJustCreated = topicRes.created === true;
       } else if (topicRes.ok) {
         relocationReason = topicRes.reason ?? "no_topic";
       }
     }
 
-    const tg = transportForChat(chatId, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+    const tg = transportForChat(chatId, { env, db });
 
-    // Rich message (pigeon-p909): the daemon offers the whole notification as Telegram rich
-    // markdown when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is
-    // tried first and, once Telegram rejects it, latched off for the rest of this request, so
+    // Rich message (pigeon-p909): the daemon offers the whole notification as rich markdown
+    // when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is tried
+    // first and, once the provider rejects it, latched off for the rest of this request, so
     // the topic recovery and relocation below re-send plain. `rich` in the response tells the
     // daemon whether one rich message carried the whole notification ("sent") or chunk 0 went
     // out plain ("fallback"), in which case it sends the remaining chunks.
@@ -545,40 +490,32 @@ export async function handleSendNotification(
       typeof body.rich?.markdown === "string" && body.rich.markdown.length > 0
         ? body.rich.markdown
         : undefined;
-    // Which dialect the daemon wrote the markdown in decides whether it may be sent as rich to
-    // THIS target: Telegram takes only dialect-less markdown (today's behaviour), Slack only
-    // `dialect: "slack"`. Anything else goes plain, which is always safe. The two kill switches
-    // are per transport.
-    const richDialect = body.rich?.dialect;
+    // Only markdown the daemon wrote in Slack's dialect may go out as a Slack markdown block;
+    // anything else (no dialect: an old daemon's Telegram markdown) goes plain, which is always
+    // safe. `SLACK_MARKDOWN_BLOCKS=off` is the kill switch.
     let richEnabled =
-      richMarkdown !== undefined &&
-      (isSlack
-        ? richDialect === "slack" && env.SLACK_MARKDOWN_BLOCKS !== "off"
-        : richDialect === undefined && env.TELEGRAM_RICH_MESSAGES !== "off");
-    const richLimit = isSlack ? SLACK_MARKDOWN_MAX : RICH_MAX_CHARS;
-    if (richEnabled && [...richMarkdown!].length > richLimit) {
+      richMarkdown !== undefined && body.rich?.dialect === "slack" && env.SLACK_MARKDOWN_BLOCKS !== "off";
+    if (richEnabled && [...richMarkdown!].length > SLACK_MARKDOWN_MAX) {
       // The daemon checks this too; a skewed or buggy daemon must not cost a round trip.
-      console.warn(`[worker] rich markdown over ${isSlack ? "Slack" : "Telegram"}'s limit, sending plain`, {
+      console.warn("[worker] rich markdown over Slack's limit, sending plain", {
         sessionId,
         notificationId,
         chars: [...richMarkdown!].length,
       });
       richEnabled = false;
     }
-    // Slack posts honour `notifyOwner`, as a category: a flagged `q:` notification is a question,
+    // Posts honour `notifyOwner`, as a category: a flagged `q:` notification is a question,
     // anything else flagged is an error. Whether that mentions anyone is `SLACK_NOTIFY_OWNER`'s
-    // call, inside the transport. Telegram has no such option, so it is not even passed.
-    const slackOnly = isSlack
-      ? {
-          notifyOwner: body.notifyOwner === true,
-          ...(body.notifyOwner === true ? { notifyCategory: explicitCategory(notificationId) } : {}),
-        }
-      : {};
+    // call, inside the transport.
+    const slackOnly = {
+      notifyOwner: body.notifyOwner === true,
+      ...(body.notifyOwner === true ? { notifyCategory: explicitCategory(notificationId) } : {}),
+    };
     let lastSendWasRich = false;
     let richError: unknown;
 
     // Buttons to the topics of sessions the text mentions (pigeon-ylx3), unless the caller sent
-    // a keyboard of its own (a question's answer buttons). Decoration: if Telegram rejects the
+    // a keyboard of its own (a question's answer buttons). Decoration: if the provider rejects the
     // keyboard with a 400 (nothing was posted), the message is resent once without it and the
     // rest of this handler carries on as if it had never been added. Resolved lazily, and
     // separately for the rich markdown (the whole notification) and the plain text (chunk 0),
@@ -586,7 +523,7 @@ export async function handleSendNotification(
     const callerHasButtons = hasButtons(replyMarkup);
     let linkMarkup: unknown;
     let linkMarkupResolved = false;
-    const sendPlain = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+    const sendPlain = async (threadId: number | undefined): Promise<ChatResult<{ message_id: number }>> => {
       if (!linkMarkupResolved) {
         linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId, env);
         linkMarkupResolved = true;
@@ -602,7 +539,7 @@ export async function handleSendNotification(
       if (linkMarkup && !result.ok && result.kind === "error" && result.errorCode === 400) {
         console.warn("[worker] mention link buttons rejected, resending without them", {
           sessionId,
-          details: getTelegramErrorDetails(result),
+          details: failureDetails(result),
         });
         linkMarkup = undefined;
         return sendPlain(threadId);
@@ -611,7 +548,7 @@ export async function handleSendNotification(
     };
     let richLinkMarkup: unknown;
     let richLinkMarkupResolved = false;
-    const sendText = async (threadId: number | undefined): Promise<TgResult<{ message_id: number }>> => {
+    const sendText = async (threadId: number | undefined): Promise<ChatResult<{ message_id: number }>> => {
       if (richEnabled) {
         if (!richLinkMarkupResolved) {
           richLinkMarkup = callerHasButtons
@@ -624,8 +561,8 @@ export async function handleSendNotification(
           messageThreadId: threadId,
           markdown: richMarkdown!,
           replyMarkup: richLinkMarkup ?? replyMarkup,
-          // Slack's notification text: the plain chunk, not the raw markdown source.
-          ...(isSlack ? { text } : {}),
+          // The notification text: the plain chunk, not the raw markdown source.
+          text,
           ...slackOnly,
         });
         if (!isRichRejection(result)) {
@@ -633,19 +570,19 @@ export async function handleSendNotification(
           return result;
         }
         if (richLinkMarkup) {
-          // The mention buttons may be what Telegram refused (sendPlain makes the same retry).
+          // The mention buttons may be what the provider refused (sendPlain makes the same retry).
           // Try rich once more without them before blaming the markdown.
           console.warn("[worker] mention link buttons rejected on a rich message, resending without them", {
             sessionId,
-            details: getTelegramErrorDetails(result),
+            details: failureDetails(result),
           });
           richLinkMarkup = undefined;
           return sendText(threadId);
         }
         // Nothing was posted (a 4xx). Fall back once, and loudly: a rich rejection means the
-        // daemon produced markdown Telegram would not take, which is a bug to go and look at.
+        // daemon produced markdown the provider would not take, which is a bug to go and look at.
         richEnabled = false;
-        richError = getTelegramErrorDetails(result);
+        richError = failureDetails(result);
         console.warn("[worker] rich message rejected, sending plain", {
           sessionId,
           notificationId,
@@ -657,15 +594,14 @@ export async function handleSendNotification(
       return sendPlain(threadId);
     };
 
-    // Call Telegram API
-    let telegramResult = await sendText(messageThreadId);
+    // Call the chat provider
+    let chatResult = await sendText(messageThreadId);
 
-    // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band in Telegram)
+    // T2.7: Stale-thread recovery (recreate topic at most once if deleted out-of-band)
     if (
-      !telegramResult.ok &&
-      telegramResult.kind === "thread_not_found" &&
+      !chatResult.ok &&
+      chatResult.kind === "thread_not_found" &&
       messageThreadId !== undefined &&
-      topicsEnabled(env) &&
       threaded !== false &&
       !bound
     ) {
@@ -681,9 +617,7 @@ export async function handleSendNotification(
         chatId: String(chatId),
         dir: dir ?? "",
         title: title ?? "",
-        botToken: env.TELEGRAM_BOT_TOKEN,
         env,
-        supersede: principal.kind === "machine" && principal.machineId === session.machine_id,
       });
 
       if (!retryTopicRes.ok && retryTopicRes.kind === "rate_limited") {
@@ -712,7 +646,7 @@ export async function handleSendNotification(
         };
         if (retryTopicRes.createError !== undefined) {
           payload.createError = retryTopicRes.createError;
-          const cls = isSlack ? errorClassOf(retryTopicRes.createError) : undefined;
+          const cls = errorClassOf(retryTopicRes.createError);
           if (cls) payload.errorClass = cls;
         }
         return json(payload, 502);
@@ -743,13 +677,9 @@ export async function handleSendNotification(
         relocationReason = innerReason ? `recreate_failed:${innerReason}` : "recreate_failed";
       }
       messageThreadId = recreatedThreadId;
-      topicJustCreated =
-        retryTopicRes.ok &&
-        retryTopicRes.messageThreadId !== null &&
-        retryTopicRes.created === true;
 
       // Retry sendMessage exactly once
-      telegramResult = await sendText(messageThreadId);
+      chatResult = await sendText(messageThreadId);
     }
 
     // PERMANENT topic failure -> fall back to General.
@@ -761,10 +691,10 @@ export async function handleSendNotification(
     // on a transient error silently moved a user's answer to General, where it was never seen
     // (pigeon-bit4). 429 is handled separately and must not reach here either.
     if (
-      !telegramResult.ok &&
-      telegramResult.kind !== "rate_limited" &&
+      !chatResult.ok &&
+      chatResult.kind !== "rate_limited" &&
       messageThreadId !== undefined &&
-      isPermanentTopicFailure(telegramResult)
+      isPermanentTopicFailure(chatResult)
     ) {
       // Clear the thread for everything downstream: if the topic would not take the text
       // it will not take the attachments either, so the media loop must follow to General.
@@ -772,57 +702,36 @@ export async function handleSendNotification(
         sessionId,
         messageThreadId,
         reason: "send_failed",
-        details: getTelegramErrorDetails(telegramResult),
+        details: failureDetails(chatResult),
       });
       relocationReason = "send_failed";
       messageThreadId = undefined;
-      telegramResult = await sendText(messageThreadId);
+      chatResult = await sendText(messageThreadId);
     }
 
-    // `retryAfter` is in SECONDS — Telegram's own unit for `parameters.retry_after`.
+    // `retryAfter` is in SECONDS (the unit of Slack's Retry-After header and of the Telegram-era
+    // `parameters.retry_after` the daemon contract was written against).
     // The daemon converts to ms when it pauses the outbox; don't change the unit here
     // without changing that multiplication too.
-    if (!telegramResult.ok && telegramResult.kind === "rate_limited") {
+    if (!chatResult.ok && chatResult.kind === "rate_limited") {
       return json(
-        { error: "rate_limited", retryAfter: telegramResult.retryAfter, ...slackClass(telegramResult.response, "rate_limited") },
+        { error: "rate_limited", retryAfter: chatResult.retryAfter, ...slackClass(chatResult.response, "rate_limited") },
         429,
       );
     }
 
-    if (!telegramResult.ok) {
-      const details = getTelegramErrorDetails(telegramResult);
+    if (!chatResult.ok && chatResult.kind === "no_transport") {
+      // Unreachable by construction (the target is a configured workspace's own address); a
+      // config error like the missing workspace above, answered the same way.
+      return json({ error: "no_transport" }, 503);
+    }
+
+    if (!chatResult.ok) {
+      const details = failureDetails(chatResult);
       return json({ error: "Telegram API error", details, ...slackClass(details) }, 502);
     }
 
-    const messageId = telegramResult.result.message_id;
-
-    // Telegram auto-pins the first message posted into a newly created forum topic, so every
-    // new session topic would otherwise open with a pinned notification. Clear it here, on the
-    // one request that created the topic, so no user-made pin can ever be caught by this
-    // (the topic is seconds old and this is its first message). Best-effort: an unpin failure
-    // — missing can_pin_messages, a Telegram 5xx — must not fail an already-delivered
-    // notification, and must not be retried by the daemon (pigeon-ud6s).
-    if (topicJustCreated && messageThreadId !== undefined) {
-      try {
-        const unpinRes = await tg.unpinAllForumTopicMessages({
-          chatId,
-          messageThreadId,
-        });
-        if (!unpinRes.ok) {
-          console.warn("[worker] unpinAllForumTopicMessages failed", {
-            sessionId,
-            messageThreadId,
-            details: getTelegramErrorDetails(unpinRes),
-          });
-        }
-      } catch (err) {
-        console.warn("[worker] unpinAllForumTopicMessages threw", {
-          sessionId,
-          messageThreadId,
-          error: String(err),
-        });
-      }
-    }
+    const messageId = chatResult.result.message_id;
 
     // Store message→session mapping for reply routing
     await withD1(
@@ -843,7 +752,7 @@ export async function handleSendNotification(
     );
 
     // Best-effort, and deliberately NOT part of the INSERT above. The INSERT runs after
-    // Telegram has already accepted the message, so a missing column there would throw ->
+    // the provider has already accepted the message, so a missing column there would throw ->
     // withD1 -> 503 -> the daemon retries a message that WAS delivered, every 5-120s for 24h.
     // As a separate UPDATE the worst case is a null column and one warn.
     await recordThreadPlacement(db, {
@@ -854,10 +763,10 @@ export async function handleSendNotification(
       actualThreadId: messageThreadId,
     });
 
-    // Fires only when topics are on and the caller wanted threading, so a deliberate
-    // unthreaded send (a quiet session's question, pigeon-c501) is never reported.
+    // Fires only when the caller wanted threading, so a deliberate unthreaded send (a quiet
+    // session's question, pigeon-c501) is never reported.
     if (relocationReason !== undefined && messageThreadId === undefined) {
-      await alertRelocation(env, tg, {
+      await alertRelocation(tg, {
         sessionId,
         chatId,
         messageId,
@@ -878,11 +787,11 @@ export async function handleSendNotification(
 
           // Bounded (pigeon-4ogz.23): this loop runs before the response, and the daemon's outbox
           // is serial, so one hung upload would hold every session's notifications behind it.
-          // The Telegram client ignores the signal; the Slack upload honours it.
+          // The Slack upload honours the signal.
           const signal = AbortSignal.timeout(MEDIA_SEND_TIMEOUT_MS);
           const mediaResult = isImage
-            ? await sendTelegramPhoto(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
-            : await sendTelegramDocument(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
+            ? await sendPhotoReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
+            : await sendDocumentReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
 
           if (mediaResult.ok && mediaResult.result) {
             await db
@@ -947,7 +856,7 @@ export async function handleSendNotification(
 /**
  * Handle POST /notifications/edit
  *
- * Edits an existing Telegram message identified by notificationId.
+ * Edits an existing message identified by notificationId.
  * Looks up (chat_id, message_id) from the messages table.
  */
 export async function handleEditNotification(
@@ -982,23 +891,29 @@ export async function handleEditNotification(
     return json({ error: "Message not found for notificationId" }, 404);
   }
 
+  // A numeric row is a Telegram-era post: nothing can edit it, and it reads as the not-found
+  // answer rather than a provider refusal.
+  if (!isSlackChatId(row.chat_id)) {
+    return json({ error: "Message not found for notificationId" }, 404);
+  }
+
   // A Slack post is editable only by a machine on that post's workspace: the shared key, a
-  // Telegram machine, or another team's machine never reaches Slack. When the post's team has no
-  // configured workspace (the secret was deleted) there is nothing to authorize against, so the
-  // call falls through to the transport's transient SLACK_UNAVAILABLE and the daemon retries.
-  const isSlackRow = isSlackChatId(row.chat_id);
+  // machine with no workspace, or another team's machine never reaches Slack. When the post's
+  // team has no configured workspace (the secret was deleted) there is nothing to authorize
+  // against, so the call falls through to the transport's transient SLACK_UNAVAILABLE and the
+  // daemon retries.
   const rowTeam = teamIdOfChat(row.chat_id);
-  if (isSlackRow && rowTeam !== null && slackWorkspaceForTeam(env, rowTeam)) {
+  if (rowTeam !== null && slackWorkspaceForTeam(env, rowTeam)) {
     const ws = machineSlackWorkspace(env, principal);
     if (!ws || ws.teamId !== rowTeam) {
       return json({ error: "chat_not_allowed" }, 403);
     }
   }
 
-  // Routed by the STORED post's chat, not by any transport the machine is on now (spec §1).
-  const tg = transportForChat(row.chat_id, env.TELEGRAM_BOT_TOKEN, undefined, { env, db });
+  // Routed by the STORED post's chat (spec §1).
+  const tg = transportForChat(row.chat_id, { env, db });
 
-  const telegramResult = await tg.editMessageText({
+  const chatResult = await tg.editMessageText({
     chatId: row.chat_id,
     messageId: row.message_id,
     text,
@@ -1006,13 +921,13 @@ export async function handleEditNotification(
     replyMarkup,
   });
 
-  if (!telegramResult.ok) {
-    const details = getTelegramErrorDetails(telegramResult);
+  if (!chatResult.ok) {
+    const details = failureDetails(chatResult);
     return json(
       {
         error: "Telegram API error",
         details,
-        ...(isSlackRow ? { errorClass: errorClassOf(details) ?? "upstream" } : {}),
+        errorClass: errorClassOf(details) ?? "upstream",
       },
       502,
     );

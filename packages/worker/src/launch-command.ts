@@ -27,7 +27,7 @@
  *    prose -- is the inconsistency that makes silent eating possible.
  *
  * A malformed /launch returns { kind: "usage" } rather than null. Returning null
- * would let webhook.ts fall through to the plain-message path, where the typo
+ * would let the ingress fall through to the plain-message path, where the typo
  * becomes a PROMPT injected into whatever session the message resolves to.
  */
 

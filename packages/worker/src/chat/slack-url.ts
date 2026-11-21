@@ -1,7 +1,6 @@
 /**
  * The link to a stored Slack conversation (bead pigeon-4ogz.3): the per-transport half of "jump to
- * this session's thread". Telegram's builder (`t.me/c/...`) needs only the row; Slack's needs the
- * channel id behind the handle (`slack_conversations`) and the workspace's domain (its secret).
+ * this session's thread". It needs the channel id behind the handle (`slack_conversations`) and the workspace's domain (its secret).
  */
 import type { D1Database } from "@cloudflare/workers-types";
 import { slackArchiveUrl } from "../slack";

@@ -1,12 +1,12 @@
 /**
  * Slack API client (bead pigeon-4ogz.3, task 1): the wire format, the timing log, and the
- * mapping of Slack's errors onto the Telegram-shaped TgResult. The table under test is
+ * mapping of Slack's errors onto the Telegram-shaped ChatResult. The table under test is
  * "Result mapping" in docs/plans/2026-11-20-slack-outbound-plan.md, plus delta 4.
  */
 import { fetchMock } from "cloudflare:test";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { callSlack, errorClassOf, slackArchiveUrl, slackErrorClass, uploadToSlack } from "../src/slack";
-import { getTelegramErrorDetails, isPermanentTopicFailure } from "../src/telegram";
+import { failureDetails, isPermanentTopicFailure } from "../src/chat/failures";
 
 beforeEach(() => {
   fetchMock.activate();
@@ -256,9 +256,9 @@ describe("callSlack result mapping", () => {
     expect(off).toMatchObject({ kind: "rate_limited" });
   });
 
-  it("feeds getTelegramErrorDetails the Slack body, so legacy daemons read error_code", async () => {
+  it("feeds failureDetails the Slack body, so legacy daemons read error_code", async () => {
     const res = await failure("chat.postMessage", 200, { ok: false, error: "msg_too_long" });
-    const details = getTelegramErrorDetails(res) as { error_code: number; error: string };
+    const details = failureDetails(res) as { error_code: number; error: string };
     expect(details.error_code).toBe(400);
     expect(details.error).toBe("msg_too_long");
     expect(errorClassOf(details)).toBe("rejected_format");
