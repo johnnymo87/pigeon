@@ -17,7 +17,7 @@
 import { env, fetchMock } from "cloudflare:test";
 import { sha256Hex } from "../src/credentials";
 import { slackChatId, slackSecretKeyForMachine, type SlackWorkspace } from "../src/chat/slack-config";
-import type { ChatTransport } from "../src/chat/transport";
+import type { ChatResult, ChatTransport } from "../src/chat/transport";
 import { finalize, reserve } from "../src/topics";
 
 let counter = 0;
@@ -145,7 +145,11 @@ export async function seedSlackTopic(sessionId: string, machineId: string, ws: S
 type Method = keyof ChatTransport;
 type Options<M extends Method> = Parameters<ChatTransport[M]>[0];
 type Result<M extends Method> = Awaited<ReturnType<ChatTransport[M]>>;
-/** Typed against ChatTransport, so a renamed method, option or result field fails `typecheck`. */
+/**
+ * Typed against ChatTransport, so a renamed method or option field, or a missing required result
+ * field, fails `typecheck`. An extra or misspelled field in an inline returned literal does not
+ * (no excess-property check on a return): use the `results` helpers below for failures.
+ */
 type Handler<M extends Method> = (o: Options<M>) => Result<M> | Promise<Result<M>>;
 type Handlers = { [M in Method]: Handler<M> };
 
@@ -200,15 +204,22 @@ export function fakeTransport(handlers: Partial<Handlers> = {}) {
   return { client: client as unknown as ChatTransport, calls };
 }
 
-/** Results a fake transport answers with, in the ChatResult shapes the real transports produce. */
+type Failure<K> = Extract<ChatResult<never>, { kind: K }>;
+
+/**
+ * Results a fake transport answers with, in the ChatResult shapes the real transports produce.
+ * Prefer these to an inline literal in a handler: a function's returned literal escapes
+ * TypeScript's excess-property check, so `{ kind: "error", status: 500 }` would compile with no
+ * errorCode, while each helper here is checked against its ChatResult variant.
+ */
 export const results = {
-  ok: <T>(result: T) => ({ ok: true as const, result }),
-  threadNotFound: () => ({ ok: false as const, kind: "thread_not_found" as const }),
-  notModified: () => ({ ok: false as const, kind: "topic_not_modified" as const }),
-  rateLimited: (retryAfter: number) => ({ ok: false as const, kind: "rate_limited" as const, retryAfter }),
-  error: (errorCode: number, description: string, response?: unknown) => ({
-    ok: false as const,
-    kind: "error" as const,
+  ok: <T>(result: T): { ok: true; result: T } => ({ ok: true, result }),
+  threadNotFound: (): Failure<"thread_not_found"> => ({ ok: false, kind: "thread_not_found" }),
+  notModified: (): Failure<"topic_not_modified"> => ({ ok: false, kind: "topic_not_modified" }),
+  rateLimited: (retryAfter: number): Failure<"rate_limited"> => ({ ok: false, kind: "rate_limited", retryAfter }),
+  error: (errorCode: number, description: string, response?: unknown): Failure<"error"> => ({
+    ok: false,
+    kind: "error",
     errorCode,
     description,
     response: response ?? { ok: false, error_code: errorCode, description },

@@ -3732,34 +3732,21 @@ describe("topics module and topicName", () => {
        * fake makes those assertions capable of failing, and it also avoids leaking unconsumed
        * interceptors into later tests in this file.
        */
-      function fakeChat(handlers: {
-        createConversation?: (o: any) => any;
-        unarchiveConversation?: (o: any) => any;
-        renameConversation?: (o: any) => any;
-        deleteConversation?: (o: any) => any;
-      }) {
-        const calls = { create: 0, reopen: 0, edit: 0, delete: 0 };
-        const editedNames: string[] = [];
-        const client = {
-          createConversation: async (o: any) => {
-            calls.create++;
-            return handlers.createConversation?.(o) ?? { ok: true, result: { messageThreadId: 1 } };
-          },
-          unarchiveConversation: async (o: any) => {
-            calls.reopen++;
-            return handlers.unarchiveConversation?.(o) ?? { ok: true, result: true };
-          },
-          renameConversation: async (o: any) => {
-            calls.edit++;
-            editedNames.push(o.name);
-            return handlers.renameConversation?.(o) ?? { ok: true, result: true };
-          },
-          deleteConversation: async (o: any) => {
-            calls.delete++;
-            return handlers.deleteConversation?.(o) ?? { ok: true, result: true };
-          },
+      // A view over the typed fakeTransport, so a renamed transport method fails typecheck instead
+      // of throwing into upgradeProvisionalName's catch-all and passing the `edit === 0` cases.
+      function fakeChat(handlers: Parameters<typeof fakeTransport>[0]) {
+        const { client, calls: byMethod } = fakeTransport(handlers);
+        const calls = {
+          get create() { return byMethod.createConversation.length; },
+          get reopen() { return byMethod.unarchiveConversation.length; },
+          get edit() { return byMethod.renameConversation.length; },
+          get delete() { return byMethod.deleteConversation.length; },
         };
-        return { client: client as any, calls, editedNames };
+        return {
+          client,
+          calls,
+          get editedNames() { return byMethod.renameConversation.map((o) => o.name); },
+        };
       }
 
       async function seedProvisionalTopic(
@@ -3789,7 +3776,7 @@ describe("topics module and topicName", () => {
 
       it("a placeholder title never reaches the topic name; the topic is marked provisional", async () => {
         const sessionId = "ses_prov_create";
-        const tg = fakeChat({ createConversation: () => ({ ok: true, result: { messageThreadId: 900 } }) });
+        const tg = fakeChat({ createConversation: (o) => ({ ok: true, result: { messageThreadId: 900, name: o.name } }) });
 
         const res = await resolveTopic(env.DB, {
           sessionId,
@@ -3808,7 +3795,7 @@ describe("topics module and topicName", () => {
 
       it("a real title at creation is not provisional", async () => {
         const sessionId = "ses_prov_real";
-        const tg = fakeChat({ createConversation: () => ({ ok: true, result: { messageThreadId: 901 } }) });
+        const tg = fakeChat({ createConversation: (o) => ({ ok: true, result: { messageThreadId: 901, name: o.name } }) });
 
         await resolveTopic(env.DB, {
           sessionId,
@@ -3888,7 +3875,7 @@ describe("topics module and topicName", () => {
         const sessionId = "ses_prov_editfail";
         await seedProvisionalTopic(sessionId, 904, "~/projects/pigeon");
         const tg = fakeChat({
-          renameConversation: () => ({ ok: false, kind: "rate_limited", retryAfter: 30 }),
+          renameConversation: () => results.rateLimited(30),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -3933,7 +3920,7 @@ describe("topics module and topicName", () => {
         const sessionId = "ses_prov_notmodified";
         await seedProvisionalTopic(sessionId, 905, "~/projects/pigeon");
         const tg = fakeChat({
-          renameConversation: () => ({ ok: false, kind: "topic_not_modified" }),
+          renameConversation: () => results.notModified(),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -4040,7 +4027,7 @@ describe("topics module and topicName", () => {
         await seedProvisionalTopic(sessionId, 910, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
         const tg = fakeChat({
-          unarchiveConversation: () => ({ ok: false, kind: "topic_not_modified" }),
+          unarchiveConversation: () => results.notModified(),
         });
 
         const res = await resolveTopic(env.DB, {
@@ -4064,7 +4051,7 @@ describe("topics module and topicName", () => {
         await seedProvisionalTopic(sessionId, 911, "~/projects/pigeon", now);
         await markClosed(env.DB, { sessionId, now });
         const tg = fakeChat({
-          unarchiveConversation: () => ({ ok: false, kind: "error", status: 500 }),
+          unarchiveConversation: () => results.error(500, "boom"),
         });
 
         const res = await resolveTopic(env.DB, {
