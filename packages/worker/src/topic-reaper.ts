@@ -183,7 +183,7 @@ export async function closeOrphanedTopics(
 
     if (limited) continue;
 
-    const res = await tgFor(row.chat_id).closeForumTopic({
+    const res = await tgFor(row.chat_id).archiveConversation({
       chatId: row.chat_id,
       messageThreadId: row.message_thread_id,
     });

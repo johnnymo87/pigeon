@@ -62,7 +62,7 @@ export const RESERVATION_TTL_MS = 120_000; // 120s TTL for topic reservations. O
  * for a new session. There is no second transport to supersede between.
  *
  * Residual failure mode note:
- * If the worker isolate dies right after conversation creation (`createForumTopic`) succeeds
+ * If the worker isolate dies right after conversation creation (`createConversation`) succeeds
  * but before `finalize()` updates D1, an orphan channel exists with no D1 record. The provider
  * has no idempotent creation API, so this residual cannot be avoided without external
  * distributed transactions. Cleanup for this rare edge case is manual.
@@ -99,16 +99,16 @@ export async function resolveTopic(
       row.name && row.name !== "session" && !hasPlaceholderName(row.name) ? row.name : "";
     const name = topicName(opts.dir || fallbackDir, title);
 
-    const tgClient = transportForChat(opts.chatId, slackCtx, opts.transport);
+    const chat = transportForChat(opts.chatId, slackCtx, opts.transport);
     try {
-      const res = await tgClient.editForumTopic({
+      const res = await chat.renameConversation({
         chatId: opts.chatId,
         messageThreadId,
         name,
         sessionId: opts.sessionId,
       });
 
-      // `topic_not_modified` means Telegram already shows this name — most likely because a
+      // `topic_not_modified` means the provider already shows this name — most likely because a
       // rival isolate got there first, or because a previous attempt succeeded and only the D1
       // write was lost. Either way the desired end state holds, so clear the flag.
       if (res.ok || res.kind === "topic_not_modified") {
@@ -116,7 +116,7 @@ export async function resolveTopic(
         return;
       }
 
-      // Everything else — rate_limited, thread_not_found, revoked can_manage_topics, a 5xx —
+      // Everything else — rate_limited, thread_not_found, revoked token rights, a 5xx —
       // leaves the flag set so a later titled notification retries. Accepted residual: a
       // PERMANENT edit failure therefore costs one wasted API call per titled notification for
       // the life of the session, the same trade already accepted for the reopen retry below.
@@ -183,11 +183,11 @@ export async function resolveTopic(
   }
   if (existing && existing.message_thread_id !== null) {
     if (existing.state === "closed") {
-      const tgClient = transportForChat(opts.chatId, slackCtx, opts.transport);
-      // Verified against live Telegram API (2026-07-28, bead pigeon-cev): an admin bot CAN post into a closed forum topic.
-      // Reopening here is belt-and-braces rather than load-bearing (ensures the topic is uncollapsed/visible).
-      // Removing this reopen call is tracked as roadmap item 6c.
-      const reopenRes = await tgClient.reopenForumTopic({
+      const chat = transportForChat(opts.chatId, slackCtx, opts.transport);
+      // Reopening (unarchiving) here is belt-and-braces rather than load-bearing: a post into an archived
+      // Slack channel is recovered by the transport itself (`withChannelRecovery` unarchives on `is_archived`),
+      // so this only makes the conversation visible again before the post.
+      const reopenRes = await chat.unarchiveConversation({
         chatId: opts.chatId,
         messageThreadId: existing.message_thread_id,
       });
@@ -201,36 +201,35 @@ export async function resolveTopic(
           };
         }
         if (reopenRes.kind === "thread_not_found") {
-          // Closed topic was deleted out-of-band in Telegram -> delete stale D1 row and fall through to recreate
+          // Closed conversation was deleted out-of-band -> delete stale D1 row and fall through to recreate
           await deleteTopicBySession(db, opts.sessionId, opts.chatId, existing.message_thread_id);
         } else if (reopenRes.kind === "topic_not_modified") {
-          // Topic is already open in Telegram -> flip D1 row to open and proceed with existing thread.
+          // Conversation is already open on the provider side -> flip D1 row to open and proceed with existing thread.
           await markOpen(db, { sessionId: opts.sessionId, chatId: opts.chatId, now: opts.now });
           await upgradeProvisionalName(existing, existing.message_thread_id);
           return { ok: true, messageThreadId: existing.message_thread_id };
         } else {
-          // Genuine reopen failure (e.g. Telegram 5xx, transient network error, bot lost can_manage_topics).
+          // Genuine reopen failure (e.g. a provider 5xx, a transient network error, the user token losing its rights).
           // Do not call markOpen so the D1 row remains 'closed' and the reopen is retried on subsequent notifications.
-          // Delivery is unaffected because posting into a closed topic works in Telegram.
+          // Delivery is unaffected because a post into an archived channel unarchives it in the transport.
           //
           // Note on reaper/state:
           // The reaper is double-gated (listReapable requires state='closed' AND closed_at < closedBefore AND the session
           // row to be missing or stale), so a closed row does not arm the reaper while the session is actively receiving notifications.
           // Nothing breaks from posting into a row marked closed. Note that because listOrphaned only selects
-          // state='open' rows, a topic stuck closed in D1 but open in Telegram is invisible to the orphan-closer,
-          // so no closeForumTopic call ever fires for it. Graceful session termination still closes it explicitly;
-          // on non-graceful death, the topic simply stays uncollapsed in Telegram until eventual reaping.
+          // state='open' rows, a topic stuck closed in D1 but open on the provider side is invisible to the orphan-closer,
+          // so no archiveConversation call ever fires for it. Graceful session termination still closes it explicitly;
+          // on non-graceful death, the conversation simply stays open until eventual reaping.
           //
           // Accepted residual:
-          // If a reopen failure is permanent (e.g. the bot loses can_manage_topics), leaving the row closed means
-          // every subsequent notification retries a reopen that always fails (~1 wasted API call per notification
-          // against the ~20/min per-group budget). This is an accepted trade-off so delivery is unaffected without
+          // If a reopen failure is permanent (e.g. the user token loses its rights), leaving the row closed means
+          // every subsequent notification retries a reopen that always fails (~1 wasted API call per notification). This is an accepted trade-off so delivery is unaffected without
           // needing a new attempt-count column. Additionally, because closed_at continues aging from the original
           // close rather than being reset to NULL by markOpen, a permanent reopen failure followed by session idleness
           // (>7d TTL) allows the reaper to delete the topic up to ~30 days earlier than if it had been re-closed on orphan cleanup.
           //
           // No provisional-name upgrade on this branch either: the reopen just failed, so
-          // spending another Telegram call on a cosmetic rename is unlikely to fare better.
+          // spending another provider call on a cosmetic rename is unlikely to fare better.
           // The name stays provisional and a later notification upgrades it once reopen works.
           return { ok: true, messageThreadId: existing.message_thread_id };
         }
@@ -256,11 +255,11 @@ export async function resolveTopic(
   const delay =
     opts.delayFn ??
     ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const tg = transportForChat(opts.chatId, slackCtx, opts.transport);
+  const chat = transportForChat(opts.chatId, slackCtx, opts.transport);
 
   // Helper for creator flow (executed by initial reserve winner or steal winner)
   async function runCreatorFlow(): Promise<ResolveTopicResult> {
-    const createRes = await tg.createForumTopic({
+    const createRes = await chat.createConversation({
       chatId: opts.chatId,
       name,
       sessionId: opts.sessionId,
@@ -298,7 +297,7 @@ export async function resolveTopic(
       };
     }
 
-    const threadId = createRes.result.message_thread_id;
+    const threadId = createRes.result.messageThreadId;
 
     // Finalize CAS: only updates if message_thread_id IS NULL, and only in THIS chat. A create
     // that finishes after the row moved to another chat must not write its thread id there.
@@ -317,12 +316,12 @@ export async function resolveTopic(
 
     // Lost finalize CAS! Another caller finalized first.
     // Residual failure mode note:
-    // If the isolate dies right after Telegram topic creation but before finalize(),
-    // an orphan Telegram topic remains without a D1 row.
+    // If the isolate dies right after the provider created the conversation but before finalize(),
+    // an orphan conversation remains without a D1 row.
     // When we reach here, finalize returned false because a rival finalized first.
     // Fire compensating delete on the topic we created.
     try {
-      await tg.deleteForumTopic({
+      await chat.deleteConversation({
         chatId: opts.chatId,
         messageThreadId: threadId,
       });

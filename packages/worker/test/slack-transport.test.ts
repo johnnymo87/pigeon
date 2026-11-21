@@ -132,11 +132,11 @@ describe("handles", () => {
         t.sendMessage({ chatId, text: "x", messageThreadId: handle }),
         t.sendRichMessage({ chatId, markdown: "x", messageThreadId: handle }),
         t.sendDocument({ chatId, document: new Blob(["a"]), filename: "a.txt", messageThreadId: handle }),
-        t.editForumTopic({ chatId, messageThreadId: handle, name: "n" }),
-        t.closeForumTopic({ chatId, messageThreadId: handle }),
-        t.reopenForumTopic({ chatId, messageThreadId: handle }),
-        t.deleteForumTopic({ chatId, messageThreadId: handle }),
-        t.editMessageText({ chatId, messageId: handle, text: "x" }),
+        t.renameConversation({ chatId, messageThreadId: handle, name: "n" }),
+        t.archiveConversation({ chatId, messageThreadId: handle }),
+        t.unarchiveConversation({ chatId, messageThreadId: handle }),
+        t.deleteConversation({ chatId, messageThreadId: handle }),
+        t.editMessage({ chatId, messageId: handle, text: "x" }),
       ]);
       for (const r of results) {
         expect(r.ok).toBe(false);
@@ -147,25 +147,24 @@ describe("handles", () => {
   });
 });
 
-// ─── createForumTopic ──────────────────────────────────────────────────────
+// ─── createConversation ──────────────────────────────────────────────────────
 
-describe("createForumTopic", () => {
+describe("createConversation", () => {
   it("names the channel <title-slug>-<sid8>, invites the owner, sets the topic, and returns a handle", async () => {
     const ws = mkWs();
     slack("conversations.create", { ok: true, channel: { id: "CNEW1", name: "fix-flaky-test-abcdef12" } });
     slack("conversations.invite", { ok: true });
     slack("conversations.setTopic", { ok: true });
     const name = "Fix flaky test · ~/projects/pigeon";
-    const res = await transport(ws).createForumTopic({
+    const res = await transport(ws).createConversation({
       chatId: slackChatId(ws),
       name,
       sessionId: "ses_ABCDEF1234567890",
     });
     expect(res.ok).toBe(true);
     if (!res.ok) return;
-    expect(res.result.message_thread_id).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
+    expect(res.result.messageThreadId).toBeGreaterThanOrEqual(SLACK_HANDLE_MIN);
     expect(res.result.name).toBe("fix-flaky-test-abcdef12");
-    expect(res.result.icon_color).toBe(0);
 
     expect(methods()).toEqual(["conversations.create", "conversations.invite", "conversations.setTopic"]);
     expect(calls[0]!.params.get("name")).toBe("fix-flaky-test-abcdef12");
@@ -176,7 +175,7 @@ describe("createForumTopic", () => {
     expect(calls[2]!.params.get("topic")).toBe(`${name} · 🆔 ses_ABCDEF1234567890`);
 
     const row = await env.DB.prepare("SELECT channel_id FROM slack_conversations WHERE handle = ? AND team_id = ?")
-      .bind(res.result.message_thread_id, ws.teamId)
+      .bind(res.result.messageThreadId, ws.teamId)
       .first<{ channel_id: string }>();
     expect(row?.channel_id).toBe("CNEW1");
   });
@@ -188,7 +187,7 @@ describe("createForumTopic", () => {
       slack("conversations.create", (p) => ({ ok: true, channel: { id: uniq("C"), name: p.get("name") } }));
       slack("conversations.invite", { ok: true });
       slack("conversations.setTopic", { ok: true });
-      const res = await t.createForumTopic({ chatId: slackChatId(ws), name: "x", ...opts });
+      const res = await t.createConversation({ chatId: slackChatId(ws), name: "x", ...opts });
       expect(res.ok).toBe(true);
       expect(calls[calls.length - 3]!.params.get("name")).toBe(expectName);
     };
@@ -207,7 +206,7 @@ describe("createForumTopic", () => {
     slack("conversations.create", { ok: true, channel: { id: "CKEY", name: "stall-watch-digest" } });
     slack("conversations.invite", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).createForumTopic({
+    const res = await transport(ws).createConversation({
       chatId: slackChatId(ws),
       name: "Stall watch digest",
       channelKey: "stall-watch:Digest",
@@ -225,7 +224,7 @@ describe("createForumTopic", () => {
     slack("conversations.create", (p) => ({ ok: true, channel: { id: "CLONG", name: p.get("name") } }));
     slack("conversations.invite", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: long, sessionId: "ses_abcdef12xyz" });
+    const res = await transport(ws).createConversation({ chatId: slackChatId(ws), name: long, sessionId: "ses_abcdef12xyz" });
     expect(res.ok).toBe(true);
     const first = calls[0]!.params.get("name")!;
     const second = calls[1]!.params.get("name")!;
@@ -240,7 +239,7 @@ describe("createForumTopic", () => {
     slack("conversations.create", { ok: true, channel: { id: "CTOP", name: "x" } });
     slack("conversations.invite", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "😀".repeat(400), sessionId: "ses_abcdef12xyz" });
+    await transport(ws).createConversation({ chatId: slackChatId(ws), name: "😀".repeat(400), sessionId: "ses_abcdef12xyz" });
     const topic = calls[2]!.params.get("topic")!;
     expect([...topic].length).toBeLessThanOrEqual(250);
     expect(topic.endsWith(" · 🆔 ses_abcdef12xyz")).toBe(true);
@@ -253,14 +252,14 @@ describe("createForumTopic", () => {
     slack("conversations.create", (p) => ({ ok: true, channel: { id: "C3", name: p.get("name") } }));
     slack("conversations.invite", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "dup" });
+    const res = await transport(ws).createConversation({ chatId: slackChatId(ws), name: "dup" });
     expect(res.ok).toBe(true);
     expect(calls.slice(0, 3).map((c) => c.params.get("name"))).toEqual(["dup", "dup-2", "dup-3"]);
     if (res.ok) expect(res.result.name).toBe("dup-3");
 
     calls.length = 0;
     for (let i = 0; i < 9; i++) slack("conversations.create", { ok: false, error: "name_taken" });
-    const failed = await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "dup" });
+    const failed = await transport(ws).createConversation({ chatId: slackChatId(ws), name: "dup" });
     expect(failed.ok).toBe(false);
     if (!failed.ok && failed.kind === "error") {
       expect(failed.errorCode).toBe(400);
@@ -279,17 +278,17 @@ describe("createForumTopic", () => {
     slack("conversations.create", { ok: true, channel: { id: "CW1", name: "a" } });
     slack("conversations.invite", { ok: false, error: "already_in_channel" });
     slack("conversations.setTopic", { ok: true });
-    expect((await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "a" })).ok).toBe(true);
+    expect((await transport(ws).createConversation({ chatId: slackChatId(ws), name: "a" })).ok).toBe(true);
 
     slack("conversations.create", { ok: true, channel: { id: "CW2", name: "b" } });
     slack("conversations.invite", { ok: false, error: "user_not_found" });
     slack("conversations.setTopic", { ok: false, error: "restricted_action" });
-    const res = await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "b" });
+    const res = await transport(ws).createConversation({ chatId: slackChatId(ws), name: "b" });
     expect(res.ok).toBe(true);
     // The mapping is durable even though the cosmetic steps failed.
     if (res.ok) {
       const row = await env.DB.prepare("SELECT channel_id FROM slack_conversations WHERE handle = ?")
-        .bind(res.result.message_thread_id)
+        .bind(res.result.messageThreadId)
         .first<{ channel_id: string }>();
       expect(row?.channel_id).toBe("CW2");
     }
@@ -298,7 +297,7 @@ describe("createForumTopic", () => {
   it("maps a conversations.create 429 to a transient 503, never an outbox-wide rate limit", async () => {
     const ws = mkWs();
     slack("conversations.create", { ok: false, error: "ratelimited" }, 429, { "retry-after": "30" });
-    const res = await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "a" });
+    const res = await transport(ws).createConversation({ chatId: slackChatId(ws), name: "a" });
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(res.kind).toBe("error");
@@ -606,9 +605,9 @@ describe("#alerts", () => {
   });
 });
 
-// ─── editMessageText ───────────────────────────────────────────────────────
+// ─── editMessage ───────────────────────────────────────────────────────
 
-describe("editMessageText", () => {
+describe("editMessage", () => {
   it("updates the recorded post in place", async () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CED");
@@ -619,7 +618,7 @@ describe("editMessageText", () => {
     if (!sent.ok) return;
 
     slack("chat.update", { ok: true });
-    const res = await t.editMessageText({
+    const res = await t.editMessage({
       chatId: slackChatId(ws),
       messageId: sent.result.message_id,
       text: "Q? (answered)",
@@ -649,9 +648,9 @@ describe("editMessageText", () => {
       .bind(ws.teamId)
       .first<{ handle: number }>();
     const t = transport(ws);
-    const missing = await t.editMessageText({ chatId: slackChatId(ws), messageId: 777, text: "x" });
+    const missing = await t.editMessage({ chatId: slackChatId(ws), messageId: 777, text: "x" });
     expect(!missing.ok && missing.kind).toBe("thread_not_found");
-    const file = await t.editMessageText({ chatId: slackChatId(ws), messageId: filePost!.handle, text: "x" });
+    const file = await t.editMessage({ chatId: slackChatId(ws), messageId: filePost!.handle, text: "x" });
     expect(!file.ok && file.kind).toBe("error");
     expect(handle).toBeGreaterThan(0);
     expect(calls).toEqual([]);
@@ -666,7 +665,7 @@ describe("editMessageText", () => {
     const sentOff = await off.sendMessage({ chatId: slackChatId(ws), messageThreadId: named, text: "Q?" });
     if (!sentOff.ok) throw new Error("send failed");
     slack("chat.update", { ok: true });
-    await off.editMessageText({ chatId: slackChatId(ws), messageId: sentOff.result.message_id, text: "Q2" });
+    await off.editMessage({ chatId: slackChatId(ws), messageId: sentOff.result.message_id, text: "Q2" });
     expect(calls[1]!.params.get("text")).toBe("Q2");
     calls.length = 0;
     const t = transport(ws, "named");
@@ -674,7 +673,7 @@ describe("editMessageText", () => {
     const sent = await t.sendMessage({ chatId: slackChatId(ws), messageThreadId: named, text: "Q?" });
     if (!sent.ok) throw new Error("send failed");
     slack("chat.update", { ok: true });
-    await t.editMessageText({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "Q2" });
+    await t.editMessage({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "Q2" });
     expect(calls[1]!.params.get("text")).toBe("<@U0OWNER> Q2");
   });
 });
@@ -768,9 +767,9 @@ describe("sendDocument / sendPhoto", () => {
   });
 });
 
-// ─── editForumTopic ────────────────────────────────────────────────────────
+// ─── renameConversation ────────────────────────────────────────────────────────
 
-describe("editForumTopic", () => {
+describe("renameConversation", () => {
   const NAME = "New title · ~/projects/pigeon";
   const SID = "ses_abcdef1234";
 
@@ -780,7 +779,7 @@ describe("editForumTopic", () => {
     slack("conversations.info", { ok: true, channel: { name: "old-title-abcdef12", topic: { value: "Old" } } });
     slack("conversations.rename", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).editForumTopic({
+    const res = await transport(ws).renameConversation({
       chatId: slackChatId(ws),
       messageThreadId: handle,
       name: NAME,
@@ -797,7 +796,7 @@ describe("editForumTopic", () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CEF2");
     slack("conversations.info", { ok: true, channel: { name: "new-title-abcdef12", topic: { value: `${NAME} · 🆔 ${SID}` } } });
-    const res = await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
+    const res = await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
     expect(res.ok).toBe(true);
     expect(methods()).toEqual(["conversations.info"]);
   });
@@ -807,7 +806,7 @@ describe("editForumTopic", () => {
     const handle = await seedChannel(ws, "CEF3");
     slack("conversations.info", { ok: true, channel: { name: "new-title-abcdef12-3", topic: { value: "stale" } } });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
+    const res = await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
     expect(res.ok).toBe(true);
     expect(methods()).toEqual(["conversations.info", "conversations.setTopic"]);
   });
@@ -819,7 +818,7 @@ describe("editForumTopic", () => {
     slack("conversations.rename", { ok: false, error: "name_taken" });
     slack("conversations.rename", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
+    const res = await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, name: NAME, sessionId: SID });
     expect(res.ok).toBe(true);
     expect(calls.filter((c) => c.method === "conversations.rename").map((c) => c.params.get("name"))).toEqual([
       "new-title-abcdef12",
@@ -833,13 +832,13 @@ describe("editForumTopic", () => {
     slack("conversations.info", { ok: true, channel: { name: "x", topic: { value: "" } } });
     slack("conversations.setTopic", { ok: true });
     expect(
-      (await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, topic: "Just this" })).ok,
+      (await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, topic: "Just this" })).ok,
     ).toBe(true);
     expect(calls[1]!.params.get("topic")).toBe("Just this");
     expect(methods()).not.toContain("conversations.rename");
 
     calls.length = 0;
-    expect((await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
     expect(calls).toEqual([]);
   });
 });
@@ -852,18 +851,18 @@ describe("conversation lifecycle", () => {
     const handle = await seedChannel(ws, "CLC1");
     const t = transport(ws);
     slack("conversations.archive", { ok: true });
-    expect((await t.closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await t.archiveConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
     expect(calls[0]!.params.get("channel")).toBe("CLC1");
     expect(calls[0]!.auth).toBe("Bearer xoxb-bot");
     slack("conversations.archive", { ok: false, error: "already_archived" });
-    expect((await t.closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await t.archiveConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
   });
 
   it("delete archives too (bots cannot delete)", async () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CLC2");
     slack("conversations.archive", { ok: true });
-    expect((await transport(ws).deleteForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await transport(ws).deleteConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
     expect(methods()).toEqual(["conversations.archive"]);
   });
 
@@ -872,10 +871,10 @@ describe("conversation lifecycle", () => {
     const handle = await seedChannel(ws, "CLC3");
     const t = transport(ws);
     slack("conversations.unarchive", { ok: true });
-    expect((await t.reopenForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await t.unarchiveConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
     expect(calls[0]!.auth).toBe("Bearer xoxp-user");
     slack("conversations.unarchive", { ok: false, error: "not_archived" });
-    const res = await t.reopenForumTopic({ chatId: slackChatId(ws), messageThreadId: handle });
+    const res = await t.unarchiveConversation({ chatId: slackChatId(ws), messageThreadId: handle });
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.kind).toBe("topic_not_modified");
   });
@@ -973,7 +972,7 @@ describe("transportForChat routing", () => {
 
 // ─── review fixes ──────────────────────────────────────────────────────────
 
-describe("editForumTopic without enough to compute the channel name", () => {
+describe("renameConversation without enough to compute the channel name", () => {
   it("never renames without a sessionId or channelKey, and keeps the id on the topic line", async () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CRV1");
@@ -982,7 +981,7 @@ describe("editForumTopic without enough to compute the channel name", () => {
       channel: { name: "old-title-abcdef12", topic: { value: "Old title · ~/p · 🆔 ses_abcdef1234" } },
     });
     slack("conversations.setTopic", { ok: true });
-    const res = await transport(ws).editForumTopic({
+    const res = await transport(ws).renameConversation({
       chatId: slackChatId(ws),
       messageThreadId: handle,
       name: "New title · ~/p",
@@ -996,7 +995,7 @@ describe("editForumTopic without enough to compute the channel name", () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CRV2");
     slack("conversations.info", { ok: true, channel: { name: "x-abcdef12", topic: { value: "Same · 🆔 ses_abcdef1234" } } });
-    const res = await transport(ws).editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: "Same" });
+    const res = await transport(ws).renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, name: "Same" });
     expect(res.ok).toBe(true);
     expect(methods()).toEqual(["conversations.info"]);
   });
@@ -1007,7 +1006,7 @@ describe("editForumTopic without enough to compute the channel name", () => {
     slack("conversations.info", { ok: true, channel: { name: "wrong", topic: { value: "Digest" } } });
     slack("conversations.rename", { ok: true });
     const t = transport(ws);
-    const res = await t.editForumTopic({
+    const res = await t.renameConversation({
       chatId: slackChatId(ws),
       messageThreadId: handle,
       name: "Digest",
@@ -1020,7 +1019,7 @@ describe("editForumTopic without enough to compute the channel name", () => {
     calls.length = 0;
     slack("conversations.info", { ok: true, channel: { name: "stall-watch-digest", topic: { value: "Digest" } } });
     expect(
-      (await t.editForumTopic({ chatId: slackChatId(ws), messageThreadId: handle, name: "Digest", channelKey: "stall-watch:Digest" })).ok,
+      (await t.renameConversation({ chatId: slackChatId(ws), messageThreadId: handle, name: "Digest", channelKey: "stall-watch:Digest" })).ok,
     ).toBe(true);
     expect(methods()).toEqual(["conversations.info"]);
   });
@@ -1029,7 +1028,7 @@ describe("editForumTopic without enough to compute the channel name", () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CRV4");
     slack("conversations.info", { ok: false, error: "is_archived" });
-    const res = await transport(ws).editForumTopic({
+    const res = await transport(ws).renameConversation({
       chatId: slackChatId(ws),
       messageThreadId: handle,
       name: "n",
@@ -1115,7 +1114,7 @@ describe("not_in_channel recovery beyond posts", () => {
     slack("conversations.archive", { ok: false, error: "not_in_channel" });
     slack("conversations.join", { ok: true });
     slack("conversations.archive", { ok: true });
-    expect((await t.closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
+    expect((await t.archiveConversation({ chatId: slackChatId(ws), messageThreadId: handle })).ok).toBe(true);
     expect(methods()).toEqual(["conversations.archive", "conversations.join", "conversations.archive"]);
 
     calls.length = 0;
@@ -1128,7 +1127,7 @@ describe("not_in_channel recovery beyond posts", () => {
     slack("conversations.setTopic", { ok: false, error: "not_in_channel" });
     slack("conversations.join", { ok: true });
     slack("conversations.setTopic", { ok: true });
-    const res = await t.editForumTopic({
+    const res = await t.renameConversation({
       chatId: slackChatId(ws),
       messageThreadId: handle,
       name: "New",
@@ -1153,7 +1152,7 @@ describe("not_in_channel recovery beyond posts", () => {
     const handle = await seedChannel(ws, "CNIC2");
     slack("conversations.archive", { ok: false, error: "not_in_channel" });
     slack("conversations.join", { ok: false, error: "channel_not_found" });
-    const res = await transport(ws).closeForumTopic({ chatId: slackChatId(ws), messageThreadId: handle });
+    const res = await transport(ws).archiveConversation({ chatId: slackChatId(ws), messageThreadId: handle });
     expect(!res.ok && res.kind).toBe("thread_not_found");
   });
 });
@@ -1192,7 +1191,7 @@ describe("a D1 failure after Slack accepted the call", () => {
       if (res.ok) {
         expect(res.result.message_id).toBeLessThan(0);
         // Never a handle: it resolves to no post, so an edit of it is thread_not_found.
-        const edit = await transport(ws).editMessageText({ chatId: slackChatId(ws), messageId: res.result.message_id, text: "x" });
+        const edit = await transport(ws).editMessage({ chatId: slackChatId(ws), messageId: res.result.message_id, text: "x" });
         expect(!edit.ok && edit.kind).toBe("thread_not_found");
       }
       expect(warn.mock.calls.some((c) => String(c[0]).includes("not recorded"))).toBe(true);
@@ -1258,7 +1257,7 @@ describe("a D1 failure after Slack accepted the call", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       const t = createSlackTransport({ db: flakyDb(/UPDATE slack_posts/, 99), ws });
-      const res = await t.editMessageText({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "q2" });
+      const res = await t.editMessage({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "q2" });
       expect(res.ok).toBe(true);
     } finally {
       warn.mockRestore();
@@ -1271,7 +1270,7 @@ describe("a D1 failure after Slack accepted the call", () => {
     const err = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
       const t = createSlackTransport({ db: flakyDb(/INTO slack_conversations/, 99), ws });
-      const res = await t.createForumTopic({ chatId: slackChatId(ws), name: "x" });
+      const res = await t.createConversation({ chatId: slackChatId(ws), name: "x" });
       expect(res.ok).toBe(false);
       if (!res.ok && res.kind === "error") expect(res.errorCode).toBe(502);
       else throw new Error("expected a 502 failure");
@@ -1348,7 +1347,7 @@ describe("signal on every operation that carries one", () => {
     return { seen, fetchFn };
   };
 
-  it("sendRichMessage, editMessageText, sendPhoto and sendDocument pass it to each Slack call", async () => {
+  it("sendRichMessage, editMessage, sendPhoto and sendDocument pass it to each Slack call", async () => {
     const ws = mkWs();
     const handle = await seedChannel(ws, "CSG");
     const ac = new AbortController();
@@ -1359,7 +1358,7 @@ describe("signal on every operation that carries one", () => {
     const rich = await t.sendRichMessage({ chatId, messageThreadId: handle, markdown: "m", signal: ac.signal });
     expect(rich.ok).toBe(true);
     if (!rich.ok) return;
-    expect((await t.editMessageText({ chatId, messageId: rich.result.message_id, text: "e", signal: ac.signal })).ok).toBe(true);
+    expect((await t.editMessage({ chatId, messageId: rich.result.message_id, text: "e", signal: ac.signal })).ok).toBe(true);
     expect((await t.sendPhoto({ chatId, messageThreadId: handle, photo: new Blob(["p"]), filename: "p.png", signal: ac.signal })).ok).toBe(true);
     expect((await t.sendDocument({ chatId, messageThreadId: handle, document: new Blob(["d"]), filename: "d.txt", signal: ac.signal })).ok).toBe(true);
 
@@ -1387,7 +1386,7 @@ describe("owner invite is retried until it lands", () => {
         .first<{ v: number }>()
     )?.v;
 
-  it("createForumTopic records owner_invited on ok and on already_in_channel, and leaves 0 on a failure", async () => {
+  it("createConversation records owner_invited on ok and on already_in_channel, and leaves 0 on a failure", async () => {
     const cases: Array<[string, Record<string, unknown>, number]> = [
       ["CINV1", { ok: true }, 1],
       ["CINV2", { ok: false, error: "already_in_channel" }, 1],
@@ -1400,7 +1399,7 @@ describe("owner invite is retried until it lands", () => {
         slack("conversations.create", { ok: true, channel: { id: channelId, name: "x" } });
         slack("conversations.invite", inviteReply);
         slack("conversations.setTopic", { ok: true });
-        expect((await transport(ws).createForumTopic({ chatId: slackChatId(ws), name: "x" })).ok).toBe(true);
+        expect((await transport(ws).createConversation({ chatId: slackChatId(ws), name: "x" })).ok).toBe(true);
         expect(await ownerInvited(ws, channelId)).toBe(expected);
       }
     } finally {
@@ -1464,7 +1463,7 @@ describe("owner invite is retried until it lands", () => {
     calls.length = 0;
     slack("conversations.unarchive", { ok: true });
     slack("conversations.invite", { ok: true });
-    expect((await transport(ws).reopenForumTopic({ chatId: slackChatId(ws), messageThreadId: other })).ok).toBe(true);
+    expect((await transport(ws).unarchiveConversation({ chatId: slackChatId(ws), messageThreadId: other })).ok).toBe(true);
     expect(methods()).toEqual(["conversations.unarchive", "conversations.invite"]);
     expect(await ownerInvited(ws, "CRETRY4")).toBe(1);
   });

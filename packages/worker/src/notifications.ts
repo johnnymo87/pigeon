@@ -151,7 +151,7 @@ const json = (body: unknown, status = 200) =>
  * runs, so nothing here may change its outcome; every failure is caught and logged.
  */
 export async function alertRelocation(
-  tg: ChatTransport,
+  chat: ChatTransport,
   opts: {
     sessionId: string;
     chatId: string | number;
@@ -166,7 +166,7 @@ export async function alertRelocation(
     `reason: ${opts.reason}\n` +
     `chat: ${opts.chatId} · message: ${opts.messageId}`;
   try {
-    const res = await tg.sendMessage({ chatId: opts.chatId, text: alertText });
+    const res = await chat.sendMessage({ chatId: opts.chatId, text: alertText });
     if (res.ok) return true;
     console.error("[worker] relocation alert failed", { sessionId: opts.sessionId, res });
     return false;
@@ -259,7 +259,7 @@ type MediaSendResult =
   | { ok: false; details: unknown };
 
 async function sendPhotoReply(
-  tg: ChatTransport,
+  chat: ChatTransport,
   chatId: string | number,
   photoBlob: Blob,
   filename: string,
@@ -267,7 +267,7 @@ async function sendPhotoReply(
   messageThreadId?: number,
   signal?: AbortSignal,
 ): Promise<MediaSendResult> {
-  const res = await tg.sendPhoto({
+  const res = await chat.sendPhoto({
     chatId,
     photo: photoBlob,
     filename,
@@ -282,7 +282,7 @@ async function sendPhotoReply(
 }
 
 async function sendDocumentReply(
-  tg: ChatTransport,
+  chat: ChatTransport,
   chatId: string | number,
   documentBlob: Blob,
   filename: string,
@@ -290,7 +290,7 @@ async function sendDocumentReply(
   messageThreadId?: number,
   signal?: AbortSignal,
 ): Promise<MediaSendResult> {
-  const res = await tg.sendDocument({
+  const res = await chat.sendDocument({
     chatId,
     document: documentBlob,
     filename,
@@ -478,7 +478,7 @@ export async function handleSendNotification(
       }
     }
 
-    const tg = transportForChat(chatId, { env, db });
+    const chat = transportForChat(chatId, { env, db });
 
     // Rich message (pigeon-p909): the daemon offers the whole notification as rich markdown
     // when it contains a table; `text` is then chunk 0 of the plain rendering. Rich is tried
@@ -528,7 +528,7 @@ export async function handleSendNotification(
         linkMarkup = callerHasButtons ? undefined : await resolveMentionKeyboard(db, text, sessionId, env);
         linkMarkupResolved = true;
       }
-      const result = await tg.sendMessage({
+      const result = await chat.sendMessage({
         chatId,
         messageThreadId: threadId,
         text,
@@ -556,7 +556,7 @@ export async function handleSendNotification(
             : await resolveMentionKeyboard(db, richMarkdown!, sessionId, env);
           richLinkMarkupResolved = true;
         }
-        const result = await tg.sendRichMessage({
+        const result = await chat.sendRichMessage({
           chatId,
           messageThreadId: threadId,
           markdown: richMarkdown!,
@@ -683,7 +683,7 @@ export async function handleSendNotification(
     }
 
     // PERMANENT topic failure -> fall back to General.
-    // If the topic itself is unusable (rights revoked, forum mode off, chat is not a forum),
+    // If the topic itself is unusable (the channel is gone or the app lost its rights),
     // retrying can only fail again, so General is better than dropping the notification.
     //
     // A TRANSIENT failure (5xx, or an unclassifiable outcome) deliberately does NOT fall back:
@@ -766,7 +766,7 @@ export async function handleSendNotification(
     // Fires only when the caller wanted threading, so a deliberate unthreaded send (a quiet
     // session's question, pigeon-c501) is never reported.
     if (relocationReason !== undefined && messageThreadId === undefined) {
-      await alertRelocation(tg, {
+      await alertRelocation(chat, {
         sessionId,
         chatId,
         messageId,
@@ -790,8 +790,8 @@ export async function handleSendNotification(
           // The Slack upload honours the signal.
           const signal = AbortSignal.timeout(MEDIA_SEND_TIMEOUT_MS);
           const mediaResult = isImage
-            ? await sendPhotoReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal)
-            : await sendDocumentReply(tg, chatId, blob, item.filename, messageId, messageThreadId, signal);
+            ? await sendPhotoReply(chat, chatId, blob, item.filename, messageId, messageThreadId, signal)
+            : await sendDocumentReply(chat, chatId, blob, item.filename, messageId, messageThreadId, signal);
 
           if (mediaResult.ok && mediaResult.result) {
             await db
@@ -911,9 +911,9 @@ export async function handleEditNotification(
   }
 
   // Routed by the STORED post's chat (spec §1).
-  const tg = transportForChat(row.chat_id, { env, db });
+  const chat = transportForChat(row.chat_id, { env, db });
 
-  const chatResult = await tg.editMessageText({
+  const chatResult = await chat.editMessage({
     chatId: row.chat_id,
     messageId: row.message_id,
     text,

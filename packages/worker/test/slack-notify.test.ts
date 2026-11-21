@@ -265,10 +265,10 @@ describe("owner mention through the transport", () => {
     if (!sent.ok) throw new Error("send failed");
 
     slack("chat.update", { ok: true });
-    await off.editMessageText({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "edited" });
+    await off.editMessage({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "edited" });
     expect(calls[2]!.params.get("text")).toBe("edited");
     slack("chat.update", { ok: true });
-    await on.editMessageText({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "edited" });
+    await on.editMessage({ chatId: slackChatId(ws), messageId: sent.result.message_id, text: "edited" });
     expect(calls[3]!.params.get("text")).toBe(`${MENTION} edited`);
   });
 });

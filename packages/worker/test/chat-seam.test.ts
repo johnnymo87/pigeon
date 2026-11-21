@@ -59,7 +59,7 @@ describe("transportForChat", () => {
     } else {
       throw new Error(`unexpected result ${JSON.stringify(res)}`);
     }
-    const created = await t.createForumTopic({ chatId: SLACK_CHAT, name: "x" });
+    const created = await t.createConversation({ chatId: SLACK_CHAT, name: "x" });
     expect(created.ok).toBe(false);
   });
 
@@ -71,14 +71,14 @@ describe("transportForChat", () => {
     const results = await Promise.all([
       t.sendMessage({ chatId: TG_CHAT, text: "hi" }),
       t.sendRichMessage({ chatId: TG_CHAT, markdown: "hi" }),
-      t.editMessageText({ chatId: TG_CHAT, messageId: 1, text: "hi" }),
+      t.editMessage({ chatId: TG_CHAT, messageId: 1, text: "hi" }),
       t.sendPhoto({ chatId: TG_CHAT, photo: blob, filename: "a.png" }),
       t.sendDocument({ chatId: TG_CHAT, document: blob, filename: "a.txt" }),
-      t.createForumTopic({ chatId: TG_CHAT, name: "x" }),
-      t.editForumTopic({ chatId: TG_CHAT, messageThreadId: 1, name: "x" }),
-      t.closeForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
-      t.reopenForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
-      t.deleteForumTopic({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.createConversation({ chatId: TG_CHAT, name: "x" }),
+      t.renameConversation({ chatId: TG_CHAT, messageThreadId: 1, name: "x" }),
+      t.archiveConversation({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.unarchiveConversation({ chatId: TG_CHAT, messageThreadId: 1 }),
+      t.deleteConversation({ chatId: TG_CHAT, messageThreadId: 1 }),
     ]);
     for (const res of results) expect(res).toEqual({ ok: false, kind: "no_transport" });
     expect(warn).toHaveBeenCalled();
@@ -151,12 +151,12 @@ describe("topic CAS scoped to chat_id", () => {
     const sessionId = uniq("ses_cas_late_");
     const deleted: number[] = [];
     const { client: tg } = fakeTransport({
-      createForumTopic: async (o) => {
+      createConversation: async (o) => {
         // The 57 s create (pigeon-iqpd): while it is in flight the row moves to another chat.
         await supersede(sessionId, SLACK_CHAT);
-        return { ok: true, result: { message_thread_id: 9001, name: o.name, icon_color: 0 } };
+        return { ok: true, result: { messageThreadId: 9001, name: o.name } };
       },
-      deleteForumTopic: async (o) => {
+      deleteConversation: async (o) => {
         deleted.push(o.messageThreadId);
         return { ok: true, result: true };
       },
@@ -182,7 +182,7 @@ describe("topic CAS scoped to chat_id", () => {
   it("a failed create does not delete a reservation that moved to another chat (loser cleanup)", async () => {
     const sessionId = uniq("ses_cas_fail_");
     const { client: tg } = fakeTransport({
-      createForumTopic: async () => {
+      createConversation: async () => {
         await supersede(sessionId, SLACK_CHAT);
         return { ok: false, kind: "error", errorCode: 500, description: "boom" };
       },

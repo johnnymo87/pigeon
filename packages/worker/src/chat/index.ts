@@ -1,6 +1,6 @@
 /**
  * Picking a ChatTransport by address (spec §1, "A stored conversation goes where it lives").
- * See `./transport.ts` for the interface and why it is Telegram-shaped.
+ * See `./transport.ts` for the interface.
  */
 import type { D1Database } from "@cloudflare/workers-types";
 import { parseNotifyCategories } from "./slack-notify";
@@ -32,14 +32,14 @@ function slackUnavailable<T>(method: string): Promise<ChatResult<T>> {
 const SLACK_UNAVAILABLE: ChatTransport = {
   sendMessage: () => slackUnavailable("sendMessage"),
   sendRichMessage: () => slackUnavailable("sendRichMessage"),
-  editMessageText: () => slackUnavailable("editMessageText"),
+  editMessage: () => slackUnavailable("editMessage"),
   sendPhoto: () => slackUnavailable("sendPhoto"),
   sendDocument: () => slackUnavailable("sendDocument"),
-  createForumTopic: () => slackUnavailable("createForumTopic"),
-  editForumTopic: () => slackUnavailable("editForumTopic"),
-  closeForumTopic: () => slackUnavailable("closeForumTopic"),
-  reopenForumTopic: () => slackUnavailable("reopenForumTopic"),
-  deleteForumTopic: () => slackUnavailable("deleteForumTopic"),
+  createConversation: () => slackUnavailable("createConversation"),
+  renameConversation: () => slackUnavailable("renameConversation"),
+  archiveConversation: () => slackUnavailable("archiveConversation"),
+  unarchiveConversation: () => slackUnavailable("unarchiveConversation"),
+  deleteConversation: () => slackUnavailable("deleteConversation"),
 };
 
 /**
@@ -56,14 +56,14 @@ function noTransport<T>(method: string): Promise<ChatResult<T>> {
 const NO_TRANSPORT: ChatTransport = {
   sendMessage: () => noTransport("sendMessage"),
   sendRichMessage: () => noTransport("sendRichMessage"),
-  editMessageText: () => noTransport("editMessageText"),
+  editMessage: () => noTransport("editMessage"),
   sendPhoto: () => noTransport("sendPhoto"),
   sendDocument: () => noTransport("sendDocument"),
-  createForumTopic: () => noTransport("createForumTopic"),
-  editForumTopic: () => noTransport("editForumTopic"),
-  closeForumTopic: () => noTransport("closeForumTopic"),
-  reopenForumTopic: () => noTransport("reopenForumTopic"),
-  deleteForumTopic: () => noTransport("deleteForumTopic"),
+  createConversation: () => noTransport("createConversation"),
+  renameConversation: () => noTransport("renameConversation"),
+  archiveConversation: () => noTransport("archiveConversation"),
+  unarchiveConversation: () => noTransport("unarchiveConversation"),
+  deleteConversation: () => noTransport("deleteConversation"),
 };
 
 /** What a Slack address needs beyond the address itself: the workspace secrets and the handle tables. */

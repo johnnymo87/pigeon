@@ -7,17 +7,18 @@
  * `slack:<teamId>` id is Slack. Slack is the only transport; any other address (a numeric chat id
  * left over from the Telegram days) gets a guard that answers `no_transport` to every call.
  *
- * The method names, options and results are Telegram-shaped for historical reasons: the daemon
- * contract was written against Telegram, and the worker's internals followed it. A Slack
- * implementation translates `createForumTopic` to `conversations.create`, a `thread not found` to
- * `channel_not_found`, and so on, rather than every call site learning a second vocabulary. The
- * names are kept because the daemon still speaks that vocabulary on the wire.
+ * The methods are named for conversations (a Slack channel), not for any one provider's API
+ * (pigeon-4ogz.29). A few option and failure names predate Slack and are also the permanent
+ * daemon wire shape (`messageThreadId`, `entities`, `replyMarkup`, `retryAfter`; AGENTS.md
+ * "Architecture"). The Slack implementation translates `createConversation` to
+ * `conversations.create`, a missing channel to `thread_not_found`, and so on, so no call site
+ * learns Slack's vocabulary.
  *
  * `src/slack.ts` is the only file that knows Slack's host (egress guard test).
  */
 /**
- * A provider call's outcome. Telegram's shape, kept for the daemon contract; Slack's errors are
- * mapped onto it.
+ * A provider call's outcome. Slack's errors are mapped onto these kinds; the names predate Slack and
+ * are kept because callers branch on them.
  *
  * `no_transport` is internal: the address has no transport at all (a numeric chat id). It is never
  * serialized into a response body. Each caller maps it to its own answer (a 403/404/503, a
@@ -62,7 +63,7 @@ export interface SendRichMessageOptions {
   signal?: AbortSignal;
 }
 
-export interface EditMessageTextOptions {
+export interface EditMessageOptions {
   chatId: string | number;
   messageId: number;
   text: string;
@@ -96,15 +97,13 @@ export interface SendDocumentOptions {
   signal?: AbortSignal;
 }
 
-export interface ForumTopic {
-  message_thread_id: number;
+/** A conversation just created: its handle (what `topics.message_thread_id` stores) and name. */
+export interface CreatedConversation {
+  messageThreadId: number;
   name: string;
-  icon_color?: number;
-  icon_custom_emoji_id?: string;
-  is_name_implicit?: boolean;
 }
 
-export interface CreateForumTopicOptions {
+export interface CreateConversationOptions {
   chatId: string | number;
   name: string;
   /** the session this conversation is for (channel name suffix, topic line). */
@@ -115,7 +114,7 @@ export interface CreateForumTopicOptions {
   topic?: string;
 }
 
-export interface EditForumTopicOptions {
+export interface RenameConversationOptions {
   chatId: string | number;
   messageThreadId: number;
   name?: string;
@@ -127,17 +126,17 @@ export interface EditForumTopicOptions {
   topic?: string;
 }
 
-export interface CloseForumTopicOptions {
+export interface ArchiveConversationOptions {
   chatId: string | number;
   messageThreadId: number;
 }
 
-export interface ReopenForumTopicOptions {
+export interface UnarchiveConversationOptions {
   chatId: string | number;
   messageThreadId: number;
 }
 
-export interface DeleteForumTopicOptions {
+export interface DeleteConversationOptions {
   chatId: string | number;
   messageThreadId: number;
 }
@@ -148,13 +147,13 @@ export interface ChatTransport {
   /** Post one rich (markdown) message. */
   sendRichMessage(options: SendRichMessageOptions): Promise<ChatResult<{ message_id: number }>>;
   /** Edit a posted message in place (the question wizard). */
-  editMessageText(options: EditMessageTextOptions): Promise<ChatResult<{ message_id?: number } | boolean>>;
+  editMessage(options: EditMessageOptions): Promise<ChatResult<{ message_id?: number } | boolean>>;
   sendPhoto(options: SendPhotoOptions): Promise<ChatResult<{ message_id: number }>>;
   sendDocument(options: SendDocumentOptions): Promise<ChatResult<{ message_id: number }>>;
   /** Create a session's (or a named) conversation: a channel on Slack. */
-  createForumTopic(options: CreateForumTopicOptions): Promise<ChatResult<ForumTopic>>;
-  editForumTopic(options: EditForumTopicOptions): Promise<ChatResult<boolean>>;
-  closeForumTopic(options: CloseForumTopicOptions): Promise<ChatResult<boolean>>;
-  reopenForumTopic(options: ReopenForumTopicOptions): Promise<ChatResult<boolean>>;
-  deleteForumTopic(options: DeleteForumTopicOptions): Promise<ChatResult<boolean>>;
+  createConversation(options: CreateConversationOptions): Promise<ChatResult<CreatedConversation>>;
+  renameConversation(options: RenameConversationOptions): Promise<ChatResult<boolean>>;
+  archiveConversation(options: ArchiveConversationOptions): Promise<ChatResult<boolean>>;
+  unarchiveConversation(options: UnarchiveConversationOptions): Promise<ChatResult<boolean>>;
+  deleteConversation(options: DeleteConversationOptions): Promise<ChatResult<boolean>>;
 }
