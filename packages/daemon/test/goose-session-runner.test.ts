@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { openStorageDb } from "../src/storage/database.js";
 import { settleSwarmMessage } from "../src/swarm/swarm-settle.js";
 import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
-import { DisconnectedDuringTurn, GooseProtocolError } from "../src/goose/acp-client.js";
+import { DisconnectedDuringTurn, GooseProtocolError, GooseTurnFailedError } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
 import type { GooseInflightStore, GooseInflightRecord, InsertGooseInflightInput } from "../src/storage/goose-inflight-repo.js";
 
@@ -3128,6 +3128,174 @@ describe("GooseSessionRunner session title", () => {
       );
     });
 
+    it("settles swarm message as delivered and surfaces error when turn fails with turn_failed error (-32603)", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_turn_failed", "failing prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60.2 turn_failed error
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "provider message: rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      // Swarm message was delivered because goose received and executed the prompt
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed");
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "goose-turn-failed",
+          message: "provider message: rate limit exceeded",
+        },
+      });
+
+      // Human-facing Stop notification surfaces error event with provider message and goose-turn-failed
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("provider message: rate limit exceeded");
+    });
+
+    it("surfaces custom data.kind and data.message on turn_failed error", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_turn_failed_custom", "custom failing prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60.2 with our port's data.kind and data.message
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "fallback provider message", {
+          reason: "turn_failed",
+          kind: "turn_failed_network",
+          message: "Network connection reset",
+        }),
+      );
+      await runner.settled();
+
+      // Settled as delivered with custom turnError
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed_custom");
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "turn_failed_network",
+          message: "Network connection reset",
+        },
+      });
+
+      // Human-facing error event uses custom kind and message
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("turn_failed_network");
+      expect(stops[0]!.message).toContain("Network connection reset");
+    });
+
+    it("settles swarm message as unconfirmed when session/prompt fails without turn_failed reason", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_internal_err", "internal error prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // A -32603 without turn_failed reason (e.g. transport/internal)
+      client.failTurn(new GooseProtocolError(-32603, "Internal transport error"));
+      await runner.settled();
+
+      // Keeps unconfirmed behaviour
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_internal_err");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "unconfirmed" }),
+      );
+
+      // Error event is still posted
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("Internal transport error");
+    });
+
+    it("settles swarm message as delivered and surfaces error on 1.54 turnError receipt", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_154_turn_error", "1.54 prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Old 1.54 shape: success with stopReason end_turn and turnError
+      client.finishTurn("end_turn", {
+        turnError: { kind: "turn_failed_provider", message: "1.54 provider error" },
+      });
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_154_turn_error");
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "turn_failed_provider",
+          message: "1.54 provider error",
+        },
+      });
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("turn_failed_provider");
+      expect(stops[0]!.message).toContain("1.54 provider error");
+    });
+
+    it("dedupes error message when collected text already contains it (goose 1.60 streaming)", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("cmd_dedupe", "prompt that streams error");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60 streams error.message as an agent_message_chunk
+      runner.onUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { text: "Some explanation. 429 rate limit exceeded" },
+      });
+
+      // Then returns session/prompt error with the same message
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "429 rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      // The error message is not repeated
+      expect(stops[0]!.message).toBe("Some explanation. 429 rate limit exceeded");
+    });
+
+    it("appends error message when collected text does not contain it", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("cmd_no_dedupe", "prompt that streams partial");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose streams some text that doesn't have the error message
+      runner.onUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { text: "Thinking about the task..." },
+      });
+
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "429 rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.message).toBe("Thinking about the task...\n\n429 rate limit exceeded");
+    });
+
     it("settles swarm message as unconfirmed when resent turn hits busy", async () => {
       const { runner, client, settledSwarm, stops } = makeRunner();
       client.isHonk = true;
@@ -3175,6 +3343,133 @@ describe("GooseSessionRunner session title", () => {
       const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
       expect(notice?.payload).toContain("DELIVERY UNCONFIRMED");
       expect(notice?.payload).toContain("Do NOT resend it");
+    });
+
+    it("settles delivered with turnError: marks verified and notifies sender with distinct turn failed notice", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_turn_err",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "task that fails",
+      }, now);
+      storage.swarm.markHandedOff("msg_turn_err", now);
+
+      settleSwarmMessage(storage, "msg_turn_err", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      });
+
+      // Swarm row is marked verified (not failed)
+      const record = storage.swarm.getByMsgId("msg_turn_err");
+      expect(record?.verifiedAt).toBeDefined();
+      expect(record?.state).not.toBe("failed");
+
+      // Sender receives the distinct notice
+      const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
+      expect(notice?.payload).toContain("Delivered; the recipient's turn failed (turn_failed_network): Network connection reset.");
+      expect(notice?.payload).toContain("It will see your message on its next turn; resend only if it needs a fresh turn.");
+    });
+
+    it("settles clean delivered with no turnError: marks verified and notifies nothing to sender", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_clean",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "clean task",
+      }, now);
+      storage.swarm.markHandedOff("msg_clean", now);
+
+      settleSwarmMessage(storage, "msg_clean", { kind: "delivered" });
+
+      const record = storage.swarm.getByMsgId("msg_clean");
+      expect(record?.verifiedAt).toBeDefined();
+
+      // Sender receives nothing
+      const notices = storage.swarm.getReadyForTarget("ses_sender", now + 10, 10);
+      expect(notices).toHaveLength(0);
+    });
+
+    it("settles delivered with turnError: skips sending notice if markVerified returned false (row already failed)", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_already_failed",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "task that timed out",
+      }, now);
+      storage.swarm.markHandedOff("msg_already_failed", now);
+
+      // Watchdog marks it failed first
+      storage.swarm.markFailed("msg_already_failed", now + 10);
+
+      // Later, turn settles delivered with turnError
+      settleSwarmMessage(storage, "msg_already_failed", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      }, now + 20);
+
+      // No second notice sent to sender (markVerified returned false because row was not in handed_off)
+      const notices = storage.swarm.getReadyForTarget("ses_sender", now + 30, 10);
+      expect(notices).toHaveLength(0);
+    });
+
+    it("settles delivered with turnError: skips relay branch entirely for relayed messages", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      // Record relayed inbound message from machine "devbox"
+      storage.relayInbound.record({
+        msgId: "msg_relayed_turn_err",
+        fromMachine: "devbox",
+        fromSession: "ses_remoteSender",
+        toSession: "gse_coord",
+        fromLabel: null,
+      }, now);
+
+      storage.swarm.insert({
+        msgId: "msg_relayed_turn_err",
+        fromSession: "ses_remoteSender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "relayed task that fails turn",
+      }, now);
+      storage.swarm.markHandedOff("msg_relayed_turn_err", now);
+
+      settleSwarmMessage(storage, "msg_relayed_turn_err", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      }, now + 5);
+
+      // Swarm row is marked verified
+      const record = storage.swarm.getByMsgId("msg_relayed_turn_err");
+      expect(record?.verifiedAt).toBeDefined();
+
+      // Relay inbound failure was NOT queued (no relay notice, no markRelayFailed on origin)
+      const inbound = storage.relayInbound.get("msg_relayed_turn_err");
+      expect(inbound?.failReason).toBeNull();
+
+      // No local swarm message sent either
+      const notices = storage.swarm.getReadyForTarget("ses_remoteSender", now + 10, 10);
+      expect(notices).toHaveLength(0);
     });
 
     it("settles not_delivered with NOT received wording and safe to resend advice", () => {

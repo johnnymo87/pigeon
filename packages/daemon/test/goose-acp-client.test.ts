@@ -2,8 +2,10 @@ import { describe, it, expect, vi } from "vitest";
 import {
   GooseAcpClient,
   GooseProtocolError,
+  GooseTurnFailedError,
   ALLOWED_ACP_METHODS,
   DEFAULT_SESSION_EXTENSIONS,
+  DEFAULT_OPTIONAL_EXTENSIONS,
   DEFAULT_SERVE_FLOOR,
   DisconnectedDuringTurn,
   ownRunPolicy,
@@ -1842,7 +1844,29 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       { type: "platform", name: "todo" },
       { type: "platform", name: "skills" },
     ]);
+    expect(DEFAULT_OPTIONAL_EXTENSIONS).toEqual(["skills"]);
     expect(DEFAULT_SERVE_FLOOR).toEqual(["developer"]);
+  });
+
+  it("accepts a session/new response whose extensionResults lack skills (goose 1.60 compatibility)", async () => {
+    // goose 1.60.2 removed the platform `skills` extension (skills are built in).
+    // It silently drops `skills` from the request, so extensionResults has no `skills` entry.
+    // The client treats skills as optional: missing from extensionResults is not fatal.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
+  });
+
+  it("allows configuring optionalExtensions (e.g. disabling them)", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"]);
+    const client = makeClient(peer, { optionalExtensions: [] });
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*skills/i);
   });
 
   it("refuses a session MISSING a requested extension -- the shell-less session", async () => {
@@ -1855,6 +1879,29 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
     await client.connect();
 
     await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*developer/i);
+  });
+
+  it("refuses a session missing developer even when skills is also absent", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["analyze", "todo"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*developer/i);
+  });
+
+  it("refuses a session where an optional extension reported success:false", async () => {
+    // Missing from extensionResults is tolerated for optional extensions, but a
+    // reported failure is not: if the serve attempted to load it and failed, that
+    // is still a bad state.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"], [
+      { name: "skills", success: false, error: "failed to load skills" },
+    ]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/skills/);
   });
 
   it("refuses a session missing a FLOOR extension it was told to expect", async () => {
@@ -2169,6 +2216,108 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       expect(outcome).toEqual({
         kind: "unknown-request",
       });
+    });
+
+    it("throws GooseTurnFailedError when session/prompt errors with code -32603 and data.reason turn_failed", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "provider failed: 429 rate limit exceeded",
+          data: { reason: "turn_failed" },
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseTurnFailedError);
+      const err = await p.catch((e) => e);
+      expect(err).toBeInstanceOf(GooseTurnFailedError);
+      expect(err.code).toBe(-32603);
+      expect(err.errorMessage).toBe("provider failed: 429 rate limit exceeded");
+      expect(err.errorKind).toBe("goose-turn-failed");
+    });
+
+    it("throws GooseTurnFailedError for auth failures with code -32000 and data.reason turn_failed", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32000,
+          message: "authentication failed",
+          data: { reason: "turn_failed" },
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseTurnFailedError);
+      const err = await p.catch((e) => e);
+      expect(err.code).toBe(-32000);
+      expect(err.errorMessage).toBe("authentication failed");
+      expect(err.errorKind).toBe("goose-turn-failed");
+    });
+
+    it("surfaces data.kind and data.message on GooseTurnFailedError when present", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "fallback provider error",
+          data: {
+            reason: "turn_failed",
+            kind: "turn_failed_network",
+            message: "Connection closed by peer",
+          },
+        },
+      });
+
+      const err = await p.catch((e) => e);
+      expect(err).toBeInstanceOf(GooseTurnFailedError);
+      expect(err.errorMessage).toBe("Connection closed by peer");
+      expect(err.errorKind).toBe("turn_failed_network");
+    });
+
+    it("throws standard GooseProtocolError when session/prompt errors with -32603 without turn_failed reason", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "Internal transport error",
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseProtocolError);
+      const err = await p.catch((e) => e);
+      expect(err).not.toBeInstanceOf(GooseTurnFailedError);
+      expect(err.code).toBe(-32603);
     });
   });
 

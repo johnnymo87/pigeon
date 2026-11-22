@@ -65,6 +65,8 @@ export interface GooseReceipt {
   text?: string;
   /** Honk cancel reason from `_meta.honk.reason` when present. */
   honkReason?: string;
+  /** Patched goose 1.54 failed turn indicator from `_meta.goose.turnError`. */
+  turnError?: { kind?: string; message?: string };
 }
 /** Session already has a run; use {@link GooseAcpClient.steer} with this id. */
 export interface GooseBusy {
@@ -159,6 +161,62 @@ export class GooseProtocolError extends Error {
     this.code = code;
     this.data = data;
   }
+}
+
+export interface TurnFailedData {
+  reason?: string;
+  kind?: string;
+  message?: string;
+}
+
+export function parseTurnFailedData(data: unknown): TurnFailedData | null {
+  if (!data) return null;
+  let parsed: unknown = data;
+  if (typeof data === "string") {
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof parsed === "object" && parsed !== null) {
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.reason === "string") {
+      return {
+        reason: obj.reason,
+        kind: typeof obj.kind === "string" ? obj.kind : undefined,
+        message: typeof obj.message === "string" ? obj.message : undefined,
+      };
+    }
+  }
+  return null;
+}
+
+/** A session/prompt error indicating that the turn failed during execution (upstream #13043). */
+export class GooseTurnFailedError extends GooseProtocolError {
+  readonly turnFailed = true;
+  readonly errorKind: string;
+  readonly errorMessage: string;
+
+  constructor(code: number, rawMessage: string, data: unknown) {
+    const parsed = parseTurnFailedData(data);
+    const message = parsed?.message ?? rawMessage;
+    const kind = parsed?.kind ?? "goose-turn-failed";
+    const dataStr = typeof data === "string" ? data : data !== undefined ? JSON.stringify(data) : undefined;
+    super(code, message, dataStr);
+    this.name = "GooseTurnFailedError";
+    this.message = message;
+    this.errorKind = kind;
+    this.errorMessage = message;
+  }
+}
+
+export function isTurnFailedError(err: unknown): err is GooseTurnFailedError {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      (err instanceof GooseTurnFailedError || (err as any).turnFailed === true),
+  );
 }
 
 /**
@@ -280,6 +338,19 @@ export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [
 ];
 
 /**
+ * Extensions that are requested by default, but whose omission from
+ * `extensionResults` is tolerated.
+ *
+ * goose 1.60.2 removed the platform `skills` extension (skills are now a
+ * built-in `load_skill` tool). goose 1.60 silently drops a requested `skills`
+ * extension, so `session/new`'s `extensionResults` has no `skills` entry.
+ * goose 1.54 has the platform extension and reports it. Treating it as optional
+ * allows pigeon to work against both versions without weakening checks for
+ * `developer`, `analyze`, or `todo`.
+ */
+export const DEFAULT_OPTIONAL_EXTENSIONS: string[] = ["skills"];
+
+/**
  * What a bare `goose serve` loads unconditionally, and therefore what the
  * verification below must not mistake for surplus.
  *
@@ -335,6 +406,11 @@ export interface GooseAcpClientOptions {
    * surplus from floor. Override when the serve runs with `--with-builtin`.
    */
   serveFloor?: string[];
+  /**
+   * Extensions that may be omitted from `extensionResults` without failing
+   * containment verification. Defaults to DEFAULT_OPTIONAL_EXTENSIONS.
+   */
+  optionalExtensions?: string[];
   /**
    * Defaults to REFUSING. The lane's whole safety model is about what the agent
    * may do unattended, so a client that silently allowed anything a serve asked
@@ -888,6 +964,12 @@ export class GooseAcpClient {
       ...requested.map((e) => e.name),
     ];
     const expected = new Set(expectedNames.map(normaliseExtensionName));
+    const optional = new Set(
+      (this.opts.optionalExtensions ?? DEFAULT_OPTIONAL_EXTENSIONS).map(normaliseExtensionName),
+    );
+    const reportedNames = new Set(
+      reported.map((r) => normaliseExtensionName(String(r?.name ?? ""))),
+    );
     const loaded = new Set(
       reported
         .filter((r) => r?.success !== false)
@@ -898,7 +980,15 @@ export class GooseAcpClient {
       .filter((name) => name && !expected.has(normaliseExtensionName(name)))
       .sort();
     const missing = [...new Set(expectedNames)]
-      .filter((name) => !loaded.has(normaliseExtensionName(name)))
+      .filter((name) => {
+        const norm = normaliseExtensionName(name);
+        if (loaded.has(norm)) return false;
+        // An optional extension completely omitted from extensionResults is tolerated
+        // (e.g. goose 1.60.2 removed the platform skills extension and silently drops it).
+        // However, a reported failure (success: false) of any expected extension remains fatal.
+        if (optional.has(norm) && !reportedNames.has(norm)) return false;
+        return true;
+      })
       .sort();
     if (surplus.length === 0 && missing.length === 0) return;
 
@@ -990,7 +1080,8 @@ export class GooseAcpClient {
         });
         return { kind: "unknown-request" };
       }
-      const busy = BUSY_RUN_ID.exec(res.error.data ?? "");
+      const dataStr = typeof res.error.data === "string" ? res.error.data : res.error.data !== undefined ? JSON.stringify(res.error.data) : undefined;
+      const busy = BUSY_RUN_ID.exec(dataStr ?? "");
       if (busy) {
         const runId = busy[1]!;
         const track = this.getOrCreateTrack(sessionId);
@@ -1004,7 +1095,20 @@ export class GooseAcpClient {
         this.log("goose session busy", { sessionId, runId });
         return { kind: "busy", runId };
       }
-      throw new GooseProtocolError(res.error.code, res.error.message, res.error.data);
+      const turnFailed = parseTurnFailedData(res.error.data);
+      if (turnFailed?.reason === "turn_failed") {
+        if (!this.honk) {
+          const track = this.getOrCreateTrack(sessionId);
+          track.lastEchoCrid = undefined;
+          this.updateRunState(sessionId, track, {
+            state: "idle",
+            runId: undefined,
+            ownership: "unknown",
+          });
+        }
+        throw new GooseTurnFailedError(res.error.code, res.error.message, res.error.data);
+      }
+      throw new GooseProtocolError(res.error.code, res.error.message, dataStr);
     }
     const stopReason = res.result?.stopReason;
     if (typeof stopReason !== "string") {
@@ -1025,12 +1129,20 @@ export class GooseAcpClient {
     const honk = (res.result?._meta as { honk?: { text?: unknown; reason?: unknown } } | undefined)?.honk;
     const honkText = honk?.text;
     const honkReason = honk?.reason;
+    const gooseTurnError = (res.result?._meta as { goose?: { turnError?: { kind?: unknown; message?: unknown } } } | undefined)?.goose?.turnError;
+    const turnError = gooseTurnError && typeof gooseTurnError === "object"
+      ? {
+          kind: typeof (gooseTurnError as any).kind === "string" ? (gooseTurnError as any).kind : undefined,
+          message: typeof (gooseTurnError as any).message === "string" ? (gooseTurnError as any).message : undefined,
+        }
+      : undefined;
     return {
       kind: "receipt",
       stopReason,
       usage: res.result?.usage,
       ...(typeof honkText === "string" ? { text: honkText } : {}),
       ...(typeof honkReason === "string" ? { honkReason } : {}),
+      ...(turnError ? { turnError } : {}),
     };
   }
 

@@ -1,8 +1,9 @@
 import type { StorageDb } from "../storage/database.js";
 import { notifySenderOfFailure } from "./notify-sender.js";
+import { clampPreservingSurrogates } from "../text.js";
 
 export type SwarmSettleOutcome =
-  | { kind: "delivered" }
+  | { kind: "delivered"; turnError?: { kind?: string; message?: string } }
   | { kind: "not_delivered"; reason: string; customPayload?: string }
   | { kind: "unconfirmed"; reason: string };
 
@@ -13,6 +14,7 @@ export type SwarmSettleCallback = (msgId: string, outcome: SwarmSettleOutcome) =
  *
  * Exactly one outcome per message:
  * - delivered: marks the swarm row verified (refuses already-failed rows) so cleanupOlderThan can reap it.
+ *   If turnError is provided, notifies the sender that the prompt was delivered but the turn failed.
  * - not_delivered: marks failed and notifies sender with "was NOT received ... resend" wording.
  * - unconfirmed: marks failed and notifies sender WITHOUT custom payload ("DELIVERY UNCONFIRMED ... Do NOT resend").
  */
@@ -23,7 +25,22 @@ export function settleSwarmMessage(
   now = Date.now(),
 ): void {
   if (outcome.kind === "delivered") {
-    storage.swarm.markVerified(msgId, now);
+    const verified = storage.swarm.markVerified(msgId, now);
+    if (verified && outcome.turnError) {
+      storage.db.transaction(() => {
+        const record = storage.swarm.getByMsgId(msgId);
+        if (!record) return;
+        const inbound = storage.relayInbound.get(msgId);
+        if (inbound && inbound.fromSession === record.fromSession && inbound.toSession === (record.toSession ?? null)) {
+          return;
+        }
+        const kind = outcome.turnError?.kind ?? "goose-turn-failed";
+        const rawMsg = outcome.turnError?.message ?? "turn failed";
+        const shortMsg = rawMsg.length > 300 ? `${clampPreservingSurrogates(rawMsg, 300)}...` : rawMsg;
+        const payload = `Delivered; the recipient's turn failed (${kind}): ${shortMsg}. It will see your message on its next turn; resend only if it needs a fresh turn.`;
+        notifySenderOfFailure(storage, record, `turn failed: ${kind}`, now, "present", payload);
+      })();
+    }
   } else if (outcome.kind === "not_delivered") {
     storage.db.transaction(() => {
       const record = storage.swarm.getByMsgId(msgId);
