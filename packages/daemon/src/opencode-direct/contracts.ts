@@ -8,22 +8,25 @@ export const OpencodeDirectMessageType = {
   QuestionReplyResult: "pigeon.question.reply.result",
 } as const;
 
-// The values the daemon SENDS. They keep their Telegram-era spelling for now: the
-// plugin validates incoming envelopes with isExecuteCommandEnvelope below and loads
-// it only at a serve restart, so a daemon that sent a name an older plugin does not
-// know would have every command refused. ACCEPTED_SOURCES already takes the
-// neutral names; switching these to them is the follow-up (pigeon-4ogz.14).
+// The values the daemon SENDS (neutral since pigeon-4ogz.33). The plugin validates
+// incoming envelopes with isExecuteCommandEnvelope below and loads it only at a
+// serve restart, so these were switched only once every serve and TUI on every
+// machine had restarted onto a plugin that accepts them (e2d5dd1, pigeon #248).
+// A plugin older than that refuses every command as INVALID_PAYLOAD.
 export const OpencodeDirectSource = {
-  ChatReply: "telegram-reply",
-  ChatCallback: "telegram-callback",
+  ChatReply: "chat-reply",
+  ChatCallback: "chat-callback",
   Manual: "manual",
 } as const;
 
-/** Every source an execute envelope may carry: the sent values plus their neutral names. */
+/**
+ * Every source an execute envelope may carry: the sent values plus the
+ * Telegram-era names a daemon older than pigeon-4ogz.33 still sends.
+ */
 export const ACCEPTED_SOURCES: ReadonlySet<string> = new Set([
   ...Object.values(OpencodeDirectSource),
-  "chat-reply",
-  "chat-callback",
+  "telegram-reply",
+  "telegram-callback",
 ]);
 
 export const AckRejectReason = {
@@ -60,7 +63,7 @@ export interface ExecuteCommandEnvelope {
   commandId: string;
   sessionId: string;
   command: string;
-  source: OpencodeDirectSource | "chat-reply" | "chat-callback";
+  source: OpencodeDirectSource | "telegram-reply" | "telegram-callback";
   issuedAt: number;
   deadlineMs?: number;
   metadata?: {

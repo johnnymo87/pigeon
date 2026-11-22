@@ -13,6 +13,7 @@ import {
 import {
   OPENCODE_DIRECT_PROTOCOL_VERSION,
   OpencodeDirectMessageType,
+  ACCEPTED_SOURCES,
   OpencodeDirectSource,
   isExecuteCommandEnvelope,
 } from "../src/opencode-direct/contracts";
@@ -198,9 +199,12 @@ describe("human-reply source rename (pigeon-4ogz.14)", () => {
       expect(isExecuteCommandEnvelope({ ...base, source: "slack-reply" })).toBe(false);
     });
 
-    it("still SENDS the legacy names until every plugin accepts the new ones", () => {
-      expect(OpencodeDirectSource.ChatReply).toBe("telegram-reply");
-      expect(OpencodeDirectSource.ChatCallback).toBe("telegram-callback");
+    it("SENDS the neutral names (pigeon-4ogz.33) and still accepts the legacy ones", () => {
+      expect(OpencodeDirectSource.ChatReply).toBe("chat-reply");
+      expect(OpencodeDirectSource.ChatCallback).toBe("chat-callback");
+      // A daemon older than pigeon-4ogz.33 still sends these to this plugin.
+      expect(ACCEPTED_SOURCES.has("telegram-reply")).toBe(true);
+      expect(ACCEPTED_SOURCES.has("telegram-callback")).toBe(true);
     });
   });
 });

@@ -160,10 +160,11 @@ at all (`provider`, `provider_error`, `provider call`), it still matches either 
 so a daemon older than #250 must never run against the current worker. The Telegram-shaped fields (`entities` in UTF-16 units,
 `replyMarkup.inline_keyboard`, `callback_data`, `messageThreadId`, and in answers `retryAfter` in
 seconds and `details.error_code`) are the permanent wire shape, not a rename waiting to happen: they are neutral
-enough, persisted in outbox payloads, and renaming them would change nothing. The `telegram-reply`
-and `telegram-callback` opencode-direct execute-envelope sources are still sent (a plugin loaded
-after `pigeon-4ogz.14` also accepts `chat-reply`/`chat-callback`, so switching is safe only once
-every serve has restarted onto it; a follow-up of `pigeon-4ogz.14`).
+enough, persisted in outbox payloads, and renaming them would change nothing. The opencode-direct
+execute-envelope sources the daemon sends are `chat-reply`/`chat-callback` since `pigeon-4ogz.33`
+(they were `telegram-reply`/`telegram-callback`); the plugin still accepts the old names, which a
+daemon older than that sends. A plugin loaded before e2d5dd1 (pigeon #248) refuses the new names, so
+never run such a plugin against a current daemon.
 
 The worker stores commands in D1 (Cloudflare's serverless SQLite). The daemon short-polls for commands via HTTP. No long-lived connections. If the worker restarts, the next poll succeeds against the new instance. If the daemon restarts, pending commands wait in D1 until it comes back.
 
