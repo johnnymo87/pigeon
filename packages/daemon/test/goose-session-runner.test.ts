@@ -3401,6 +3401,77 @@ describe("GooseSessionRunner session title", () => {
       expect(notices).toHaveLength(0);
     });
 
+    it("settles delivered with turnError: skips sending notice if markVerified returned false (row already failed)", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_already_failed",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "task that timed out",
+      }, now);
+      storage.swarm.markHandedOff("msg_already_failed", now);
+
+      // Watchdog marks it failed first
+      storage.swarm.markFailed("msg_already_failed", now + 10);
+
+      // Later, turn settles delivered with turnError
+      settleSwarmMessage(storage, "msg_already_failed", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      }, now + 20);
+
+      // No second notice sent to sender (markVerified returned false because row was not in handed_off)
+      const notices = storage.swarm.getReadyForTarget("ses_sender", now + 30, 10);
+      expect(notices).toHaveLength(0);
+    });
+
+    it("settles delivered with turnError: skips relay branch entirely for relayed messages", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      // Record relayed inbound message from machine "devbox"
+      storage.relayInbound.record({
+        msgId: "msg_relayed_turn_err",
+        fromMachine: "devbox",
+        fromSession: "ses_remoteSender",
+        toSession: "gse_coord",
+        fromLabel: null,
+      }, now);
+
+      storage.swarm.insert({
+        msgId: "msg_relayed_turn_err",
+        fromSession: "ses_remoteSender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "relayed task that fails turn",
+      }, now);
+      storage.swarm.markHandedOff("msg_relayed_turn_err", now);
+
+      settleSwarmMessage(storage, "msg_relayed_turn_err", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      }, now + 5);
+
+      // Swarm row is marked verified
+      const record = storage.swarm.getByMsgId("msg_relayed_turn_err");
+      expect(record?.verifiedAt).toBeDefined();
+
+      // Relay inbound failure was NOT queued (no relay notice, no markRelayFailed on origin)
+      const inbound = storage.relayInbound.get("msg_relayed_turn_err");
+      expect(inbound?.failReason).toBeNull();
+
+      // No local swarm message sent either
+      const notices = storage.swarm.getReadyForTarget("ses_remoteSender", now + 10, 10);
+      expect(notices).toHaveLength(0);
+    });
+
     it("settles not_delivered with NOT received wording and safe to resend advice", () => {
       const storage = openStorageDb(":memory:");
       const now = 1000;

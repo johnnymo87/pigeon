@@ -25,17 +25,20 @@ export function settleSwarmMessage(
   now = Date.now(),
 ): void {
   if (outcome.kind === "delivered") {
-    storage.swarm.markVerified(msgId, now);
-    if (outcome.turnError) {
+    const verified = storage.swarm.markVerified(msgId, now);
+    if (verified && outcome.turnError) {
       storage.db.transaction(() => {
         const record = storage.swarm.getByMsgId(msgId);
-        if (record) {
-          const kind = outcome.turnError?.kind ?? "goose-turn-failed";
-          const rawMsg = outcome.turnError?.message ?? "turn failed";
-          const shortMsg = rawMsg.length > 300 ? `${clampPreservingSurrogates(rawMsg, 300)}...` : rawMsg;
-          const payload = `Delivered; the recipient's turn failed (${kind}): ${shortMsg}. It will see your message on its next turn; resend only if it needs a fresh turn.`;
-          notifySenderOfFailure(storage, record, `turn failed: ${kind}`, now, "present", payload);
+        if (!record) return;
+        const inbound = storage.relayInbound.get(msgId);
+        if (inbound && inbound.fromSession === record.fromSession && inbound.toSession === (record.toSession ?? null)) {
+          return;
         }
+        const kind = outcome.turnError?.kind ?? "goose-turn-failed";
+        const rawMsg = outcome.turnError?.message ?? "turn failed";
+        const shortMsg = rawMsg.length > 300 ? `${clampPreservingSurrogates(rawMsg, 300)}...` : rawMsg;
+        const payload = `Delivered; the recipient's turn failed (${kind}): ${shortMsg}. It will see your message on its next turn; resend only if it needs a fresh turn.`;
+        notifySenderOfFailure(storage, record, `turn failed: ${kind}`, now, "present", payload);
       })();
     }
   } else if (outcome.kind === "not_delivered") {
