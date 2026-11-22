@@ -3144,7 +3144,13 @@ describe("GooseSessionRunner session title", () => {
       // Swarm message was delivered because goose received and executed the prompt
       expect(settledSwarm).toHaveLength(1);
       expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed");
-      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "goose-turn-failed",
+          message: "provider message: rate limit exceeded",
+        },
+      });
 
       // Human-facing Stop notification surfaces error event with provider message and goose-turn-failed
       expect(stops).toHaveLength(1);
@@ -3170,10 +3176,16 @@ describe("GooseSessionRunner session title", () => {
       );
       await runner.settled();
 
-      // Settled as delivered
+      // Settled as delivered with custom turnError
       expect(settledSwarm).toHaveLength(1);
       expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed_custom");
-      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "turn_failed_network",
+          message: "Network connection reset",
+        },
+      });
 
       // Human-facing error event uses custom kind and message
       expect(stops).toHaveLength(1);
@@ -3222,12 +3234,66 @@ describe("GooseSessionRunner session title", () => {
 
       expect(settledSwarm).toHaveLength(1);
       expect(settledSwarm[0]!.msgId).toBe("msg_154_turn_error");
-      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+      expect(settledSwarm[0]!.outcome).toEqual({
+        kind: "delivered",
+        turnError: {
+          kind: "turn_failed_provider",
+          message: "1.54 provider error",
+        },
+      });
 
       expect(stops).toHaveLength(1);
       expect(stops[0]!.event).toBe("Error");
       expect(stops[0]!.error_kind).toBe("turn_failed_provider");
       expect(stops[0]!.message).toContain("1.54 provider error");
+    });
+
+    it("dedupes error message when collected text already contains it (goose 1.60 streaming)", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("cmd_dedupe", "prompt that streams error");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60 streams error.message as an agent_message_chunk
+      runner.onUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { text: "Some explanation. 429 rate limit exceeded" },
+      });
+
+      // Then returns session/prompt error with the same message
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "429 rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      // The error message is not repeated
+      expect(stops[0]!.message).toBe("Some explanation. 429 rate limit exceeded");
+    });
+
+    it("appends error message when collected text does not contain it", async () => {
+      const { runner, client, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("cmd_no_dedupe", "prompt that streams partial");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose streams some text that doesn't have the error message
+      runner.onUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { text: "Thinking about the task..." },
+      });
+
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "429 rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.message).toBe("Thinking about the task...\n\n429 rate limit exceeded");
     });
 
     it("settles swarm message as unconfirmed when resent turn hits busy", async () => {
@@ -3277,6 +3343,62 @@ describe("GooseSessionRunner session title", () => {
       const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
       expect(notice?.payload).toContain("DELIVERY UNCONFIRMED");
       expect(notice?.payload).toContain("Do NOT resend it");
+    });
+
+    it("settles delivered with turnError: marks verified and notifies sender with distinct turn failed notice", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_turn_err",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "task that fails",
+      }, now);
+      storage.swarm.markHandedOff("msg_turn_err", now);
+
+      settleSwarmMessage(storage, "msg_turn_err", {
+        kind: "delivered",
+        turnError: { kind: "turn_failed_network", message: "Network connection reset" },
+      });
+
+      // Swarm row is marked verified (not failed)
+      const record = storage.swarm.getByMsgId("msg_turn_err");
+      expect(record?.verifiedAt).toBeDefined();
+      expect(record?.state).not.toBe("failed");
+
+      // Sender receives the distinct notice
+      const notice = storage.swarm.getReadyForTarget("ses_sender", now + 10, 1)[0];
+      expect(notice?.payload).toContain("Delivered; the recipient's turn failed (turn_failed_network): Network connection reset.");
+      expect(notice?.payload).toContain("It will see your message on its next turn; resend only if it needs a fresh turn.");
+    });
+
+    it("settles clean delivered with no turnError: marks verified and notifies nothing to sender", () => {
+      const storage = openStorageDb(":memory:");
+      const now = 1000;
+      storage.swarm.insert({
+        msgId: "msg_clean",
+        fromSession: "ses_sender",
+        toSession: "gse_coord",
+        channel: null,
+        kind: "chat",
+        priority: "normal",
+        replyTo: null,
+        payload: "clean task",
+      }, now);
+      storage.swarm.markHandedOff("msg_clean", now);
+
+      settleSwarmMessage(storage, "msg_clean", { kind: "delivered" });
+
+      const record = storage.swarm.getByMsgId("msg_clean");
+      expect(record?.verifiedAt).toBeDefined();
+
+      // Sender receives nothing
+      const notices = storage.swarm.getReadyForTarget("ses_sender", now + 10, 10);
+      expect(notices).toHaveLength(0);
     });
 
     it("settles not_delivered with NOT received wording and safe to resend advice", () => {

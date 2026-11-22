@@ -1826,13 +1826,13 @@ export class GooseSessionRunner {
         message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (turnFailed) {
         const detail = err.errorMessage;
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : message.includes(detail) ? message : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : message.includes(detail) ? message : `${message}\n\n${detail}`;
       } else if (turnError !== undefined) {
         const detail = turnError.message ?? "turn failed";
-        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+        message = message === "" || emptyReceipt ? detail : message.includes(detail) ? message : `${message}\n\n${detail}`;
       } else {
         const detail = honkReasonDetail(receipt?.stopReason, receipt?.honkReason);
         if (detail !== undefined) {
@@ -1853,7 +1853,23 @@ export class GooseSessionRunner {
       }
 
       if (turnFailed) {
-        this.settleSwarmTurn(turn, { kind: "delivered" }, true);
+        const turnErrorDetail = {
+          kind: err.errorKind,
+          message: err.errorMessage,
+        };
+        this.settleSwarmTurn(turn, { kind: "delivered", turnError: turnErrorDetail }, true);
+      } else if (turnError !== undefined) {
+        this.settleSwarmTurn(
+          turn,
+          {
+            kind: "delivered",
+            turnError: {
+              kind: turnError.kind ?? "goose-turn-failed",
+              message: turnError.message ?? "turn failed",
+            },
+          },
+          true,
+        );
       } else if (err !== undefined) {
         if (
           err instanceof Error &&
