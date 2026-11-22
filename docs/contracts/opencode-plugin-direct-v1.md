@@ -25,7 +25,7 @@ For OpenCode sessions, daemon routes inbound chat commands to this backend.
   "commandId": "cmd-uuid",
   "sessionId": "session-id",
   "command": "echo hello",
-  "source": "telegram-reply",
+  "source": "chat-reply",
   "issuedAt": 1739383871000,
   "deadlineMs": 30000,
   "metadata": {
@@ -36,9 +36,11 @@ For OpenCode sessions, daemon routes inbound chat commands to this backend.
 }
 ```
 
-`source` is one of `telegram-reply`, `telegram-callback`, `manual` (what the daemon sends today)
-or `chat-reply`, `chat-callback` (their neutral names, accepted by the plugin since
-`pigeon-4ogz.14`; the daemon switches to them once every serve has restarted onto that plugin).
+`source` is one of `chat-reply`, `chat-callback`, `manual` (what the daemon sends since
+`pigeon-4ogz.33`) or `telegram-reply`, `telegram-callback` (their Telegram-era names, sent by older
+daemons and still accepted by the plugin). A plugin older than e2d5dd1 (pigeon #248) accepts only
+the Telegram-era names. The daemon and the plugin both load this file from the primary
+checkout, so rolling that checkout back past #248 must restart the daemon and every serve together.
 
 ## Ack Message (plugin -> daemon)
 

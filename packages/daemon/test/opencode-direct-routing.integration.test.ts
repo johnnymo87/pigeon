@@ -248,7 +248,7 @@ describe("opencode direct-channel routing integration", () => {
     storage.db.close();
   });
 
-  it("sends all text commands with telegram-reply source", async () => {
+  it("sends all text commands with chat-reply source", async () => {
     let capturedCommand: unknown = null;
     const onExecute = vi.fn(async (req: unknown) => {
       capturedCommand = req;
@@ -274,7 +274,7 @@ describe("opencode direct-channel routing integration", () => {
 
     expect(onExecute).toHaveBeenCalledTimes(1);
     expect(capturedCommand).toMatchObject({
-      source: "telegram-reply",
+      source: "chat-reply",
       command: "continue",
     });
     storage.db.close();
