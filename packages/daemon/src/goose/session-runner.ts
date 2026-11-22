@@ -51,7 +51,14 @@
 import { backendSessionIdOf } from "../storage/types.js";
 import type { SessionRecord } from "../storage/types.js";
 import type { GooseInflightRecord, GooseInflightStore } from "../storage/goose-inflight-repo.js";
-import { DisconnectedDuringTurn, type RunOwnership, type RunState, type RunStateInfo } from "./acp-client.js";
+import {
+  DisconnectedDuringTurn,
+  GooseTurnFailedError,
+  isTurnFailedError,
+  type RunOwnership,
+  type RunState,
+  type RunStateInfo,
+} from "./acp-client.js";
 import {
   capText,
   DEFAULT_MAX_TRANSCRIPT_BYTES,
@@ -1763,7 +1770,9 @@ export class GooseSessionRunner {
 
     try {
       const stopReason = receipt?.stopReason;
-      const failed = err !== undefined || (stopReason !== undefined && stopReason !== "end_turn");
+      const turnError = (receipt as any)?.turnError;
+      const turnFailed = isTurnFailedError(err);
+      const failed = err !== undefined || turnError !== undefined || (stopReason !== undefined && stopReason !== "end_turn");
 
       const cap = this.opts.maxTranscriptBytes ?? DEFAULT_MAX_TRANSCRIPT_BYTES;
       let message: string;
@@ -1815,8 +1824,14 @@ export class GooseSessionRunner {
           + `closes, so this turn was cancelled and will not finish. ${advice}`
           + ` (close code ${err.closeCode}${err.runId ? `, run ${err.runId}` : ""})`;
         message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+      } else if (turnFailed) {
+        const detail = err.errorMessage;
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else if (err !== undefined) {
         const detail = err instanceof Error ? err.message : String(err);
+        message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
+      } else if (turnError !== undefined) {
+        const detail = turnError.message ?? "turn failed";
         message = message === "" || emptyReceipt ? detail : `${message}\n\n${detail}`;
       } else {
         const detail = honkReasonDetail(receipt?.stopReason, receipt?.honkReason);
@@ -1837,7 +1852,9 @@ export class GooseSessionRunner {
         }
       }
 
-      if (err !== undefined) {
+      if (turnFailed) {
+        this.settleSwarmTurn(turn, { kind: "delivered" }, true);
+      } else if (err !== undefined) {
         if (
           err instanceof Error &&
           err.message.includes("a swarm message to this goose session was not delivered")
@@ -1865,9 +1882,13 @@ export class GooseSessionRunner {
               error_kind:
                 err instanceof DisconnectedDuringTurn
                   ? "goose-turn-disconnected"
-                  : err !== undefined
-                    ? "goose-turn-failed"
-                    : `goose-stop-${stopReason}`,
+                  : turnFailed
+                    ? err.errorKind
+                    : turnError !== undefined
+                      ? turnError.kind ?? "goose-turn-failed"
+                      : err !== undefined
+                        ? "goose-turn-failed"
+                        : `goose-stop-${stopReason}`,
             }
           : {}),
       });

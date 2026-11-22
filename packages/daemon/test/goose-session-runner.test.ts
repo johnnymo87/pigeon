@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { openStorageDb } from "../src/storage/database.js";
 import { settleSwarmMessage } from "../src/swarm/swarm-settle.js";
 import { GooseSessionRunner, GooseRunnerRegistry, gooseShutdownNotice } from "../src/goose/session-runner.js";
-import { DisconnectedDuringTurn, GooseProtocolError } from "../src/goose/acp-client.js";
+import { DisconnectedDuringTurn, GooseProtocolError, GooseTurnFailedError } from "../src/goose/acp-client.js";
 import type { SessionRecord } from "../src/storage/types.js";
 import type { GooseInflightStore, GooseInflightRecord, InsertGooseInflightInput } from "../src/storage/goose-inflight-repo.js";
 
@@ -3126,6 +3126,108 @@ describe("GooseSessionRunner session title", () => {
       expect(settledSwarm[0]!.outcome).toEqual(
         expect.objectContaining({ kind: "unconfirmed" }),
       );
+    });
+
+    it("settles swarm message as delivered and surfaces error when turn fails with turn_failed error (-32603)", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_turn_failed", "failing prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60.2 turn_failed error
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "provider message: rate limit exceeded", { reason: "turn_failed" }),
+      );
+      await runner.settled();
+
+      // Swarm message was delivered because goose received and executed the prompt
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+
+      // Human-facing Stop notification surfaces error event with provider message and goose-turn-failed
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("provider message: rate limit exceeded");
+    });
+
+    it("surfaces custom data.kind and data.message on turn_failed error", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_turn_failed_custom", "custom failing prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Goose 1.60.2 with our port's data.kind and data.message
+      client.failTurn(
+        new GooseTurnFailedError(-32603, "fallback provider message", {
+          reason: "turn_failed",
+          kind: "turn_failed_network",
+          message: "Network connection reset",
+        }),
+      );
+      await runner.settled();
+
+      // Settled as delivered
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_turn_failed_custom");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+
+      // Human-facing error event uses custom kind and message
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("turn_failed_network");
+      expect(stops[0]!.message).toContain("Network connection reset");
+    });
+
+    it("settles swarm message as unconfirmed when session/prompt fails without turn_failed reason", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_internal_err", "internal error prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // A -32603 without turn_failed reason (e.g. transport/internal)
+      client.failTurn(new GooseProtocolError(-32603, "Internal transport error"));
+      await runner.settled();
+
+      // Keeps unconfirmed behaviour
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_internal_err");
+      expect(settledSwarm[0]!.outcome).toEqual(
+        expect.objectContaining({ kind: "unconfirmed" }),
+      );
+
+      // Error event is still posted
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("goose-turn-failed");
+      expect(stops[0]!.message).toContain("Internal transport error");
+    });
+
+    it("settles swarm message as delivered and surfaces error on 1.54 turnError receipt", async () => {
+      const { runner, client, settledSwarm, stops } = makeRunner();
+      client.isHonk = false;
+
+      await runner.deliver("swarm:msg_154_turn_error", "1.54 prompt");
+      expect(client.liveTurns).toBe(1);
+
+      // Old 1.54 shape: success with stopReason end_turn and turnError
+      client.finishTurn("end_turn", {
+        turnError: { kind: "turn_failed_provider", message: "1.54 provider error" },
+      });
+      await runner.settled();
+
+      expect(settledSwarm).toHaveLength(1);
+      expect(settledSwarm[0]!.msgId).toBe("msg_154_turn_error");
+      expect(settledSwarm[0]!.outcome).toEqual({ kind: "delivered" });
+
+      expect(stops).toHaveLength(1);
+      expect(stops[0]!.event).toBe("Error");
+      expect(stops[0]!.error_kind).toBe("turn_failed_provider");
+      expect(stops[0]!.message).toContain("1.54 provider error");
     });
 
     it("settles swarm message as unconfirmed when resent turn hits busy", async () => {

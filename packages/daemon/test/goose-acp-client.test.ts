@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   GooseAcpClient,
   GooseProtocolError,
+  GooseTurnFailedError,
   ALLOWED_ACP_METHODS,
   DEFAULT_SESSION_EXTENSIONS,
   DEFAULT_OPTIONAL_EXTENSIONS,
@@ -2215,6 +2216,108 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       expect(outcome).toEqual({
         kind: "unknown-request",
       });
+    });
+
+    it("throws GooseTurnFailedError when session/prompt errors with code -32603 and data.reason turn_failed", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "provider failed: 429 rate limit exceeded",
+          data: { reason: "turn_failed" },
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseTurnFailedError);
+      const err = await p.catch((e) => e);
+      expect(err).toBeInstanceOf(GooseTurnFailedError);
+      expect(err.code).toBe(-32603);
+      expect(err.errorMessage).toBe("provider failed: 429 rate limit exceeded");
+      expect(err.errorKind).toBe("goose-turn-failed");
+    });
+
+    it("throws GooseTurnFailedError for auth failures with code -32000 and data.reason turn_failed", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32000,
+          message: "authentication failed",
+          data: { reason: "turn_failed" },
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseTurnFailedError);
+      const err = await p.catch((e) => e);
+      expect(err.code).toBe(-32000);
+      expect(err.errorMessage).toBe("authentication failed");
+      expect(err.errorKind).toBe("goose-turn-failed");
+    });
+
+    it("surfaces data.kind and data.message on GooseTurnFailedError when present", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "fallback provider error",
+          data: {
+            reason: "turn_failed",
+            kind: "turn_failed_network",
+            message: "Connection closed by peer",
+          },
+        },
+      });
+
+      const err = await p.catch((e) => e);
+      expect(err).toBeInstanceOf(GooseTurnFailedError);
+      expect(err.errorMessage).toBe("Connection closed by peer");
+      expect(err.errorKind).toBe("turn_failed_network");
+    });
+
+    it("throws standard GooseProtocolError when session/prompt errors with -32603 without turn_failed reason", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const client = makeClient(peer);
+      await client.connect();
+
+      const p = client.prompt("sess-1", "test prompt");
+      const req = peer.lastOf("session/prompt")!;
+      peer.emit({
+        jsonrpc: "2.0",
+        id: req.id,
+        error: {
+          code: -32603,
+          message: "Internal transport error",
+        },
+      });
+
+      await expect(p).rejects.toThrow(GooseProtocolError);
+      const err = await p.catch((e) => e);
+      expect(err).not.toBeInstanceOf(GooseTurnFailedError);
+      expect(err.code).toBe(-32603);
     });
   });
 

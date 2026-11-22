@@ -65,6 +65,8 @@ export interface GooseReceipt {
   text?: string;
   /** Honk cancel reason from `_meta.honk.reason` when present. */
   honkReason?: string;
+  /** Patched goose 1.54 failed turn indicator from `_meta.goose.turnError`. */
+  turnError?: { kind?: string; message?: string };
 }
 /** Session already has a run; use {@link GooseAcpClient.steer} with this id. */
 export interface GooseBusy {
@@ -159,6 +161,62 @@ export class GooseProtocolError extends Error {
     this.code = code;
     this.data = data;
   }
+}
+
+export interface TurnFailedData {
+  reason?: string;
+  kind?: string;
+  message?: string;
+}
+
+export function parseTurnFailedData(data: unknown): TurnFailedData | null {
+  if (!data) return null;
+  let parsed: unknown = data;
+  if (typeof data === "string") {
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof parsed === "object" && parsed !== null) {
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.reason === "string") {
+      return {
+        reason: obj.reason,
+        kind: typeof obj.kind === "string" ? obj.kind : undefined,
+        message: typeof obj.message === "string" ? obj.message : undefined,
+      };
+    }
+  }
+  return null;
+}
+
+/** A session/prompt error indicating that the turn failed during execution (upstream #13043). */
+export class GooseTurnFailedError extends GooseProtocolError {
+  readonly turnFailed = true;
+  readonly errorKind: string;
+  readonly errorMessage: string;
+
+  constructor(code: number, rawMessage: string, data: unknown) {
+    const parsed = parseTurnFailedData(data);
+    const message = parsed?.message ?? rawMessage;
+    const kind = parsed?.kind ?? "goose-turn-failed";
+    const dataStr = typeof data === "string" ? data : data !== undefined ? JSON.stringify(data) : undefined;
+    super(code, message, dataStr);
+    this.name = "GooseTurnFailedError";
+    this.message = message;
+    this.errorKind = kind;
+    this.errorMessage = message;
+  }
+}
+
+export function isTurnFailedError(err: unknown): err is GooseTurnFailedError {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      (err instanceof GooseTurnFailedError || (err as any).turnFailed === true),
+  );
 }
 
 /**
@@ -1022,7 +1080,8 @@ export class GooseAcpClient {
         });
         return { kind: "unknown-request" };
       }
-      const busy = BUSY_RUN_ID.exec(res.error.data ?? "");
+      const dataStr = typeof res.error.data === "string" ? res.error.data : res.error.data !== undefined ? JSON.stringify(res.error.data) : undefined;
+      const busy = BUSY_RUN_ID.exec(dataStr ?? "");
       if (busy) {
         const runId = busy[1]!;
         const track = this.getOrCreateTrack(sessionId);
@@ -1036,7 +1095,20 @@ export class GooseAcpClient {
         this.log("goose session busy", { sessionId, runId });
         return { kind: "busy", runId };
       }
-      throw new GooseProtocolError(res.error.code, res.error.message, res.error.data);
+      const turnFailed = parseTurnFailedData(res.error.data);
+      if (turnFailed?.reason === "turn_failed") {
+        if (!this.honk) {
+          const track = this.getOrCreateTrack(sessionId);
+          track.lastEchoCrid = undefined;
+          this.updateRunState(sessionId, track, {
+            state: "idle",
+            runId: undefined,
+            ownership: "unknown",
+          });
+        }
+        throw new GooseTurnFailedError(res.error.code, res.error.message, res.error.data);
+      }
+      throw new GooseProtocolError(res.error.code, res.error.message, dataStr);
     }
     const stopReason = res.result?.stopReason;
     if (typeof stopReason !== "string") {
@@ -1057,12 +1129,20 @@ export class GooseAcpClient {
     const honk = (res.result?._meta as { honk?: { text?: unknown; reason?: unknown } } | undefined)?.honk;
     const honkText = honk?.text;
     const honkReason = honk?.reason;
+    const gooseTurnError = (res.result?._meta as { goose?: { turnError?: { kind?: unknown; message?: unknown } } } | undefined)?.goose?.turnError;
+    const turnError = gooseTurnError && typeof gooseTurnError === "object"
+      ? {
+          kind: typeof (gooseTurnError as any).kind === "string" ? (gooseTurnError as any).kind : undefined,
+          message: typeof (gooseTurnError as any).message === "string" ? (gooseTurnError as any).message : undefined,
+        }
+      : undefined;
     return {
       kind: "receipt",
       stopReason,
       usage: res.result?.usage,
       ...(typeof honkText === "string" ? { text: honkText } : {}),
       ...(typeof honkReason === "string" ? { honkReason } : {}),
+      ...(turnError ? { turnError } : {}),
     };
   }
 
