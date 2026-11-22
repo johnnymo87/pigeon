@@ -80,7 +80,7 @@ async function main(): Promise<void> {
     log: (m, f) => console.log(`      [runner] ${m}`, f ?? ""),
   });
 
-  const adapter = new GooseAcpAdapter({ runnerFor: () => runner! });
+  const adapter = new GooseAcpAdapter({ runnerFor: () => runner!, allowedSenderIds: new Set<string>() });
 
   // --- 2. THE lease property: delivery returns while the turn runs.
   console.log("\n2. deliver a slow turn and check we return before it finishes");
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
 
   // --- 6. a wrong token must be a permanent refusal, never a throw.
   console.log("\n4. a wrong token is a permanent refusal, not a retryable throw");
-  const badAdapter = new GooseAcpAdapter({ runnerFor: () => runner! });
+  const badAdapter = new GooseAcpAdapter({ runnerFor: () => runner!, allowedSenderIds: new Set<string>() });
   const badSession = { ...session, backendAuthToken: "definitely-not-the-token" } as SessionRecord;
   let threw = false;
   let outcome: { ok?: boolean; error?: string } = {};
