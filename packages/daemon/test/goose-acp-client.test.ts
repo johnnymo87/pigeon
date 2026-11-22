@@ -4,6 +4,7 @@ import {
   GooseProtocolError,
   ALLOWED_ACP_METHODS,
   DEFAULT_SESSION_EXTENSIONS,
+  DEFAULT_OPTIONAL_EXTENSIONS,
   DEFAULT_SERVE_FLOOR,
   DisconnectedDuringTurn,
   ownRunPolicy,
@@ -1842,7 +1843,29 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
       { type: "platform", name: "todo" },
       { type: "platform", name: "skills" },
     ]);
+    expect(DEFAULT_OPTIONAL_EXTENSIONS).toEqual(["skills"]);
     expect(DEFAULT_SERVE_FLOOR).toEqual(["developer"]);
+  });
+
+  it("accepts a session/new response whose extensionResults lack skills (goose 1.60 compatibility)", async () => {
+    // goose 1.60.2 removed the platform `skills` extension (skills are built in).
+    // It silently drops `skills` from the request, so extensionResults has no `skills` entry.
+    // The client treats skills as optional: missing from extensionResults is not fatal.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).resolves.toBe("sess-1");
+  });
+
+  it("allows configuring optionalExtensions (e.g. disabling them)", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"]);
+    const client = makeClient(peer, { optionalExtensions: [] });
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*skills/i);
   });
 
   it("refuses a session MISSING a requested extension -- the shell-less session", async () => {
@@ -1855,6 +1878,29 @@ describe("R9: session/new is a containment decision, not a transport detail", ()
     await client.connect();
 
     await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*developer/i);
+  });
+
+  it("refuses a session missing developer even when skills is also absent", async () => {
+    const peer = new FakePeer();
+    autoHandshake(peer, ["analyze", "todo"]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/missing.*developer/i);
+  });
+
+  it("refuses a session where an optional extension reported success:false", async () => {
+    // Missing from extensionResults is tolerated for optional extensions, but a
+    // reported failure is not: if the serve attempted to load it and failed, that
+    // is still a bad state.
+    const peer = new FakePeer();
+    autoHandshake(peer, ["developer", "analyze", "todo"], [
+      { name: "skills", success: false, error: "failed to load skills" },
+    ]);
+    const client = makeClient(peer);
+    await client.connect();
+
+    await expect(client.newSession("/tmp/x")).rejects.toThrow(/skills/);
   });
 
   it("refuses a session missing a FLOOR extension it was told to expect", async () => {

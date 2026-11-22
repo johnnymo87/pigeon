@@ -280,6 +280,19 @@ export const DEFAULT_SESSION_EXTENSIONS: GooseExtensionSpec[] = [
 ];
 
 /**
+ * Extensions that are requested by default, but whose omission from
+ * `extensionResults` is tolerated.
+ *
+ * goose 1.60.2 removed the platform `skills` extension (skills are now a
+ * built-in `load_skill` tool). goose 1.60 silently drops a requested `skills`
+ * extension, so `session/new`'s `extensionResults` has no `skills` entry.
+ * goose 1.54 has the platform extension and reports it. Treating it as optional
+ * allows pigeon to work against both versions without weakening checks for
+ * `developer`, `analyze`, or `todo`.
+ */
+export const DEFAULT_OPTIONAL_EXTENSIONS: string[] = ["skills"];
+
+/**
  * What a bare `goose serve` loads unconditionally, and therefore what the
  * verification below must not mistake for surplus.
  *
@@ -335,6 +348,11 @@ export interface GooseAcpClientOptions {
    * surplus from floor. Override when the serve runs with `--with-builtin`.
    */
   serveFloor?: string[];
+  /**
+   * Extensions that may be omitted from `extensionResults` without failing
+   * containment verification. Defaults to DEFAULT_OPTIONAL_EXTENSIONS.
+   */
+  optionalExtensions?: string[];
   /**
    * Defaults to REFUSING. The lane's whole safety model is about what the agent
    * may do unattended, so a client that silently allowed anything a serve asked
@@ -888,6 +906,12 @@ export class GooseAcpClient {
       ...requested.map((e) => e.name),
     ];
     const expected = new Set(expectedNames.map(normaliseExtensionName));
+    const optional = new Set(
+      (this.opts.optionalExtensions ?? DEFAULT_OPTIONAL_EXTENSIONS).map(normaliseExtensionName),
+    );
+    const reportedNames = new Set(
+      reported.map((r) => normaliseExtensionName(String(r?.name ?? ""))),
+    );
     const loaded = new Set(
       reported
         .filter((r) => r?.success !== false)
@@ -898,7 +922,15 @@ export class GooseAcpClient {
       .filter((name) => name && !expected.has(normaliseExtensionName(name)))
       .sort();
     const missing = [...new Set(expectedNames)]
-      .filter((name) => !loaded.has(normaliseExtensionName(name)))
+      .filter((name) => {
+        const norm = normaliseExtensionName(name);
+        if (loaded.has(norm)) return false;
+        // An optional extension completely omitted from extensionResults is tolerated
+        // (e.g. goose 1.60.2 removed the platform skills extension and silently drops it).
+        // However, a reported failure (success: false) of any expected extension remains fatal.
+        if (optional.has(norm) && !reportedNames.has(norm)) return false;
+        return true;
+      })
       .sort();
     if (surplus.length === 0 && missing.length === 0) return;
 
