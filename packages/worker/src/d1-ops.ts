@@ -7,12 +7,13 @@
 
 import { transportForChat } from "./chat";
 import { allSlackWorkspaces, slackChatId } from "./chat/slack-config";
+import { HEARTBEAT_WRITE_INTERVAL_MS, MACHINE_ONLINE_MS } from "./machine-liveness";
 import { MAX_SESSIONS } from "./sessions";
 
 export const LEASE_TIMEOUT_MS = 60_000; // 60s lease expiry
 export const MAX_QUEUE_PER_MACHINE = 100;
 
-const DEFAULT_MACHINE_THRESHOLD_MS = 60_000; // 60s for "is machine online"
+const DEFAULT_MACHINE_THRESHOLD_MS = MACHINE_ONLINE_MS;
 
 // ─── generateCommandId ────────────────────────────────────────────────────────
 
@@ -220,20 +221,35 @@ export async function ackCommand(
 // ─── touchMachine ─────────────────────────────────────────────────────────────
 
 /**
- * Update the machine's last_poll_at timestamp (upsert).
+ * The machine heartbeat upsert. It writes only when the stored `last_poll_at` is at least
+ * HEARTBEAT_WRITE_INTERVAL_MS old, or is in the future (so a bad value cannot make a dead
+ * machine look online until real time catches up). A no-op upsert costs 0 rows written.
+ * See machine-liveness.ts.
+ */
+export function touchMachineStatement(
+  db: D1Database,
+  machineId: string,
+  now: number = Date.now(),
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO machines (machine_id, last_poll_at) VALUES (?, ?)
+       ON CONFLICT (machine_id) DO UPDATE SET last_poll_at = excluded.last_poll_at
+       WHERE excluded.last_poll_at - machines.last_poll_at >= ?
+          OR excluded.last_poll_at < machines.last_poll_at`,
+    )
+    .bind(machineId, now, HEARTBEAT_WRITE_INTERVAL_MS);
+}
+
+/**
+ * Record the machine's poll in last_poll_at (throttled; see touchMachineStatement).
  */
 export async function touchMachine(
   db: D1Database,
   machineId: string,
   now: number = Date.now(),
 ): Promise<void> {
-  await db
-    .prepare(
-      `INSERT INTO machines (machine_id, last_poll_at) VALUES (?, ?)
-       ON CONFLICT (machine_id) DO UPDATE SET last_poll_at = excluded.last_poll_at`,
-    )
-    .bind(machineId, now)
-    .run();
+  await touchMachineStatement(db, machineId, now).run();
 }
 
 // ─── isMachineRecent ──────────────────────────────────────────────────────────

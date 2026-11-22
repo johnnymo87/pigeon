@@ -17,6 +17,7 @@
  */
 
 import { isSharedKeyRetiredFor, machineMismatch, requireMachinePrincipal, sha256Hex, MACHINE_ID_PATTERN } from "./credentials";
+import { MACHINE_ONLINE_MS } from "./machine-liveness";
 
 /** The poll request header a receiving daemon sends. Byte-exact on both sides. */
 export const SWARM_RELAY_HEADER = "X-Pigeon-Swarm-Relay";
@@ -24,7 +25,7 @@ export const SWARM_RELAY_HEADER = "X-Pigeon-Swarm-Relay";
 /** A leased item not acked within this long is handed out again. */
 export const RELAY_LEASE_MS = 60_000;
 /** An owner whose last poll is older than this is offline (503, retried by the sender). */
-export const RELAY_ONLINE_MS = 60_000;
+export const RELAY_ONLINE_MS = MACHINE_ONLINE_MS;
 /**
  * A machine silent this long is treated as decommissioned or renamed (its accept row
  * and sessions survive until the 14-day sweep), not asleep.

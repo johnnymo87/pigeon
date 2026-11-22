@@ -24,6 +24,7 @@ import {
 } from "./credentials";
 import { SENDER_ID, RELAY_SENDER_ID, isMissingTable, relayReachability, readJson, parseRelayHeader } from "./relay";
 import { isValidTag } from "./tag-command";
+import { MACHINE_ONLINE_MS } from "./machine-liveness";
 
 export const LAUNCH_TTL_MS = 15 * 60_000;
 export const LAUNCH_LEASE_MS = 60_000;
@@ -37,7 +38,8 @@ export const LAUNCH_RATE_PER_HOUR = 30;
 export const LAUNCH_RETENTION_MS = 7 * 24 * 3600_000;
 export const LAUNCH_MAX_PROMPT = 16_000;
 export const LAUNCH_MAX_DIRECTORY = 512;
-export const LAUNCH_ONLINE_MS = 60_000;
+/** A target whose recorded poll is older than this is offline (503 target_offline). */
+export const LAUNCH_ONLINE_MS = MACHINE_ONLINE_MS;
 
 const LAUNCH_ID_PATTERN = /^[^:\s]{1,128}$/;
 const REASON = /^[a-z0-9_]{1,64}$/;
