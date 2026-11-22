@@ -12,6 +12,7 @@ import {
   pollNextCommand,
   ackCommand,
   touchMachine,
+  touchMachineStatement,
   isMachineRecent,
   cleanupCommands,
   checkSessionHighWaterAlert,
@@ -20,6 +21,9 @@ import {
   SWEEP_ID_CHUNK,
   MAX_QUEUE_PER_MACHINE,
 } from "../src/d1-ops";
+import { HEARTBEAT_WRITE_INTERVAL_MS, MACHINE_ONLINE_MS } from "../src/machine-liveness";
+import { RELAY_ONLINE_MS } from "../src/relay";
+import { LAUNCH_ONLINE_MS } from "../src/remote-launch";
 import {
   generateToken,
   handleSendNotification,
@@ -1982,23 +1986,58 @@ describe("d1-ops", () => {
 
   // ─── touchMachine ─────────────────────────────────────────────────────
 
-  it("touchMachine inserts on first call and updates on second", async () => {
+  it("touchMachine inserts on first call and updates once the stored value is stale", async () => {
+    const id = "machine-touch";
+    const lastPoll = async () =>
+      (await env.DB.prepare("SELECT last_poll_at FROM machines WHERE machine_id = ?").bind(id).first())!
+        .last_poll_at;
     const t1 = Date.now();
-    const t2 = t1 + 5000;
 
-    await touchMachine(env.DB, "machine-touch", t1);
+    await touchMachine(env.DB, id, t1);
+    expect(await lastPoll()).toBe(t1);
 
-    const row1 = await env.DB.prepare(
-      "SELECT last_poll_at FROM machines WHERE machine_id = ?",
-    ).bind("machine-touch").first();
-    expect(row1!.last_poll_at).toBe(t1);
+    // A poll inside the write interval writes nothing: this is what keeps D1 rows_written
+    // under the free-tier cap (pigeon-wl7a).
+    await touchMachine(env.DB, id, t1 + 5_000);
+    await touchMachine(env.DB, id, t1 + HEARTBEAT_WRITE_INTERVAL_MS - 1);
+    expect(await lastPoll()).toBe(t1);
 
-    await touchMachine(env.DB, "machine-touch", t2);
+    await touchMachine(env.DB, id, t1 + HEARTBEAT_WRITE_INTERVAL_MS);
+    expect(await lastPoll()).toBe(t1 + HEARTBEAT_WRITE_INTERVAL_MS);
+  });
 
-    const row2 = await env.DB.prepare(
-      "SELECT last_poll_at FROM machines WHERE machine_id = ?",
-    ).bind("machine-touch").first();
-    expect(row2!.last_poll_at).toBe(t2);
+  it("touchMachine reports zero rows written for a throttled poll", async () => {
+    const id = "machine-touch-rows";
+    const t1 = Date.now();
+    await touchMachine(env.DB, id, t1);
+    const stmt = touchMachineStatement(env.DB, id, t1 + 5_000);
+    const result = await stmt.run();
+    expect(result.meta.rows_written).toBe(0);
+  });
+
+  it("touchMachine repairs a last_poll_at that is in the future", async () => {
+    const id = "machine-touch-future";
+    const now = Date.now();
+    await env.DB.prepare("INSERT INTO machines (machine_id, last_poll_at) VALUES (?, ?)")
+      .bind(id, now + 3_600_000)
+      .run();
+
+    await touchMachine(env.DB, id, now);
+
+    const row = await env.DB.prepare("SELECT last_poll_at FROM machines WHERE machine_id = ?").bind(id).first();
+    expect(row!.last_poll_at).toBe(now);
+  });
+
+  it("the online threshold tolerates a throttled heartbeat plus a long poll stall", () => {
+    // Longest known single-tick stall in the daemon: a remote launch (health 5s + create 20s +
+    // prompt 20s). See machine-liveness.ts.
+    const DAEMON_POLL_INTERVAL_MS = 5_000;
+    const LONGEST_TICK_STALL_MS = 45_000;
+    expect(MACHINE_ONLINE_MS).toBeGreaterThanOrEqual(
+      HEARTBEAT_WRITE_INTERVAL_MS + DAEMON_POLL_INTERVAL_MS + LONGEST_TICK_STALL_MS,
+    );
+    expect(RELAY_ONLINE_MS).toBe(MACHINE_ONLINE_MS);
+    expect(LAUNCH_ONLINE_MS).toBe(MACHINE_ONLINE_MS);
   });
 
   // ─── isMachineRecent ──────────────────────────────────────────────────
