@@ -116,8 +116,11 @@ export function checkLaunchServable(
     // machine where goose IS configured but the launch path has not shipped,
     // naming configuration would send the human to fix something that is
     // already correct.
-    return caps.goose
-      ? { ok: true, backend }
+    if (caps.goose) return { ok: true, backend };
+    // The human did not type goose: say it is this machine's default, and how to
+    // get a session anyway.
+    return requested === undefined
+      ? { ok: false, message: "This machine's default /launch backend is goose (PIGEON_LAUNCH_DEFAULT_BACKEND), but this daemon cannot launch goose sessions. Re-send with --backend opencode." }
       : { ok: false, message: "This daemon cannot launch goose sessions." };
   }
   return { ok: false, message: `This daemon does not know how to launch a ${backend} session.` };

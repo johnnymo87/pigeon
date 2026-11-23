@@ -64,6 +64,9 @@ describe("checkLaunchServable with a machine default (PIGEON_LAUNCH_DEFAULT_BACK
     const res = checkLaunchServable(undefined, ocOnly, "goose");
     expect(res.ok).toBe(false);
     expect(res.ok === false && res.message).toContain("cannot launch goose");
+    // The human never typed goose: the refusal names the default and the way out.
+    expect(res.ok === false && res.message).toContain("default /launch backend is goose");
+    expect(res.ok === false && res.message).toContain("--backend opencode");
   });
 
   it("omitting the default keeps today's opencode", () => {

@@ -66,6 +66,8 @@ export interface DaemonConfig {
    * refuses in chat if it cannot serve its own default; it never falls back to
    * the other backend. An explicit `--backend` always wins, so `--backend
    * opencode` is the per-launch rollback. Any other value throws at startup.
+   * Human `/launch` only: `swarm_launch` (remote launch) always starts opencode and
+   * does not read this (workstation-6w7i.12).
    */
   launchDefaultBackend: "opencode" | "goose";
   /**
