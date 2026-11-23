@@ -59,6 +59,14 @@ export async function getBoundSessionForKey(
   }
 }
 
+const PROGRAM_KEY_PREFIX = "stallwatch:";
+
+function isProgramKey(key: string): boolean {
+  if (!key.startsWith(PROGRAM_KEY_PREFIX)) return false;
+  const tag = key.slice(PROGRAM_KEY_PREFIX.length);
+  return tag.length > 0 && !tag.startsWith("_");
+}
+
 export async function handleNamedTopicRekey(
   db: D1Database,
   env: Env,
@@ -89,6 +97,11 @@ export async function handleNamedTopicRekey(
   if (fromKey.startsWith("_") || toKey.startsWith("_")) {
     return Response.json({ error: "keys starting with _ are reserved" }, { status: 400 });
   }
+  // Only a stall-watch program's channel (`stallwatch:<tag>`) may be rekeyed; `stallwatch:_digest`
+  // and other `_` suffixes are shared topics, not a program's.
+  if (!isProgramKey(fromKey) || !isProgramKey(toKey)) {
+    return Response.json({ error: "only stallwatch:<program> keys may be rekeyed" }, { status: 400 });
+  }
   if (fromKey === toKey) {
     return Response.json({ error: "fromKey and toKey must be different" }, { status: 400 });
   }
@@ -112,6 +125,9 @@ export async function handleNamedTopicRekey(
     return Response.json({
       chatId,
       dryRun: true,
+      // Reported even with no `to` topic: an orphan binding for toKey would make the rekey's
+      // binding UPDATE fail after the channel was renamed.
+      toBoundSession,
       from: from
         ? {
             messageThreadId: from.message_thread_id,

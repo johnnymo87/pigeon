@@ -156,6 +156,20 @@ describe("POST /topics/named/rekey", () => {
       expect((await resTo.json() as { error: string }).error).toMatch(/reserved/);
     });
 
+    it("rejects keys that are not stallwatch:<program> keys", async () => {
+      for (const [fromKey, toKey] of [["other:old", "stallwatch:new"], ["stallwatch:old", "stallwatch:_digest"], ["stallwatch:", "stallwatch:new"]]) {
+        const res = await rekey(topicsEnv, machine.key, { fromKey, toKey, name: "New" });
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it("dry run reports an orphan binding on toKey", async () => {
+      await seedNamedTopic({ key: "stallwatch:old", name: "Old" });
+      await seedBinding({ key: "stallwatch:new", sessionId: "gse_orphan" });
+      const res = await rekey(topicsEnv, machine.key, { fromKey: "stallwatch:old", toKey: "stallwatch:new", name: "New", dryRun: true });
+      expect(((await res.json()) as { toBoundSession: string | null }).toBoundSession).toBe("gse_orphan");
+    });
+
     it("rejects identical fromKey and toKey", async () => {
       const res = await rekey(topicsEnv, machine.key, { fromKey: "stallwatch:same", toKey: "stallwatch:same", name: "New" });
       expect(res.status).toBe(400);
@@ -200,6 +214,7 @@ describe("POST /topics/named/rekey", () => {
       expect(await res.json()).toEqual({
         chatId: CHAT,
         dryRun: true,
+        toBoundSession: null,
         from: null,
         to: null,
       });
@@ -225,6 +240,7 @@ describe("POST /topics/named/rekey", () => {
           boundSession: "gse_coord1",
         },
         to: null,
+        toBoundSession: null,
       });
     });
 
@@ -253,6 +269,7 @@ describe("POST /topics/named/rekey", () => {
           name: "Target Name",
           boundSession: "gse_coord2",
         },
+        toBoundSession: "gse_coord2",
       });
     });
 
