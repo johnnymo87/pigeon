@@ -74,7 +74,7 @@ export async function getNamedTopicByThread(
   );
 }
 
-function truncateName(name: string): string {
+export function truncateName(name: string): string {
   const chars = [...name];
   return chars.length <= MAX_TOPIC_NAME_CHARS ? name : chars.slice(0, MAX_TOPIC_NAME_CHARS).join("");
 }
@@ -287,7 +287,7 @@ export async function maybeAnswerInNamedTopic(
  * notification the daemon would have retried into a permanent misroute into a fresh session
  * topic, and tell the human nothing reads a topic that something does.
  */
-function isMissingBindingsTable(err: unknown): boolean {
+export function isMissingBindingsTable(err: unknown): boolean {
   return /no such table/i.test(String(err));
 }
 
