@@ -47,6 +47,30 @@ describe("advertisedBackends", () => {
   });
 });
 
+describe("checkLaunchServable with a machine default (PIGEON_LAUNCH_DEFAULT_BACKEND, workstation-6w7i.11)", () => {
+  const both = { opencode: true, goose: true };
+  const ocOnly = { opencode: true, goose: false };
+
+  it("an ordinary launch takes the machine default", () => {
+    expect(checkLaunchServable(undefined, both, "goose")).toEqual({ ok: true, backend: "goose" });
+    expect(checkLaunchServable(undefined, both, "opencode")).toEqual({ ok: true, backend: "opencode" });
+  });
+
+  it("an explicit --backend opencode still wins over a goose default (the rollback path)", () => {
+    expect(checkLaunchServable("opencode", both, "goose")).toEqual({ ok: true, backend: "opencode" });
+  });
+
+  it("a goose default on a machine that cannot serve goose refuses, never falls back to opencode", () => {
+    const res = checkLaunchServable(undefined, ocOnly, "goose");
+    expect(res.ok).toBe(false);
+    expect(res.ok === false && res.message).toContain("cannot launch goose");
+  });
+
+  it("omitting the default keeps today's opencode", () => {
+    expect(checkLaunchServable(undefined, both)).toEqual({ ok: true, backend: "opencode" });
+  });
+});
+
 describe("checkLaunchServable", () => {
   const both = { opencode: true, goose: true };
   const ocOnly = { opencode: true, goose: false };

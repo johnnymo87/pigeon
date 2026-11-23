@@ -356,6 +356,16 @@ const gooseRunners = config.gooseAcpUrl
  * long as the launch path did not exist.
  */
 const canLaunchGoose = Boolean(gooseRunners && config.gooseAcpUrl);
+if (config.launchDefaultBackend !== "opencode") {
+  // Said once at startup, so a machine whose unnamed /launch is not opencode is
+  // visible in the journal (workstation-6w7i.11); loud if it cannot be served.
+  const msg = `[pigeon-daemon] /launch default backend on this machine: ${config.launchDefaultBackend}`;
+  if (config.launchDefaultBackend === "goose" && !canLaunchGoose) {
+    console.error(`${msg} -- but goose is not configured here, so every unnamed /launch will be refused`);
+  } else {
+    console.log(msg);
+  }
+}
 
 /**
  * Intercepts a control command aimed at a goose session BEFORE it can reach
@@ -735,9 +745,9 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
           const servable = checkLaunchServable(msg.backend, {
             opencode: Boolean(opencodeClient),
             goose: canLaunchGoose,
-          });
+          }, config.launchDefaultBackend);
           if (!servable.ok) {
-            console.warn(`[pigeon-daemon] refusing launch commandId=${msg.commandId} backend=${msg.backend ?? "opencode"}: ${servable.message}`);
+            console.warn(`[pigeon-daemon] refusing launch commandId=${msg.commandId} backend=${msg.backend ?? `${config.launchDefaultBackend} (machine default)`}: ${servable.message}`);
             await reply(msg.chatId, servable.message);
             return;
           }

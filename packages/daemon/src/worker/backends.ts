@@ -97,12 +97,16 @@ export const DEFAULT_BACKEND = "opencode";
 export function checkLaunchServable(
   requested: string | undefined,
   caps: BackendCapabilities,
+  machineDefault: string = DEFAULT_BACKEND,
 ): { ok: true; backend: string } | { ok: false; message: string } {
   // Undefined is "the ordinary launch", never something invalid: an old worker
-  // cannot send this field at all.
-  const backend = requested ?? DEFAULT_BACKEND;
+  // cannot send this field at all. It takes this machine's default
+  // (PIGEON_LAUNCH_DEFAULT_BACKEND, opencode unless set); an explicit backend
+  // always wins, and a default this daemon cannot serve is refused below, not
+  // swapped for the other backend.
+  const backend = requested ?? machineDefault;
 
-  if (backend === DEFAULT_BACKEND) {
+  if (backend === "opencode") {
     return caps.opencode
       ? { ok: true, backend }
       : { ok: false, message: "This daemon has no opencode configured, so it cannot launch a session." };

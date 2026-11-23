@@ -59,6 +59,16 @@ export interface DaemonConfig {
   /** Matches the serve's `GOOSE_SERVER__SECRET_KEY`. Absent is valid only for a serve run unauthenticated. */
   gooseAcpToken?: string;
   /**
+   * The backend a human `/launch` without `--backend` starts on this machine
+   * (`PIGEON_LAUNCH_DEFAULT_BACKEND`: opencode | goose; unset or empty means
+   * opencode). Daemon-side on purpose (workstation-6w7i.11): the worker gates an
+   * unnamed launch on opencode, which every daemon serves, and this daemon then
+   * refuses in chat if it cannot serve its own default; it never falls back to
+   * the other backend. An explicit `--backend` always wins, so `--backend
+   * opencode` is the per-launch rollback. Any other value throws at startup.
+   */
+  launchDefaultBackend: "opencode" | "goose";
+  /**
    * Chat user id allowed to bank a message for a pull-mode session
    * (`PIGEON_PULL_ALLOWED_USER_IDS`, comma separated). EMPTY MEANS NOBODY: a pull
    * session's banked text is input to a client that is not watched while it
@@ -142,6 +152,13 @@ export function parseMachineList(value: string | undefined, self: string | undef
   return [...new Set(ids)].sort();
 }
 
+export function parseLaunchDefaultBackend(raw: string | undefined): "opencode" | "goose" {
+  const v = raw?.trim() ?? "";
+  if (v === "") return "opencode";
+  if (v === "opencode" || v === "goose") return v;
+  throw new Error(`Invalid PIGEON_LAUNCH_DEFAULT_BACKEND: ${JSON.stringify(raw)} (expected opencode or goose)`);
+}
+
 export function loadConfig(env: Record<string, string | undefined> = process.env): DaemonConfig {
   const defaultDbPath = `${process.cwd()}/data/pigeon-daemon.db`;
   const opencodeUrl = env.OPENCODE_URL?.trim() || undefined;
@@ -173,6 +190,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     stuckAbortSilenceMs: numOr(env.STUCK_ABORT_SILENCE_MS, DEFAULT_STUCK_ABORT_SILENCE_MS),
     gooseAcpUrl: env.PIGEON_GOOSE_ACP_URL?.trim() || undefined,
     gooseAcpToken: env.PIGEON_GOOSE_ACP_TOKEN?.trim() || undefined,
+    launchDefaultBackend: parseLaunchDefaultBackend(env.PIGEON_LAUNCH_DEFAULT_BACKEND),
     pullAllowedUserIds: parseIdList(env.PIGEON_PULL_ALLOWED_USER_IDS),
     maxRequeues: numOr(env.MAX_REQUEUES, DEFAULT_MAX_REQUEUES),
     swarmRelayAcceptFrom: parseMachineList(env.PIGEON_SWARM_RELAY_ACCEPT_FROM, env.CCR_MACHINE_ID?.trim()),
