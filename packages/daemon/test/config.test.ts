@@ -20,6 +20,17 @@ describe("parsePort", () => {
 });
 
 describe("loadConfig", () => {
+  it("launchDefaultBackend: unset or empty is opencode; opencode and goose are accepted (workstation-6w7i.11)", () => {
+    expect(loadConfig({}).launchDefaultBackend).toBe("opencode");
+    expect(loadConfig({ PIGEON_LAUNCH_DEFAULT_BACKEND: " " }).launchDefaultBackend).toBe("opencode");
+    expect(loadConfig({ PIGEON_LAUNCH_DEFAULT_BACKEND: "goose" }).launchDefaultBackend).toBe("goose");
+    expect(loadConfig({ PIGEON_LAUNCH_DEFAULT_BACKEND: " opencode " }).launchDefaultBackend).toBe("opencode");
+  });
+
+  it("launchDefaultBackend: any other value fails loudly at startup", () => {
+    expect(() => loadConfig({ PIGEON_LAUNCH_DEFAULT_BACKEND: "Goose" })).toThrow("Invalid PIGEON_LAUNCH_DEFAULT_BACKEND");
+  });
+
   it("loads port from env", () => {
     const config = loadConfig({ PIGEON_DAEMON_PORT: "6123" });
     expect(config.port).toBe(6123);

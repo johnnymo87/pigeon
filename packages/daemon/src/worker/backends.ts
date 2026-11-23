@@ -97,12 +97,16 @@ export const DEFAULT_BACKEND = "opencode";
 export function checkLaunchServable(
   requested: string | undefined,
   caps: BackendCapabilities,
+  machineDefault: string = DEFAULT_BACKEND,
 ): { ok: true; backend: string } | { ok: false; message: string } {
   // Undefined is "the ordinary launch", never something invalid: an old worker
-  // cannot send this field at all.
-  const backend = requested ?? DEFAULT_BACKEND;
+  // cannot send this field at all. It takes this machine's default
+  // (PIGEON_LAUNCH_DEFAULT_BACKEND, opencode unless set); an explicit backend
+  // always wins, and a default this daemon cannot serve is refused below, not
+  // swapped for the other backend.
+  const backend = requested ?? machineDefault;
 
-  if (backend === DEFAULT_BACKEND) {
+  if (backend === "opencode") {
     return caps.opencode
       ? { ok: true, backend }
       : { ok: false, message: "This daemon has no opencode configured, so it cannot launch a session." };
@@ -112,8 +116,11 @@ export function checkLaunchServable(
     // machine where goose IS configured but the launch path has not shipped,
     // naming configuration would send the human to fix something that is
     // already correct.
-    return caps.goose
-      ? { ok: true, backend }
+    if (caps.goose) return { ok: true, backend };
+    // The human did not type goose: say it is this machine's default, and how to
+    // get a session anyway.
+    return requested === undefined
+      ? { ok: false, message: "This machine's default /launch backend is goose (PIGEON_LAUNCH_DEFAULT_BACKEND), but this daemon cannot launch goose sessions. Re-send with --backend opencode." }
       : { ok: false, message: "This daemon cannot launch goose sessions." };
   }
   return { ok: false, message: `This daemon does not know how to launch a ${backend} session.` };
