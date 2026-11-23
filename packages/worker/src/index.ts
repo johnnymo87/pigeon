@@ -1,4 +1,5 @@
 import { handleNamedTopicRehome } from "./named-topic-rehome";
+import { handleNamedTopicRekey } from "./named-topic-rekey";
 import { handleSendMessage } from "./messages";
 import { handleSessionRequest, handleSessionOwner } from "./sessions";
 import { handleSendNotification, handleEditNotification } from "./notifications";
@@ -108,6 +109,9 @@ export default {
         }
         if (path === "/topics/named/rehome" && method === "POST") {
           return handleNamedTopicRehome(db, env, request);
+        }
+        if (path === "/topics/named/rekey" && method === "POST") {
+          return handleNamedTopicRekey(db, env, request);
         }
         if (path === "/topics/named/unbind" && method === "POST") {
           return handleNamedTopicUnbind(db, env, request);
