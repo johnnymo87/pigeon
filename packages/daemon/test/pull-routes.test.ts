@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
 import { openStorageDb, type StorageDb } from "../src/storage/database";
 import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
+import { processRelayItems } from "../src/swarm/relay-receiver";
 
 /**
  * The pull routes: `/pull/drain`, `/pull/ack`, `/pull/pending`.
@@ -207,6 +208,215 @@ describe("pull routes", () => {
       expect(swMsg.source).toBe("swarm");
       expect(swMsg.kind).toBe("chat");
       expect(swMsg.reply_to).toBe("orig_1");
+    });
+
+    it("returns from_machine for relayed messages, null for local messages", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
+
+      // Local chat row (no relay_inbound record)
+      bank(s, "m_local", 2_000);
+
+      // Local swarm row (no relay_inbound record)
+      s.pullInbox.bank(
+        {
+          msgId: "m_sw_local",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "local swarm",
+          senderId: "ses_local_peer",
+        },
+        2_050,
+      );
+
+      // Relayed swarm row matching sender and to_session
+      s.pullInbox.bank(
+        {
+          msgId: "m_relayed",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "relayed swarm",
+          senderId: "ses_remote_sender",
+        },
+        2_100,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_relayed",
+          fromMachine: "devbox",
+          fromSession: "ses_remote_sender",
+          toSession: "ses_pull",
+          fromLabel: null,
+        },
+        2_100,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const localChat = body.messages.find((m) => m.msg_id === "m_local")!;
+      expect(localChat).toHaveProperty("from_machine", null);
+
+      const localSwarm = body.messages.find((m) => m.msg_id === "m_sw_local")!;
+      expect(localSwarm).toHaveProperty("from_machine", null);
+
+      const relayed = body.messages.find((m) => m.msg_id === "m_relayed")!;
+      expect(relayed).toHaveProperty("from_machine", "devbox");
+    });
+
+    it("returns from_machine as null when relay_inbound sender or recipient mismatches", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
+
+      // Mismatched senderId vs relay_inbound fromSession
+      s.pullInbox.bank(
+        {
+          msgId: "m_mismatched_sender",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "spoofed sender",
+          senderId: "ses_spoofed",
+        },
+        2_100,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_mismatched_sender",
+          fromMachine: "devbox",
+          fromSession: "ses_actual_sender",
+          toSession: "ses_pull",
+          fromLabel: null,
+        },
+        2_100,
+      );
+
+      // Mismatched sessionId vs relay_inbound toSession
+      s.pullInbox.bank(
+        {
+          msgId: "m_mismatched_recipient",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "mismatched recipient",
+          senderId: "ses_sender",
+        },
+        2_200,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_mismatched_recipient",
+          fromMachine: "devbox",
+          fromSession: "ses_sender",
+          toSession: "ses_other",
+          fromLabel: null,
+        },
+        2_200,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const mismatchedSender = body.messages.find((m) => m.msg_id === "m_mismatched_sender")!;
+      expect(mismatchedSender).toHaveProperty("from_machine", null);
+
+      const mismatchedRecipient = body.messages.find((m) => m.msg_id === "m_mismatched_recipient")!;
+      expect(mismatchedRecipient).toHaveProperty("from_machine", null);
+    });
+
+    it("returns from_machine as null when a later local row reuses an old relayed msg_id", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
+
+      // A relay_inbound record from an earlier relayed message at t=2_000
+      s.relayInbound.record(
+        {
+          msgId: "m_reused",
+          fromMachine: "devbox",
+          fromSession: "ses_sender",
+          toSession: "ses_pull",
+          fromLabel: null,
+        },
+        2_000,
+      );
+
+      // A later local send reuses the msg_id with the same from/to at t=5_000
+      s.pullInbox.bank(
+        {
+          msgId: "m_reused",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "later local send reusing msg_id",
+          senderId: "ses_sender",
+        },
+        5_000,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const reused = body.messages.find((m) => m.msg_id === "m_reused")!;
+      expect(reused).toHaveProperty("from_machine", null);
+    });
+
+    it("reports from_machine for a message banked via the real relay receiver path", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm", "swarm-remote"]);
+
+      const acks = await processRelayItems(
+        {
+          storage: s,
+          selfMachineId: "cloudbox",
+          acceptFrom: ["devbox"],
+          nowFn: () => 2_100,
+          log: () => {},
+        },
+        [
+          {
+            item: "message",
+            from_machine: "devbox",
+            msg_id: "m_real_relay",
+            from: "ses_remote_sender",
+            to: "ses_pull",
+            kind: "chat",
+            priority: "normal",
+            reply_to: null,
+            payload: "message from devbox via relay receiver",
+          },
+        ],
+      );
+
+      expect(acks).toEqual([
+        { from_machine: "devbox", msg_id: "m_real_relay", outcome: "delivered" },
+      ]);
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const msg = body.messages.find((m) => m.msg_id === "m_real_relay")!;
+      expect(msg).toHaveProperty("from_machine", "devbox");
     });
 
     it("claims chat-reply rows before swarm rows under limit", async () => {
@@ -715,6 +925,72 @@ describe("pull routes", () => {
       });
       expect(badRes.status).toBe(400);
       expect(s.sessions.get("ses_pull")!.pullSources).toEqual(["swarm"]);
+    });
+  });
+
+  describe("POST /session-start notify handling for pull sessions", () => {
+    it("persists notify: false and suppresses chat notice on banked swarm message", async () => {
+      const { app, storage: s } = newApp();
+      const startRes = await post(app, "/session-start", {
+        session_id: "ses_pull_quiet",
+        backend_kind: PULL_BACKEND_KIND,
+        notify: false,
+        pull_sources: ["chat-reply", "swarm"],
+      });
+      expect(startRes.status).toBe(200);
+      const session = s.sessions.get("ses_pull_quiet");
+      expect(session).not.toBeNull();
+      expect(session!.backendKind).toBe(PULL_BACKEND_KIND);
+      expect(session!.notify).toBe(false);
+
+      const sendRes = await post(app, "/swarm/send", {
+        from: "ses_sender",
+        to: "ses_pull_quiet",
+        kind: "chat",
+        payload: "hello quiet pull session",
+      });
+      expect(sendRes.status).toBe(202);
+      const sendBody = (await sendRes.json()) as { accepted: boolean; banked?: boolean; msg_id: string };
+      expect(sendBody.accepted).toBe(true);
+      expect(sendBody.banked).toBe(true);
+
+      // Banked in pull_inbox
+      expect(s.pullInbox.claim("ses_pull_quiet", 10_000)).toHaveLength(1);
+
+      // No chat notice in outbox
+      expect(s.outbox.getByNotificationId(`w:${sendBody.msg_id}`)).toBeNull();
+    });
+
+    it("persists notify: true and emits chat notice on banked swarm message", async () => {
+      const { app, storage: s } = newApp();
+      const startRes = await post(app, "/session-start", {
+        session_id: "ses_pull_loud",
+        backend_kind: PULL_BACKEND_KIND,
+        notify: true,
+        pull_sources: ["chat-reply", "swarm"],
+      });
+      expect(startRes.status).toBe(200);
+      const session = s.sessions.get("ses_pull_loud");
+      expect(session).not.toBeNull();
+      expect(session!.backendKind).toBe(PULL_BACKEND_KIND);
+      expect(session!.notify).toBe(true);
+
+      const sendRes = await post(app, "/swarm/send", {
+        from: "ses_sender",
+        to: "ses_pull_loud",
+        kind: "chat",
+        payload: "hello loud pull session",
+      });
+      expect(sendRes.status).toBe(202);
+      const sendBody = (await sendRes.json()) as { accepted: boolean; banked?: boolean; msg_id: string };
+      expect(sendBody.accepted).toBe(true);
+      expect(sendBody.banked).toBe(true);
+
+      // Banked in pull_inbox
+      expect(s.pullInbox.claim("ses_pull_loud", 10_000)).toHaveLength(1);
+
+      // Chat notice IS in outbox
+      expect(s.outbox.getByNotificationId(`w:${sendBody.msg_id}`)).not.toBeNull();
     });
   });
 

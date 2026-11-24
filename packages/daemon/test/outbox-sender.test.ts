@@ -5,6 +5,7 @@ import { REPLY_TOKEN_TTL_MS } from "../src/storage/schema";
 import { chunkNotificationId, commitDelivery, expiryForKind, OutboxSender, OUTBOX_RATE_LIMIT, OUTBOX_RATE_WINDOW_MS, SWARM_SUB_BUDGET, SWARM_LOCAL_SESSION_GRACE_MS, TOPIC_HOLD_WINDOW_MS, TOPIC_HOLD_LINGER_MS } from "../src/worker/outbox-sender";
 import type { RegisterSessionFn, SendNotificationFn, UnregisterSessionFn } from "../src/worker/outbox-sender";
 import type { SendNotificationInput } from "../src/worker/poller";
+import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
 
 const BASE_OUTBOX_INPUT = {
   notificationId: "notif-1",
@@ -3208,6 +3209,78 @@ describe("swarm notices need a local session row (pigeon-qioa)", () => {
     const row = storage.outbox.getByNotificationId("w:gse_silent_msg")!;
     expect(row.state).toBe("failed");
     expect(row.failedReason).toBe("notify_false_goose");
+  });
+
+  it("drops an entry for a notify: false goose-pull row terminally with reason notify_false_goose", async () => {
+    storage.sessions.upsert(
+      {
+        sessionId: "ses_pull_silent",
+        backendKind: PULL_BACKEND_KIND,
+        notify: false,
+      },
+      1_000,
+    );
+    storage.outbox.upsert(
+      {
+        ...BASE_OUTBOX_INPUT,
+        notificationId: "w:ses_pull_silent_msg",
+        sessionId: "ses_pull_silent",
+        kind: "swarm",
+        payload: JSON.stringify({ messages: [{ text: "swarm" }], notificationId: "w:ses_pull_silent_msg" }),
+      },
+      1_000,
+    );
+    const send = makeSendNotification({ ok: true });
+    const registerSession = vi.fn<RegisterSessionFn>();
+    const s = new OutboxSender({
+      storage,
+      sendNotification: send,
+      registerSession,
+      nowFn: () => 2_000,
+    });
+
+    await s.processOnce();
+
+    expect(send).not.toHaveBeenCalled();
+    expect(registerSession).not.toHaveBeenCalled();
+    const row = storage.outbox.getByNotificationId("w:ses_pull_silent_msg")!;
+    expect(row.state).toBe("failed");
+    expect(row.failedReason).toBe("notify_false_goose");
+  });
+
+  it("does not drop an entry for a notify: true goose-pull row", async () => {
+    storage.sessions.upsert(
+      {
+        sessionId: "ses_pull_loud",
+        backendKind: PULL_BACKEND_KIND,
+        notify: true,
+      },
+      1_000,
+    );
+    storage.outbox.upsert(
+      {
+        ...BASE_OUTBOX_INPUT,
+        notificationId: "w:ses_pull_loud_msg",
+        sessionId: "ses_pull_loud",
+        kind: "swarm",
+        payload: JSON.stringify({ messages: [{ text: "swarm" }], notificationId: "w:ses_pull_loud_msg" }),
+      },
+      1_000,
+    );
+    const send = makeSendNotification({ ok: true });
+    const registerSession = vi.fn<RegisterSessionFn>();
+    const s = new OutboxSender({
+      storage,
+      sendNotification: send,
+      registerSession,
+      nowFn: () => 2_000,
+    });
+
+    await s.processOnce();
+
+    expect(send).toHaveBeenCalled();
+    const row = storage.outbox.getByNotificationId("w:ses_pull_loud_msg")!;
+    expect(row.state).toBe("sent");
   });
 });
 

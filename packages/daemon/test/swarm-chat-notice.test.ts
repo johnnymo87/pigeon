@@ -10,6 +10,7 @@ import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
 import { notifySenderOfFailure } from "../src/swarm/notify-sender";
 import { DeliveryWatchdog, type WatchdogClient } from "../src/swarm/delivery-watchdog";
 import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
+import { createApp } from "../src/app";
 
 function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRecord {
   return {
@@ -42,8 +43,8 @@ function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRe
 }
 
 function mockStorage(opts: {
-  senderSession?: { title?: string | null; label?: string | null; cwd?: string | null } | null;
-  targetSession?: { title?: string | null; label?: string | null; cwd?: string | null } | null;
+  senderSession?: { title?: string | null; label?: string | null; cwd?: string | null; backendKind?: string | null; notify?: boolean } | null;
+  targetSession?: { title?: string | null; label?: string | null; cwd?: string | null; backendKind?: string | null; notify?: boolean } | null;
   outboxThrow?: boolean;
   /** session_origin row for the RECEIVER. Default: none, so notices emit. */
   originRow?: { notifyPolicy: string; source: string; createdAt: number } | null;
@@ -185,6 +186,60 @@ describe("swarm notices respect a declared-quiet receiver", () => {
     const { storage, upsertCalls } = mockStorage({ originalPosted: false });
     enqueueSwarmCancelNotice(storage, makeRecord(), 1786363205000);
     expect(upsertCalls).toHaveLength(0);
+  });
+});
+
+describe("swarm notices for goose-pull targets", () => {
+  it("suppresses the chat notice when a goose-pull target has notify: false", () => {
+    const { storage, upsertCalls } = mockStorage({
+      targetSession: { backendKind: PULL_BACKEND_KIND, notify: false },
+    });
+    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(0);
+  });
+
+  it("still emits the chat notice when a goose-pull target has notify: true", () => {
+    const { storage, upsertCalls } = mockStorage({
+      targetSession: { backendKind: PULL_BACKEND_KIND, notify: true },
+    });
+    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(1);
+    expect(upsertCalls[0]!.input.notificationId).toBe("w:msg_1001");
+  });
+
+  it("suppresses the chat notice when a goose-pull target is registered via /session-start without notify", async () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      const app = createApp(storage);
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: "ses_receiver",
+            backend_kind: PULL_BACKEND_KIND,
+          }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const target = storage.sessions.get("ses_receiver");
+      expect(target).not.toBeNull();
+      expect(target!.notify).toBe(false);
+
+      enqueueSwarmChatNotice(storage, makeRecord({ toSession: "ses_receiver" }), 1786363205000);
+      expect(storage.outbox.getByNotificationId("w:msg_1001")).toBeNull();
+    } finally {
+      storage.db.close();
+    }
+  });
+
+  it("still emits the chat notice when an opencode target has notify: false", () => {
+    const { storage, upsertCalls } = mockStorage({
+      targetSession: { backendKind: "opencode-plugin-direct", notify: false },
+    });
+    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
+    expect(upsertCalls).toHaveLength(1);
   });
 });
 

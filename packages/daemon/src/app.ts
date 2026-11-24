@@ -1429,22 +1429,33 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
           ok: true,
           session_id: sessionId,
           pending_total: pendingTotal,
-          messages: claimed.map((m) => ({
-            msg_id: m.msgId,
-            source: m.source,
-            payload: m.payload,
-            sender_id: m.senderId,
-            in_reply_to: m.inReplyTo,
-            in_reply_to_quote: m.inReplyToQuote ?? null,
-            kind: m.kind,
-            reply_to: m.replyTo,
-            created_at: m.createdAt,
-            claim_count: m.claimCount,
-            // A row claimed before but never acked. The client may already have
-            // acted on it; saying so lets it decide, rather than making the
-            // daemon guess on its behalf.
-            redelivered: m.claimCount > 1,
-          })),
+          messages: claimed.map((m) => {
+            const inbound = storage.relayInbound.get(m.msgId);
+            const fromMachine =
+              inbound &&
+              inbound.fromSession === m.senderId &&
+              inbound.toSession === sessionId &&
+              inbound.receivedAt === m.createdAt
+                ? inbound.fromMachine
+                : null;
+            return {
+              msg_id: m.msgId,
+              source: m.source,
+              payload: m.payload,
+              sender_id: m.senderId,
+              from_machine: fromMachine,
+              in_reply_to: m.inReplyTo,
+              in_reply_to_quote: m.inReplyToQuote ?? null,
+              kind: m.kind,
+              reply_to: m.replyTo,
+              created_at: m.createdAt,
+              claim_count: m.claimCount,
+              // A row claimed before but never acked. The client may already have
+              // acted on it; saying so lets it decide, rather than making the
+              // daemon guess on its behalf.
+              redelivered: m.claimCount > 1,
+            };
+          }),
         });
       }
 

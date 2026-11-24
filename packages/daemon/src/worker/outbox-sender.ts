@@ -9,6 +9,7 @@
 import type { StorageDb } from "../storage/database";
 import type { OutboxRecord } from "../storage/outbox-repo";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
+import { isPullBackend } from "../adapters/goose-pull";
 import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, UploadMediaResult, WorkerResult } from "./poller";
 import {
@@ -769,11 +770,16 @@ export class OutboxSender {
           this.mediaHolds.delete(entry.sessionId);
         }
 
-        // Defence in depth: an outbox entry whose session is a goose-acp row with
-        // notify: false is dropped terminally (notify_false_goose) before any send
+        // Defence in depth: an outbox entry whose session is a goose-acp or pull
+        // row with notify: false is dropped terminally (notify_false_goose) before any send
         // or re-register, so no future producer can create a topic for a --no-chat session.
+        // Reason string retains legacy name notify_false_goose but also covers pull-mode sessions.
         const sessionRow = this.storage.sessions.get(entry.sessionId);
-        if (sessionRow && sessionRow.backendKind === GOOSE_BACKEND_KIND && !sessionRow.notify) {
+        if (
+          sessionRow &&
+          ((sessionRow.backendKind === GOOSE_BACKEND_KIND && !sessionRow.notify) ||
+            (isPullBackend(sessionRow) && sessionRow.notify === false))
+        ) {
           this.markTerminal(entry, now, "notify_false_goose");
           continue;
         }
