@@ -46,6 +46,15 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { withDeadline } from "./deadline.js";
+import {
+  QuoteUnsupportedError,
+  parseQuoteResult,
+  type QuoteRequest,
+  type QuoteResult,
+} from "./quote-types.js";
+
+export { QuoteUnsupportedError } from "./quote-types.js";
 
 export interface AcpTransport {
   send(data: string): void;
@@ -1198,6 +1207,39 @@ export class GooseAcpClient {
     }
   }
 
+  async quote(req: QuoteRequest, opts?: { timeoutMs?: number }): Promise<QuoteResult> {
+    const params: Record<string, unknown> = {
+      sessionId: req.sessionId,
+      pick: req.pick,
+      full: req.full,
+    };
+    if (req.tag !== undefined) params.tag = req.tag;
+    if (req.quoteId !== undefined) params.quoteId = req.quoteId;
+
+    const callPromise = this.call(
+      "_honk/quote",
+      params,
+      { sessionId: req.sessionId, isTurn: false },
+    );
+
+    const res = opts?.timeoutMs !== undefined
+      ? await withDeadline(callPromise, opts.timeoutMs, "_honk/quote")
+      : await callPromise;
+
+    if (res.error) {
+      if (res.error.code === -32601) {
+        throw new QuoteUnsupportedError(res.error.message);
+      }
+      throw new GooseProtocolError(res.error.code, res.error.message, res.error.data);
+    }
+
+    try {
+      return parseQuoteResult(res.result);
+    } catch {
+      throw new GooseProtocolError(-1, "malformed _honk/quote result");
+    }
+  }
+
   private ensureTransport(method: string): AcpTransport {
     const transport = this.transport;
     if (!transport) throw new Error("goose acp client is not connected");
@@ -1666,6 +1708,10 @@ export function refuse(options: PermissionParams["options"]): string | undefined
  * not in honkd's memory, honkd first loads it into goose, exactly as a prompt
  * would. It executes nothing. The honkd-only gate in `prompt` is load-bearing:
  * on bare goose `session/load` is a direct reload of the session.
+ *
+ * Human decision (2026-11-24, Jonathan, pigeon-14uk): _honk/quote, sent only to
+ * honkd, reads the session's own transcript and makes one tool-less model call
+ * (honkd _honk/oneshot); it executes nothing.
  */
 export const ALLOWED_ACP_METHODS = [
   "initialize",
@@ -1675,4 +1721,5 @@ export const ALLOWED_ACP_METHODS = [
   "session/cancel",
   "_goose/unstable/session/rename",
   "session/load",
+  "_honk/quote",
 ] as const;
