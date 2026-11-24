@@ -33,6 +33,22 @@ export interface QuoteResult {
   model: string | null;
 }
 
+export interface StoredQuotePassage {
+  header: string;
+  lines: string[];
+  first: boolean;
+}
+
+export interface StoredQuote {
+  v: 1;
+  sessionId: string;
+  passages: StoredQuotePassage[];
+  total: number;
+}
+
+export const QUOTE_MAX_PASSAGES = 45;
+export const QUOTE_MAX_TOTAL_CHARS = 100_000;
+
 export class QuoteUnsupportedError extends Error {
   constructor(message = "honkd does not support _honk/quote") {
     super(message);

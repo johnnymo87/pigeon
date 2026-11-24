@@ -241,7 +241,7 @@ export function chatMessageToMarkdown(msg: ChatMessage): string | null {
  */
 const MD_SPECIAL_SLACK = /[\\`*_[\]~|]/g;
 
-function escapePlainSlack(s: string): string {
+export function escapePlainSlack(s: string): string {
   return s.replace(MD_SPECIAL_SLACK, (c) => "\\" + c).replace(/\n/g, "  \n");
 }
 
