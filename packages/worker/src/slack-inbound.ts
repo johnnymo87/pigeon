@@ -36,6 +36,8 @@ import { LAUNCH_USAGE_TEXT } from "./launch-command";
 import { TAG_USAGE_TEXT } from "./tag-command";
 import type { MediaRef } from "./media";
 import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
+import { getQuote } from "./slack-quotes";
+import { buildAnswerModal } from "./slack-quote-modal";
 
 export type SlackEndpoint = "events" | "commands" | "interactivity";
 
@@ -804,6 +806,7 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
 
 interface BlockActionsPayload {
   type?: string;
+  trigger_id?: string;
   api_app_id?: string;
   team?: { id?: string };
   user?: { id?: string };
@@ -829,9 +832,33 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
 
   // A URL button's press is reported too; Slack has already opened the link, so it is acked and ignored.
   const value = payload.actions?.[0]?.value;
-  if (typeof value !== "string" || !value.startsWith("cmd:")) return OK();
+  if (typeof value !== "string") return OK();
   const channelId = payload.channel?.id ?? payload.container?.channel_id;
   if (typeof channelId !== "string" || !channelId) return OK();
+
+  if (value.startsWith("quote:")) {
+    const quoteId = value.slice("quote:".length);
+    const stored = await getQuote(db, quoteId);
+    if (!stored) {
+      await postEphemeral(ws, channelId, "This quote has expired. Run /quote again.");
+      return OK();
+    }
+    const view = buildAnswerModal(quoteId, channelId, stored);
+    const res = await callSlack(ws.botToken, "views.open", {
+      trigger_id: payload.trigger_id,
+      view,
+    });
+    if (!res.ok) {
+      const errorMsg =
+        (res.response as { error?: string } | undefined)?.error ??
+        (res.kind === "error" ? res.description : res.kind);
+      console.warn("[slack-inbound] views.open failed", { error: errorMsg, kind: res.kind });
+      await postEphemeral(ws, channelId, errorMsg ?? "Could not open modal");
+    }
+    return OK();
+  }
+
+  if (!value.startsWith("cmd:")) return OK();
 
   // The button value is the daemon's callback_data: cmd:TOKEN:ACTION.
   const parts = value.split(":");

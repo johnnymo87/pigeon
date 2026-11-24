@@ -15,6 +15,7 @@ import { slackSignature, verifySlackSignature } from "../src/chat/slack-verify";
 import { finalize, reserve } from "../src/topics";
 import { MAX_COMMAND_LENGTH } from "../src/chat/limits";
 import { handleSlackRequest, pickSlackFile, SLACK_APP_COMMANDS, slackTextToPlain, sweepSlackSeenEvents } from "../src/slack-inbound";
+import { putQuote, type StoredQuote } from "../src/slack-quotes";
 import manifestRaw from "../slack/manifest.template.json?raw";
 
 beforeAll(async () => {
@@ -209,9 +210,10 @@ async function sendCommand(box: Box, command: string, text: string, channelId: s
   return call(box, await signed(box, "commands", form, "application/x-www-form-urlencoded"));
 }
 
-async function sendAction(box: Box, channelId: string, action: Record<string, unknown>, user = OWNER) {
+async function sendAction(box: Box, channelId: string, action: Record<string, unknown>, user = OWNER, triggerId = "trig-123") {
   const payload = {
     type: "block_actions",
+    trigger_id: triggerId,
     api_app_id: box.ws.appId,
     team: { id: box.ws.teamId },
     user: { id: user },
@@ -898,6 +900,79 @@ describe("interactivity", () => {
     expect(slackOf("chat.postEphemeral")[0]!.params.get("text")).toBe("Session expired");
     expect(slackOf("chat.postEphemeral")[0]!.params.get("user")).toBe(OWNER);
     expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("quote Answer button: missing quote says so ephemerally", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    slack("chat.postEphemeral", { ok: true });
+    await sendAction(box, ch.channelId, { value: "quote:qid_expired" });
+    expect(slackOf("chat.postEphemeral")[0]!.params.get("text")).toBe("This quote has expired. Run /quote again.");
+    expect(slackOf("chat.postEphemeral")[0]!.params.get("user")).toBe(OWNER);
+  });
+
+  it("quote Answer button: opens answer modal via views.open with trigger_id and view", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        {
+          header: "# 11-24 13:05 (wake: mail) · ask",
+          lines: ["quote line"],
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("views.open", { ok: true });
+    const res = await sendAction(box, ch.channelId, { value: `quote:${quoteId}` }, OWNER, "trig-999");
+    expect(res.status).toBe(200);
+
+    const call = slackOf("views.open")[0]!;
+    expect(call.params.get("trigger_id")).toBe("trig-999");
+    const view = JSON.parse(call.params.get("view")!);
+    expect(view.callback_id).toBe("quote_answer");
+    expect(view.private_metadata).toBe(JSON.stringify({ quoteId, channelId: ch.channelId }));
+  });
+
+  it("quote Answer button: failure of views.open posts ephemeral with the error", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        {
+          header: "# Header",
+          lines: ["line"],
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("views.open", { ok: false, error: "expired_trigger_id" });
+    slack("chat.postEphemeral", { ok: true });
+    const res = await sendAction(box, ch.channelId, { value: `quote:${quoteId}` });
+    expect(res.status).toBe(200);
+
+    expect(slackOf("chat.postEphemeral")[0]!.params.get("text")).toBe("expired_trigger_id");
+  });
+
+  it("quote Answer button: non-owner press is ignored", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const res = await sendAction(box, ch.channelId, { value: `quote:${quoteId}` }, "UOTHER");
+    expect(res.status).toBe(200);
+    expect(slackCalls).toHaveLength(0);
   });
 });
 
