@@ -978,6 +978,38 @@ describe("interactivity", () => {
     expect(slackOf("chat.postEphemeral")[0]!.params.get("text")).toBe("expired_trigger_id");
   });
 
+  it("quote Answer button: thrown fetch in views.open logs and posts ephemeral without throwing", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        {
+          header: "# Header",
+          lines: ["line"],
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    fetchMock
+      .get("https://slack.com")
+      .intercept({ method: "POST", path: "/api/views.open" })
+      .replyWithError(new Error("network failure"));
+    slack("chat.postEphemeral", { ok: true });
+
+    const res = await sendAction(box, ch.channelId, { value: `quote:${quoteId}` });
+    expect(res.status).toBe(200);
+
+    const ephemeralCalls = slackOf("chat.postEphemeral");
+    expect(ephemeralCalls).toHaveLength(1);
+    expect(ephemeralCalls[0]!.params.get("text")).toBe("Could not open modal");
+  });
+
   it("quote Answer button: non-owner press is ignored", async () => {
     const box = await mkBox();
     const ch = await seedSessionChannel(box);
@@ -1074,6 +1106,46 @@ describe("interactivity: view_submission", () => {
     const body = (await res.json()) as any;
     expect(body.response_action).toBe("errors");
     expect(body.errors.a2).toMatch(/Too long to send \(\d+ of 10000 characters\)\. Shorten an answer or answer fewer passages\./);
+  });
+
+  it("queue full returns response_action errors on the first answer block", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        { header: "# Header 1", lines: ["line 1"], first: true },
+        { header: "# Header 2", lines: ["line 2"], first: true },
+      ],
+      total: 2,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    const stmts = Array.from({ length: 100 }, (_, i) =>
+      env.DB.prepare(
+        "INSERT INTO commands (command_id, machine_id, session_id, chat_id, command, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+      ).bind(`cmd_fill_${stamp()}_${i}`, box.machineId, ch.sessionId, `slack:${box.ws.teamId}`, "noop", Date.now()),
+    );
+    await env.DB.batch(stmts);
+
+    const res = await sendSubmission(box, {
+      id: "V_QFULL",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: {
+        values: {
+          a1: { answer: { value: "" } },
+          a2: { answer: { value: "my answer" } },
+        },
+      },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      response_action: "errors",
+      errors: { a2: `Queue full for ${box.machineId}; try again shortly.` },
+    });
   });
 
   it("happy path: queues execute command with senderId, posts copy into channel, returns response_action clear", async () => {

@@ -126,6 +126,7 @@ describe("isValidStoredQuote", () => {
 
   it("rejects non-array passages or malformed passage", () => {
     expect(isValidStoredQuote({ ...sampleQuote("ses_123"), passages: null })).toBe(false);
+    expect(isValidStoredQuote({ ...sampleQuote("ses_123"), passages: [] })).toBe(false);
     expect(
       isValidStoredQuote({
         ...sampleQuote("ses_123"),
@@ -201,6 +202,18 @@ describe("putQuote and getQuote", () => {
 
   it("returns null for unknown quoteId", async () => {
     expect(await getQuote(env.DB, "nonexistent")).toBe(null);
+  });
+
+  it("returns null on corrupt JSON in payload_json", async () => {
+    const quoteId = `qid_corrupt_${stamp()}`;
+    await env.DB.prepare(
+      "INSERT INTO slack_quotes (quote_id, session_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
+    )
+      .bind(quoteId, "ses_corrupt", "{not valid json", Date.now())
+      .run();
+
+    const retrieved = await getQuote(env.DB, quoteId);
+    expect(retrieved).toBe(null);
   });
 
   it("handles missing table gracefully without throwing", async () => {

@@ -41,15 +41,11 @@ export function pickLabel(pick: QuotePick, full: boolean): string {
 /**
  * Flattens passages from all replies into StoredQuote["passages"].
  * Reply order, then passage order; `first` is true for each reply's first passage.
- * If inProgress is true on a reply, " · in progress" is appended to the header unless already present.
  */
 export function flattenPassages(result: QuoteResult): StoredQuotePassage[] {
   const passages: StoredQuotePassage[] = [];
   for (const reply of result.replies) {
-    let header = reply.header;
-    if (reply.inProgress && !header.includes("in progress")) {
-      header = `${header} · in progress`;
-    }
+    const header = reply.header;
     for (let i = 0; i < reply.passages.length; i++) {
       const p = reply.passages[i]!;
       passages.push({

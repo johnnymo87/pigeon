@@ -22,7 +22,7 @@ export function isValidStoredQuote(raw: unknown): raw is StoredQuote {
   if (q.v !== 1) return false;
   if (typeof q.sessionId !== "string" || q.sessionId.length === 0) return false;
   if (typeof q.total !== "number" || !Number.isInteger(q.total) || q.total < 0) return false;
-  if (!Array.isArray(q.passages)) return false;
+  if (!Array.isArray(q.passages) || q.passages.length === 0) return false;
 
   for (const p of q.passages) {
     if (typeof p !== "object" || p === null) return false;
@@ -86,7 +86,12 @@ export async function getQuote(db: D1Database, quoteId: string): Promise<StoredQ
       .bind(quoteId)
       .first<{ payload_json: string }>();
     if (!row) return null;
-    const parsed = JSON.parse(row.payload_json);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.payload_json);
+    } catch {
+      return null;
+    }
     if (!isValidStoredQuote(parsed)) return null;
     return parsed;
   } catch (err) {

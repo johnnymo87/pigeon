@@ -78,12 +78,12 @@ describe("flattenPassages", () => {
     ]);
   });
 
-  it("appends ' · in progress' when inProgress is true and not present in header", () => {
+  it("leaves header as sent without appending ' · in progress' when inProgress is true", () => {
     const result: QuoteResult = {
       summary: null,
       replies: [
         {
-          header: "# 11-24 15:00 · ask",
+          header: "# 11-24 15:00 · ask · untrimmed",
           passages: [["running now"]],
           inProgress: true,
         },
@@ -95,27 +95,7 @@ describe("flattenPassages", () => {
     };
 
     const passages = flattenPassages(result);
-    expect(passages[0]?.header).toBe("# 11-24 15:00 · ask · in progress");
-  });
-
-  it("does not duplicate 'in progress' if already present in header", () => {
-    const result: QuoteResult = {
-      summary: null,
-      replies: [
-        {
-          header: "# 11-24 15:00 · ask · in progress",
-          passages: [["running now"]],
-          inProgress: true,
-        },
-      ],
-      notices: [],
-      warnings: [],
-      empty: null,
-      model: null,
-    };
-
-    const passages = flattenPassages(result);
-    expect(passages[0]?.header).toBe("# 11-24 15:00 · ask · in progress");
+    expect(passages[0]?.header).toBe("# 11-24 15:00 · ask · untrimmed");
   });
 
   it("splits passage lines on embedded newlines so lines are single lines", () => {

@@ -60,7 +60,6 @@ export function buildAnswerModal(
   quoteId: string,
   channelId: string,
   stored: StoredQuote,
-  label?: string,
 ): SlackView {
   const blocks: SlackModalBlock[] = [];
   let lastAddedPassage = 0;
@@ -69,7 +68,7 @@ export function buildAnswerModal(
     const i = idx + 1;
     const passage = stored.passages[idx]!;
 
-    const cleanHeader = passage.header.replace(/^#\s*/, "");
+    const cleanHeader = escapeMrkdwn(passage.header.replace(/^#\s*/, ""));
     const headerLine = passage.first ? `*[${i}]* ${cleanHeader}` : `*[${i}]* …`;
     const quoteLines = passage.lines.map((l) => (l ? `> ${escapeMrkdwn(l)}` : ">"));
     const passageLines = [headerLine, ...quoteLines];

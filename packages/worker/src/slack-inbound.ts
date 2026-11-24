@@ -863,16 +863,26 @@ async function handleInteractivity(
       return OK();
     }
     const view = buildAnswerModal(quoteId, channelId, stored);
-    const res = await callSlack(ws.botToken, "views.open", {
-      trigger_id: payload.trigger_id,
-      view,
-    });
-    if (!res.ok) {
-      const errorMsg =
-        (res.response as { error?: string } | undefined)?.error ??
-        (res.kind === "error" ? res.description : res.kind);
-      console.warn("[slack-inbound] views.open failed", { error: errorMsg, kind: res.kind });
-      await postEphemeral(ws, channelId, errorMsg ?? "Could not open modal");
+    try {
+      const res = await callSlack(
+        ws.botToken,
+        "views.open",
+        {
+          trigger_id: payload.trigger_id,
+          view,
+        },
+        { signal: AbortSignal.timeout(2500) },
+      );
+      if (!res.ok) {
+        const errorMsg =
+          (res.response as { error?: string } | undefined)?.error ??
+          (res.kind === "error" ? res.description : res.kind);
+        console.warn("[slack-inbound] views.open failed", { error: errorMsg, kind: res.kind });
+        await postEphemeral(ws, channelId, errorMsg ?? "Could not open modal");
+      }
+    } catch (err) {
+      console.warn("[slack-inbound] views.open threw", { err: String(err) });
+      await postEphemeral(ws, channelId, "Could not open modal");
     }
     return OK();
   }
@@ -1016,6 +1026,13 @@ async function handleViewSubmission(
     return Response.json({
       response_action: "errors",
       errors: { [errorBlock]: "That session has ended." },
+    });
+  }
+
+  if (await isQueueFull(db, session.machine_id)) {
+    return Response.json({
+      response_action: "errors",
+      errors: { [errorBlock]: `Queue full for ${session.machine_id}; try again shortly.` },
     });
   }
 

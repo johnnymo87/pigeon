@@ -126,6 +126,33 @@ describe("buildAnswerModal", () => {
     });
   });
 
+  it("escapes mrkdwn and defuses broadcasts in header and quote lines", () => {
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "ses_broadcast",
+      passages: [
+        {
+          header: "# Announcement: <!channel> and @here & <test>",
+          lines: [
+            "Check <!everyone> now",
+            "Also bare @channel and @here should defuse",
+          ],
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+
+    const view = buildAnswerModal("quote_bcast", "C_CHAN", stored);
+    expect(view.blocks[0]).toMatchObject({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*[1]* Announcement: &lt;!channel&gt; and @\u200dhere &amp; &lt;test&gt;\n> Check &lt;!everyone&gt; now\n> Also bare @\u200dchannel and @\u200dhere should defuse",
+      },
+    });
+  });
+
   it("splits a 7,000-character passage into sections of at most 3,000 characters", () => {
     // 70 lines of 100 characters each = 7,000 chars
     const lines = Array.from({ length: 70 }, (_, i) => `line ${i + 1}: ${"x".repeat(90)}`);
