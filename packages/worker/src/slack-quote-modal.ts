@@ -123,3 +123,33 @@ export function buildAnswerModal(
     blocks,
   };
 }
+
+export function composeAnswer(stored: StoredQuote, answers: Map<number, string>): string | null {
+  const parts: string[] = [];
+  let lastHeaderWritten: string | null = null;
+
+  for (let idx = 0; idx < stored.passages.length; idx++) {
+    const i = idx + 1;
+    const rawAnswer = answers.get(i);
+    if (!rawAnswer || rawAnswer.trim() === "") continue;
+
+    const answer = rawAnswer.trimEnd();
+    const passage = stored.passages[idx]!;
+
+    const lines: string[] = [];
+    if (passage.header !== lastHeaderWritten) {
+      lines.push(passage.header);
+      lastHeaderWritten = passage.header;
+    }
+
+    for (const line of passage.lines) {
+      lines.push(line ? `> ${line}` : ">");
+    }
+    lines.push(answer);
+
+    parts.push(lines.join("\n"));
+  }
+
+  if (parts.length === 0) return null;
+  return parts.join("\n\n");
+}

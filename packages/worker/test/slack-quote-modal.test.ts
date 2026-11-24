@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildAnswerModal } from "../src/slack-quote-modal";
+import { buildAnswerModal, composeAnswer } from "../src/slack-quote-modal";
 import type { StoredQuote } from "../src/slack-quotes";
 
 describe("buildAnswerModal", () => {
@@ -211,5 +211,81 @@ describe("buildAnswerModal", () => {
         "Passages 3–10 are not shown; answer them in the thread.",
       );
     }
+  });
+});
+
+describe("composeAnswer", () => {
+  const sampleStored: StoredQuote = {
+    v: 1,
+    sessionId: "ses_ans",
+    passages: [
+      {
+        header: "# 11-24 13:05 (wake: mail) · ask",
+        lines: ["line 1", "line 2"],
+        first: true,
+      },
+      {
+        header: "# 11-24 13:05 (wake: mail) · ask",
+        lines: ["line 3", "", "line 4"],
+        first: false,
+      },
+      {
+        header: "# 11-24 13:10 (wake: check) · ask",
+        lines: ["line 5"],
+        first: true,
+      },
+    ],
+    total: 3,
+  };
+
+  it("returns null when answers map is empty or all blank", () => {
+    expect(composeAnswer(sampleStored, new Map())).toBe(null);
+    expect(composeAnswer(sampleStored, new Map([[1, "   "], [2, ""]]))).toBe(null);
+  });
+
+  it("formats single answered passage", () => {
+    const answers = new Map([[1, "my answer"]]);
+    const text = composeAnswer(sampleStored, answers);
+    expect(text).toBe(
+      "# 11-24 13:05 (wake: mail) · ask\n" +
+      "> line 1\n" +
+      "> line 2\n" +
+      "my answer",
+    );
+  });
+
+  it("drops unanswered passages and keeps header for answered one", () => {
+    // Only passage 2 answered
+    const answers = new Map([[2, "answer to 2"]]);
+    const text = composeAnswer(sampleStored, answers);
+    expect(text).toBe(
+      "# 11-24 13:05 (wake: mail) · ask\n" +
+      "> line 3\n" +
+      ">\n" +
+      "> line 4\n" +
+      "answer to 2",
+    );
+  });
+
+  it("omits repeated header for consecutive answered passages from the same reply, and separates by blank line", () => {
+    const answers = new Map([
+      [1, "answer 1   "], // trailing whitespace to be trimmed
+      [2, "answer 2"],
+      [3, "answer 3"],
+    ]);
+    const text = composeAnswer(sampleStored, answers);
+    const expected =
+      "# 11-24 13:05 (wake: mail) · ask\n" +
+      "> line 1\n" +
+      "> line 2\n" +
+      "answer 1\n\n" +
+      "> line 3\n" +
+      ">\n" +
+      "> line 4\n" +
+      "answer 2\n\n" +
+      "# 11-24 13:10 (wake: check) · ask\n" +
+      "> line 5\n" +
+      "answer 3";
+    expect(text).toBe(expected);
   });
 });

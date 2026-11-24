@@ -37,7 +37,7 @@ import { TAG_USAGE_TEXT } from "./tag-command";
 import type { MediaRef } from "./media";
 import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
 import { getQuote } from "./slack-quotes";
-import { buildAnswerModal } from "./slack-quote-modal";
+import { buildAnswerModal, composeAnswer } from "./slack-quote-modal";
 
 export type SlackEndpoint = "events" | "commands" | "interactivity";
 
@@ -233,7 +233,7 @@ export async function handleSlackRequest(
 
   if (endpoint === "events") return handleEvents(db, env, ws, raw, waitUntil);
   if (endpoint === "commands") return handleCommand(db, env, ws, raw);
-  return handleInteractivity(db, env, ws, raw);
+  return handleInteractivity(db, env, ws, raw, waitUntil);
 }
 
 function teamMismatch(ws: SlackWorkspace, teamId: unknown, appId: unknown): boolean {
@@ -804,7 +804,7 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
 
 // ─── interactivity ─────────────────────────────────────────────────────────
 
-interface BlockActionsPayload {
+interface InteractivityPayload {
   type?: string;
   trigger_id?: string;
   api_app_id?: string;
@@ -813,12 +813,26 @@ interface BlockActionsPayload {
   channel?: { id?: string };
   container?: { channel_id?: string };
   actions?: Array<{ value?: string; url?: string }>;
+  view?: {
+    id?: string;
+    callback_id?: string;
+    private_metadata?: string;
+    state?: {
+      values?: Record<string, Record<string, { value?: string | null }>>;
+    };
+  };
 }
 
-async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace, raw: string): Promise<Response> {
-  let payload: BlockActionsPayload;
+async function handleInteractivity(
+  db: D1Database,
+  env: Env,
+  ws: SlackWorkspace,
+  raw: string,
+  waitUntil?: WaitUntil,
+): Promise<Response> {
+  let payload: InteractivityPayload;
   try {
-    payload = JSON.parse(new URLSearchParams(raw).get("payload") ?? "") as BlockActionsPayload;
+    payload = JSON.parse(new URLSearchParams(raw).get("payload") ?? "") as InteractivityPayload;
   } catch {
     return Response.json({ error: "invalid payload" }, { status: 400 });
   }
@@ -827,6 +841,11 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
     console.warn("[slack-inbound] interaction for another team or app refused");
     return new Response("Forbidden", { status: 403 });
   }
+
+  if (payload.type === "view_submission") {
+    return handleViewSubmission(db, env, ws, payload, waitUntil);
+  }
+
   if (payload.type !== "block_actions") return OK();
   if (payload.user?.id !== ws.ownerUserId) return OK(); // owner only, silently (D5)
 
@@ -898,4 +917,144 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
     await postEphemeral(ws, channelId, `Queue full for ${session.label || session.machine_id}.`);
   }
   return OK();
+}
+
+async function handleViewSubmission(
+  db: D1Database,
+  env: Env,
+  ws: SlackWorkspace,
+  payload: InteractivityPayload,
+  waitUntil?: WaitUntil,
+): Promise<Response> {
+  // 1. Owner check
+  if (payload.user?.id !== ws.ownerUserId) return Response.json({});
+  if (payload.view?.callback_id !== "quote_answer") return Response.json({});
+
+  // 2. quoteId from private_metadata; getQuote; missing → error
+  let privateMeta: { quoteId?: string; channelId?: string } = {};
+  try {
+    privateMeta = JSON.parse(payload.view?.private_metadata ?? "{}");
+  } catch {
+    // malformed
+  }
+  const quoteId = privateMeta.quoteId;
+  const channelId = privateMeta.channelId;
+  if (!quoteId || !channelId) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+    });
+  }
+
+  const stored = await getQuote(db, quoteId);
+  if (!stored) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+    });
+  }
+
+  // 3. Answers from payload.view.state.values["a<i>"].answer.value
+  const values = payload.view?.state?.values ?? {};
+  const answers = new Map<number, string>();
+  let firstAnsweredBlock: string | null = null;
+
+  for (let i = 1; i <= stored.passages.length; i++) {
+    const val = values[`a${i}`]?.answer?.value;
+    if (typeof val === "string") {
+      answers.set(i, val);
+      if (!firstAnsweredBlock && val.trim() !== "") {
+        firstAnsweredBlock = `a${i}`;
+      }
+    }
+  }
+
+  // 4. composeAnswer null → errors on a1
+  const text = composeAnswer(stored, answers);
+  if (!text) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "Type an answer under at least one passage." },
+    });
+  }
+
+  // 5. Length > MAX_COMMAND_LENGTH → errors on the first answered block
+  const errorBlock = firstAnsweredBlock ?? "a1";
+  if (text.length > MAX_COMMAND_LENGTH) {
+    return Response.json({
+      response_action: "errors",
+      errors: {
+        [errorBlock]: `Too long to send (${text.length} of ${MAX_COMMAND_LENGTH} characters). Shorten an answer or answer fewer passages.`,
+      },
+    });
+  }
+
+  // 6. Target session: from channelId in private_metadata:
+  // channelHandle, then its topics row session, else getBoundSessionByThread.
+  // None found → the quote's session_id if it still exists in sessions, else errors "That session has ended."
+  const chat = slackChatId(ws);
+  const handle = await channelHandle(db, ws, channelId, true);
+  let resolvedSessionId: string | null = null;
+  if (handle !== null) {
+    const topic = await getByThread(db, chat, handle);
+    if (topic) resolvedSessionId = topic.session_id;
+    if (!resolvedSessionId) {
+      resolvedSessionId = await getBoundSessionByThread(db, chat, handle);
+    }
+  }
+
+  if (!resolvedSessionId) {
+    resolvedSessionId = stored.sessionId;
+  }
+
+  const session = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(resolvedSessionId)
+    .first<{ machine_id: string; label: string | null }>();
+
+  if (!session) {
+    return Response.json({
+      response_action: "errors",
+      errors: { [errorBlock]: "That session has ended." },
+    });
+  }
+
+  const isReplaced = resolvedSessionId !== stored.sessionId;
+
+  // 7. One db.batch([seenInsert(db, "view:" + payload.view.id), touch, statement]);
+  // a seen-conflict → 200 {} (duplicate tap).
+  const viewId = payload.view?.id ?? "";
+  const eventId = `view:${viewId}`;
+  const touch = db
+    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+    .bind(Date.now(), resolvedSessionId);
+
+  const { statement } = commandInsertStatement(db, {
+    machineId: session.machine_id,
+    sessionId: resolvedSessionId,
+    command: text,
+    chatId: chat,
+    commandType: "execute",
+    metadataJson: JSON.stringify({ senderId: payload.user?.id }),
+    messageThreadId: handle,
+  });
+
+  try {
+    await db.batch([seenInsert(db, eventId), touch, statement]);
+  } catch (err) {
+    if (isSeenConflict(err)) return Response.json({});
+    throw err;
+  }
+
+  // 8. Return {response_action:"clear"}; in ctx.waitUntil, post the copy into that channel:
+  // 🧑 via /quote\n<text> via postInChannel.
+  if (handle !== null) {
+    const copyPrefix = isReplaced ? "(the quoted session was replaced; sent to the current one)\n" : "";
+    const copyText = `${copyPrefix}🧑 via /quote\n${text}`;
+    const work = postInChannel(env, db, ws, handle, copyText);
+    if (waitUntil) waitUntil(work);
+    else await work;
+  }
+
+  return Response.json({ response_action: "clear" });
 }

@@ -225,6 +225,18 @@ async function sendAction(box: Box, channelId: string, action: Record<string, un
   return call(box, await signed(box, "interactivity", form, "application/x-www-form-urlencoded"));
 }
 
+async function sendSubmission(box: Box, view: Record<string, unknown>, user = OWNER) {
+  const payload = {
+    type: "view_submission",
+    api_app_id: box.ws.appId,
+    team: { id: box.ws.teamId },
+    user: { id: user },
+    view,
+  };
+  const form = new URLSearchParams({ payload: JSON.stringify(payload) }).toString();
+  return call(box, await signed(box, "interactivity", form, "application/x-www-form-urlencoded"));
+}
+
 interface CommandRow {
   command_id: string;
   machine_id: string;
@@ -973,6 +985,256 @@ describe("interactivity", () => {
     const res = await sendAction(box, ch.channelId, { value: `quote:${quoteId}` }, "UOTHER");
     expect(res.status).toBe(200);
     expect(slackCalls).toHaveLength(0);
+  });
+});
+
+describe("interactivity: view_submission", () => {
+  it("non-owner submission is ignored with 200 {}", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendSubmission(box, {
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId: "qid", channelId: ch.channelId }),
+      state: { values: { a1: { answer: { value: "ans" } } } },
+    }, "UOTHER");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({});
+    expect(await commandsFor(box.machineId)).toHaveLength(0);
+  });
+
+  it("expired quote returns errors on a1", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendSubmission(box, {
+      id: "V_EXP",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId: "qid_missing", channelId: ch.channelId }),
+      state: { values: { a1: { answer: { value: "ans" } } } },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      response_action: "errors",
+      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+    });
+  });
+
+  it("blank answers returns error on a1: Type an answer under at least one passage", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [{ header: "# Header", lines: ["line"], first: true }],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    const res = await sendSubmission(box, {
+      id: "V_BLANK",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: { values: { a1: { answer: { value: "   \n  " } } } },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      response_action: "errors",
+      errors: { a1: "Type an answer under at least one passage." },
+    });
+  });
+
+  it("composed text too long returns error on first answered block", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        { header: "# Header 1", lines: ["line 1"], first: true },
+        { header: "# Header 2", lines: ["line 2"], first: true },
+      ],
+      total: 2,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    // Answer to a2 is huge (over 10,000 chars)
+    const res = await sendSubmission(box, {
+      id: "V_TOOLONG",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: {
+        values: {
+          a1: { answer: { value: "" } },
+          a2: { answer: { value: "x".repeat(10_001) } },
+        },
+      },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.response_action).toBe("errors");
+    expect(body.errors.a2).toMatch(/Too long to send \(\d+ of 10000 characters\)\. Shorten an answer or answer fewer passages\./);
+  });
+
+  it("happy path: queues execute command with senderId, posts copy into channel, returns response_action clear", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        { header: "# 11-24 13:05 (wake: mail) · ask", lines: ["q1"], first: true },
+        { header: "# 11-24 13:05 (wake: mail) · ask", lines: ["q2"], first: false },
+      ],
+      total: 2,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000100" });
+
+    const viewId = `V_${stamp()}`;
+    const res = await sendSubmission(box, {
+      id: viewId,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: {
+        values: {
+          a1: { answer: { value: "my answer to 1" } },
+          a2: { answer: { value: "" } },
+        },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ response_action: "clear" });
+
+    // Verify command was queued
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!).toMatchObject({
+      session_id: ch.sessionId,
+      command_type: "execute",
+      chat_id: box.chat,
+      message_thread_id: ch.handle,
+    });
+    expect(rows[0]!.command).toBe("# 11-24 13:05 (wake: mail) · ask\n> q1\nmy answer to 1");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({ senderId: OWNER });
+
+    // Verify copy was posted into the channel
+    const posts = slackOf("chat.postMessage");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.params.get("text")).toBe("🧑 via /quote\n# 11-24 13:05 (wake: mail) · ask\n&gt; q1\nmy answer to 1");
+  });
+
+  it("duplicate view id is ignored (returns {})", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [{ header: "# Header", lines: ["q"], first: true }],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000101" });
+
+    const viewId = `V_DUP_${stamp()}`;
+    const makeReq = () =>
+      sendSubmission(box, {
+        id: viewId,
+        callback_id: "quote_answer",
+        private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+        state: { values: { a1: { answer: { value: "ans" } } } },
+      });
+
+    const res1 = await makeReq();
+    expect(res1.status).toBe(200);
+    expect(await res1.json()).toEqual({ response_action: "clear" });
+
+    const res2 = await makeReq();
+    expect(res2.status).toBe(200);
+    expect(await res2.json()).toEqual({});
+
+    // Only 1 command queued
+    expect(await commandsFor(box.machineId)).toHaveLength(1);
+  });
+
+  it("prefixes copy post when resolved session differs from quoted session", async () => {
+    const box = await mkBox();
+    const oldSessionId = await seedSession(box.machineId);
+    const newSessionId = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:rotated");
+
+    // Initially bound to oldSessionId, quote created
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: oldSessionId,
+      passages: [{ header: "# Header", lines: ["q"], first: true }],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    // Coordinator rotated to newSessionId
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)",
+    )
+      .bind(box.chat, "stallwatch:rotated", newSessionId, Date.now())
+      .run();
+
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000102" });
+
+    const res = await sendSubmission(box, {
+      id: `V_ROT_${stamp()}`,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: named.channelId }),
+      state: { values: { a1: { answer: { value: "new answer" } } } },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ response_action: "clear" });
+
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.session_id).toBe(newSessionId);
+
+    const posts = slackOf("chat.postMessage");
+    expect(posts[0]!.params.get("text")).toBe(
+      "(the quoted session was replaced; sent to the current one)\n🧑 via /quote\n# Header\n&gt; q\nnew answer",
+    );
+  });
+
+  it("returns error on session ended when no session is found", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const deadSessionId = "ses_dead_and_gone";
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: deadSessionId,
+      passages: [{ header: "# Header", lines: ["q"], first: true }],
+      total: 1,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    // Delete the session channel row from topics so channel has no session
+    await env.DB.prepare("DELETE FROM topics WHERE session_id = ?").bind(ch.sessionId).run();
+
+    const res = await sendSubmission(box, {
+      id: `V_DEAD_${stamp()}`,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: { values: { a1: { answer: { value: "ans" } } } },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      response_action: "errors",
+      errors: { a1: "That session has ended." },
+    });
   });
 });
 
