@@ -48,6 +48,7 @@ export interface StoredQuote {
 
 export const QUOTE_MAX_PASSAGES = 45;
 export const QUOTE_MAX_TOTAL_CHARS = 100_000;
+export const QUOTE_MAX_SINGLE_PASSAGE_CHARS = 6_000;
 
 export class QuoteUnsupportedError extends Error {
   constructor(message = "honkd does not support _honk/quote") {

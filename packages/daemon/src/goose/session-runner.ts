@@ -343,7 +343,7 @@ const CANCEL_CONNECT_TIMEOUT_MS = 3_000;
  * A half-open socket (NAT idle drop, serve SIGKILL with no FIN) emits no close
  * event, so this is the only thing that ends such a wait.
  */
-const NON_TURN_TIMEOUT_MS = 10_000;
+export const NON_TURN_TIMEOUT_MS = 10_000;
 
 /**
  * goose's name for a session it has not named yet (acp/server/new_session.rs).

@@ -123,6 +123,37 @@ export function buildAnswerModal(
   };
 }
 
+function elidePassageLines(rawLines: string[]): string[] {
+  const totalChars = rawLines.reduce((sum, l) => sum + l.length, 0);
+  if (rawLines.length <= 12 && totalChars <= 1500) {
+    return rawLines;
+  }
+
+  let kept: Array<{ line: string; isEllipsis?: boolean }>;
+  if (rawLines.length > 8) {
+    kept = [
+      ...rawLines.slice(0, 4).map((line) => ({ line })),
+      { line: "…", isEllipsis: true },
+      ...rawLines.slice(-4).map((line) => ({ line })),
+    ];
+  } else {
+    kept = rawLines.map((line) => ({ line }));
+  }
+
+  const currentChars = kept.reduce((sum, k) => sum + k.line.length, 0);
+  if (currentChars > 1500) {
+    kept = kept.map((k) => {
+      if (k.isEllipsis) return k;
+      if (k.line.length > 180) {
+        return { line: k.line.slice(0, 180) + "…" };
+      }
+      return k;
+    });
+  }
+
+  return kept.map((k) => k.line);
+}
+
 export function composeAnswer(stored: StoredQuote, answers: Map<number, string>): string | null {
   const parts: string[] = [];
   let lastHeaderWritten: string | null = null;
@@ -141,7 +172,8 @@ export function composeAnswer(stored: StoredQuote, answers: Map<number, string>)
       lastHeaderWritten = passage.header;
     }
 
-    for (const line of passage.lines) {
+    const passageLines = elidePassageLines(passage.lines);
+    for (const line of passageLines) {
       lines.push(line ? `> ${line}` : ">");
     }
     lines.push(answer);

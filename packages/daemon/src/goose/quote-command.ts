@@ -4,6 +4,8 @@ import { coordinatorProgramOf } from "../tag-key";
 import { displayName } from "../notification-service";
 import { excerptOf } from "../text";
 import { splitChatMessage } from "../split-message";
+import { withDeadline } from "./deadline";
+import { NON_TURN_TIMEOUT_MS } from "./session-runner";
 import {
   QuoteUnsupportedError,
   isValidQuoteMetadata,
@@ -88,7 +90,7 @@ export function createQuoteHandler(
 
     let result: QuoteResult;
     try {
-      await client.connect();
+      await withDeadline(client.connect(), NON_TURN_TIMEOUT_MS, "connect");
       if (!client.isHonk) {
         await sendReply(
           "this session is on bare goose, not honkd; /quote needs honkd",

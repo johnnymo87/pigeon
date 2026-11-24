@@ -5,6 +5,7 @@ import {
 } from "../rich-markdown";
 import {
   QUOTE_MAX_PASSAGES,
+  QUOTE_MAX_SINGLE_PASSAGE_CHARS,
   QUOTE_MAX_TOTAL_CHARS,
   type QuotePick,
   type QuoteResult,
@@ -13,10 +14,45 @@ import {
 
 export {
   QUOTE_MAX_PASSAGES,
+  QUOTE_MAX_SINGLE_PASSAGE_CHARS,
   QUOTE_MAX_TOTAL_CHARS,
   type StoredQuote,
   type StoredQuotePassage,
 } from "./quote-types";
+
+export const QUOTE_MAX_BODY_CHARS = 12_000;
+
+/**
+ * Caps a single stored passage at maxChars (default 6,000) of lines.
+ * Truncates its lines and appends a "…" line.
+ */
+export function capSinglePassage(
+  passage: StoredQuotePassage,
+  maxChars = QUOTE_MAX_SINGLE_PASSAGE_CHARS,
+): StoredQuotePassage {
+  const totalChars = passage.lines.reduce((sum, l) => sum + l.length, 0);
+  if (totalChars <= maxChars) {
+    return passage;
+  }
+  const newLines: string[] = [];
+  let remaining = maxChars;
+  for (const line of passage.lines) {
+    if (remaining <= 0) break;
+    if (line.length <= remaining) {
+      newLines.push(line);
+      remaining -= line.length;
+    } else {
+      newLines.push(line.slice(0, remaining));
+      remaining = 0;
+      break;
+    }
+  }
+  newLines.push("…");
+  return {
+    ...passage,
+    lines: newLines,
+  };
+}
 
 /**
  * Renders the pick label for /quote status:
@@ -59,20 +95,23 @@ export function flattenPassages(result: QuoteResult): StoredQuotePassage[] {
 }
 
 /**
- * Caps passages at QUOTE_MAX_PASSAGES (45) and QUOTE_MAX_TOTAL_CHARS (100,000) total line chars.
+ * Caps passages at QUOTE_MAX_PASSAGES (45) and QUOTE_MAX_TOTAL_CHARS (100,000) total line chars,
+ * and caps each single passage at QUOTE_MAX_SINGLE_PASSAGE_CHARS (6,000) chars.
  * `total` records the uncapped count before capping.
  */
 export function capPassages(
   passages: StoredQuotePassage[],
   maxPassages = QUOTE_MAX_PASSAGES,
   maxTotalChars = QUOTE_MAX_TOTAL_CHARS,
+  maxSinglePassageChars = QUOTE_MAX_SINGLE_PASSAGE_CHARS,
 ): { passages: StoredQuotePassage[]; total: number } {
   const total = passages.length;
   const capped: StoredQuotePassage[] = [];
   let totalChars = 0;
 
-  for (const passage of passages) {
+  for (const rawPassage of passages) {
     if (capped.length >= maxPassages) break;
+    const passage = capSinglePassage(rawPassage, maxSinglePassageChars);
     const passageChars = passage.lines.reduce((sum, l) => sum + l.length, 0);
     if (totalChars + passageChars > maxTotalChars && capped.length > 0) break;
     capped.push(passage);
@@ -80,6 +119,66 @@ export function capPassages(
   }
 
   return { passages: capped, total };
+}
+
+function formatPassageLines(passage: StoredQuotePassage, i: number): string[] {
+  const lines: string[] = [];
+  if (passage.first) {
+    lines.push(`[${i + 1}] ${stripHeader(passage.header)}`);
+  } else {
+    lines.push(`[${i + 1}] …`);
+  }
+  for (const line of passage.lines) {
+    const defused = defuseBroadcasts(line);
+    lines.push(defused === "" ? ">" : `> ${defused}`);
+  }
+  return lines;
+}
+
+/**
+ * Selects passages for the body post so that the plain body stays within maxBodyChars (12,000).
+ * If passages must be omitted, stops adding passages and accounts for the trailer line:
+ * "… <k> more passage(s): open them with Answer."
+ */
+export function selectBodyPassages(
+  passages: StoredQuotePassage[],
+  headerText: string,
+  maxBodyChars = QUOTE_MAX_BODY_CHARS,
+): { visiblePassages: StoredQuotePassage[]; omittedCount: number } {
+  if (passages.length === 0) {
+    return { visiblePassages: [], omittedCount: 0 };
+  }
+
+  const basePrefixLength = headerText.length + 2; // headerText + "\n\n"
+  const accumulatedLines: string[] = [];
+  let visibleCount = 0;
+
+  for (let i = 0; i < passages.length; i++) {
+    const passage = passages[i]!;
+    const pLines = formatPassageLines(passage, i);
+    const remainingAfter = passages.length - (i + 1);
+    const trailerLength =
+      remainingAfter > 0
+        ? `\n… ${remainingAfter} more passage(s): open them with Answer.`.length
+        : 0;
+
+    const candidateLinesLength =
+      (accumulatedLines.length > 0 ? accumulatedLines.join("\n").length + 1 : 0) +
+      pLines.join("\n").length;
+    const candidateLength = basePrefixLength + candidateLinesLength + trailerLength;
+
+    if (candidateLength > maxBodyChars && i > 0) {
+      break;
+    }
+
+    accumulatedLines.push(...pLines);
+    visibleCount++;
+  }
+
+  return {
+    visiblePassages: passages.slice(0, visibleCount),
+    omittedCount: passages.length - visibleCount,
+  };
 }
 
 /**
@@ -149,7 +248,12 @@ function stripHeader(header: string): string {
  * > line
  * [2] …
  */
-export function quoteBodyText(result: QuoteResult, pickLabel: string, label: string): string {
+export function quoteBodyText(
+  result: QuoteResult,
+  pickLabel: string,
+  label: string,
+  maxBodyChars = QUOTE_MAX_BODY_CHARS,
+): string {
   const headerLines: string[] = [
     `📋 /quote ${pickLabel} · ${label}`,
     result.summary ? stripHeader(result.summary) : "quoted in full",
@@ -166,21 +270,22 @@ export function quoteBodyText(result: QuoteResult, pickLabel: string, label: str
     return headerLines.join("\n");
   }
 
+  const headerText = headerLines.join("\n");
+  const { visiblePassages, omittedCount } = selectBodyPassages(
+    passages,
+    headerText,
+    maxBodyChars,
+  );
+
   const passageLines: string[] = [];
-  for (let i = 0; i < passages.length; i++) {
-    const passage = passages[i]!;
-    if (passage.first) {
-      passageLines.push(`[${i + 1}] ${stripHeader(passage.header)}`);
-    } else {
-      passageLines.push(`[${i + 1}] …`);
-    }
-    for (const line of passage.lines) {
-      const defused = defuseBroadcasts(line);
-      passageLines.push(defused === "" ? ">" : `> ${defused}`);
-    }
+  for (let i = 0; i < visiblePassages.length; i++) {
+    passageLines.push(...formatPassageLines(visiblePassages[i]!, i));
+  }
+  if (omittedCount > 0) {
+    passageLines.push(`… ${omittedCount} more passage(s): open them with Answer.`);
   }
 
-  return `${headerLines.join("\n")}\n\n${passageLines.join("\n")}`;
+  return `${headerText}\n\n${passageLines.join("\n")}`;
 }
 
 /**
@@ -202,6 +307,7 @@ export function quoteBodyMarkdown(
   result: QuoteResult,
   pickLabel: string,
   label: string,
+  maxBodyChars = QUOTE_MAX_BODY_CHARS,
 ): string | null {
   const headerLines: string[] = [
     `📋 /quote ${escapePlainSlack(pickLabel)} · ${escapePlainSlack(label)}`,
@@ -220,9 +326,26 @@ export function quoteBodyMarkdown(
   if (passages.length === 0) {
     rawMarkdown = headerLines.join("\n");
   } else {
+    const plainHeaderLines: string[] = [
+      `📋 /quote ${pickLabel} · ${label}`,
+      result.summary ? stripHeader(result.summary) : "quoted in full",
+    ];
+    for (const w of result.warnings) {
+      plainHeaderLines.push(w.startsWith("⚠️") ? w : `⚠️ ${w}`);
+    }
+    for (const n of result.notices) {
+      plainHeaderLines.push(n.startsWith("ℹ️") ? n : `ℹ️ ${n}`);
+    }
+    const plainHeaderText = plainHeaderLines.join("\n");
+    const { visiblePassages, omittedCount } = selectBodyPassages(
+      passages,
+      plainHeaderText,
+      maxBodyChars,
+    );
+
     const passageLines: string[] = [];
-    for (let i = 0; i < passages.length; i++) {
-      const passage = passages[i]!;
+    for (let i = 0; i < visiblePassages.length; i++) {
+      const passage = visiblePassages[i]!;
       if (passage.first) {
         passageLines.push(`**[${i + 1}] ${escapePlainSlack(stripHeader(passage.header))}**`);
       } else {
@@ -231,6 +354,9 @@ export function quoteBodyMarkdown(
       for (const line of passage.lines) {
         passageLines.push(line === "" ? ">" : `> ${escapeQuoteLine(line)}`);
       }
+    }
+    if (omittedCount > 0) {
+      passageLines.push(`… ${omittedCount} more passage(s): open them with Answer.`);
     }
     rawMarkdown = `${headerLines.join("\n")}\n\n${passageLines.join("\n")}`;
   }

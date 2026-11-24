@@ -376,6 +376,88 @@ describe("createQuoteHandler", () => {
     expect(replies).toEqual(["/quote failed: connect ECONNREFUSED 127.0.0.1:4000"]);
   });
 
+  it("times out hung client.connect() after 10_000 ms, sends '/quote failed: …', and closes client", async () => {
+    vi.useFakeTimers();
+    try {
+      const replies: string[] = [];
+      const client = {
+        isHonk: true,
+        connect: vi.fn().mockReturnValue(new Promise(() => {})), // never resolving
+        quote: vi.fn(),
+        close: vi.fn(),
+      };
+
+      const handler = createQuoteHandler({
+        getSession: () => makeSession(),
+        createClient: () => client,
+        reply: async (text: string) => {
+          replies.push(text);
+        },
+        upsertOutbox: vi.fn(),
+        machineId: "devbox",
+      });
+
+      await handler(makeMessage());
+      expect(client.close).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(client.close).toHaveBeenCalledTimes(1);
+      expect(replies).toEqual([
+        "/quote failed: goose connect did not answer within 10000ms",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caps body post at 12000 chars while keeping all passages in the stored quote modal", async () => {
+    // 5 passages of 3400 chars each.
+    // Body post shows 3 passages and ends with '… 2 more passage(s): open them with Answer.'
+    // Stored quote has all 5 passages.
+    const replies = Array.from({ length: 5 }, (_, i) => ({
+      header: `# 11-24 13:0${i} · reply ${i + 1}`,
+      passages: [[`passage ${i + 1} line: ${"x".repeat(3300)}`]],
+      inProgress: false,
+    }));
+    const client = {
+      isHonk: true,
+      connect: vi.fn().mockResolvedValue(undefined),
+      quote: vi.fn().mockResolvedValue(makeQuoteResult({ replies })),
+      close: vi.fn(),
+    };
+
+    const outbox: UpsertOutboxInput[] = [];
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => client,
+      reply: vi.fn(),
+      upsertOutbox: (input: UpsertOutboxInput) => outbox.push(input),
+      machineId: "devbox",
+    });
+
+    await handler(makeMessage());
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(outbox).toHaveLength(2);
+    const bodyInput = outbox[0]!;
+    const answerInput = outbox[1]!;
+
+    const bodyPayload = JSON.parse(bodyInput.payload);
+    const bodyText = bodyPayload.messages.map((m: any) => m.text).join("");
+    expect(bodyText.length).toBeLessThanOrEqual(12000);
+    expect(bodyText).toContain("[1] 11-24 13:00 · reply 1");
+    expect(bodyText).toContain("[2] 11-24 13:01 · reply 2");
+    expect(bodyText).toContain("[3] 11-24 13:02 · reply 3");
+    expect(bodyText).not.toContain("[4]");
+    expect(bodyText).toContain("… 2 more passage(s): open them with Answer.");
+
+    const answerPayload = JSON.parse(answerInput.payload);
+    expect(answerPayload.quote.passages).toHaveLength(5);
+    expect(answerPayload.quote.passages[0].header).toBe("# 11-24 13:00 · reply 1");
+    expect(answerPayload.quote.passages[4].header).toBe("# 11-24 13:04 · reply 5");
+  });
+
   it("replies emptyText when result.empty is present", async () => {
     const replies: string[] = [];
     const client = {

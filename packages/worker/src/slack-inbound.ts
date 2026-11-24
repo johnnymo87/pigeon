@@ -708,8 +708,23 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
 
   if (parsed.kind === "quote") {
     let resolved: Resolved | string;
+    let isOwnChannel = true;
     if (parsed.target !== undefined) {
       resolved = await namedSession(db, parsed.target);
+      if (typeof resolved !== "string") {
+        isOwnChannel = false;
+        if (handle !== null) {
+          const topic = await getByThread(db, chat, handle);
+          if (topic && topic.session_id === resolved.sessionId) {
+            isOwnChannel = true;
+          } else {
+            const boundId = await getBoundSessionByThread(db, chat, handle);
+            if (boundId === resolved.sessionId) {
+              isOwnChannel = true;
+            }
+          }
+        }
+      }
     } else {
       const ctx = await channelContext(db, chat, handle);
       if (ctx.kind !== "none") {
@@ -748,8 +763,9 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     });
     if (!ok) return queueFull(resolved.label || resolved.machineId);
 
+    const destination = isOwnChannel ? "here" : "in the session's channel";
     return commandReply(
-      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted here.`,
+      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted ${destination}.`,
       false,
     );
   }
@@ -991,10 +1007,20 @@ async function handleViewSubmission(
   // 5. Length > MAX_COMMAND_LENGTH → errors on the first answered block
   const errorBlock = firstAnsweredBlock ?? "a1";
   if (text.length > MAX_COMMAND_LENGTH) {
+    let answersChars = 0;
+    for (const rawAnswer of answers.values()) {
+      if (rawAnswer && rawAnswer.trim() !== "") {
+        answersChars += rawAnswer.trimEnd().length;
+      }
+    }
+    const message =
+      answersChars > 8000
+        ? `Your answers are too long (${answersChars} characters); shorten them.`
+        : `Too long to send (${text.length} of ${MAX_COMMAND_LENGTH} characters); answer fewer passages.`;
     return Response.json({
       response_action: "errors",
       errors: {
-        [errorBlock]: `Too long to send (${text.length} of ${MAX_COMMAND_LENGTH} characters). Shorten an answer or answer fewer passages.`,
+        [errorBlock]: message,
       },
     });
   }

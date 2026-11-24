@@ -181,17 +181,34 @@ describe("capPassages", () => {
     expect(capped.passages[44]?.lines).toEqual(["line 44"]);
   });
 
-  it("caps at QUOTE_MAX_TOTAL_CHARS (100,000 chars)", () => {
-    // 3 passages of 40,000 chars each = 120,000 chars total -> only 2 fit
-    const longLine = "x".repeat(40_000);
+  it("caps a single stored passage at 6000 chars of lines, truncating lines and appending '…'", () => {
+    const longLine1 = "a".repeat(4000);
+    const longLine2 = "b".repeat(3000); // 4000 + 3000 = 7000 > 6000
     const passages: StoredQuotePassage[] = [
-      { header: "h0", lines: [longLine], first: true },
-      { header: "h1", lines: [longLine], first: true },
-      { header: "h2", lines: [longLine], first: true },
+      { header: "h0", lines: [longLine1, longLine2, "c".repeat(100)], first: true },
     ];
     const capped = capPassages(passages);
-    expect(capped.total).toBe(3);
-    expect(capped.passages.length).toBe(2);
+    expect(capped.total).toBe(1);
+    expect(capped.passages).toHaveLength(1);
+    const lines = capped.passages[0]?.lines!;
+    expect(lines).toHaveLength(3); // longLine1, truncated longLine2, "…"
+    expect(lines[0]).toBe("a".repeat(4000));
+    expect(lines[1]).toBe("b".repeat(2000)); // 4000 + 2000 = 6000
+    expect(lines[2]).toBe("…");
+    const charsWithoutEllipsis = lines.slice(0, 2).reduce((sum: number, l: string) => sum + l.length, 0);
+    expect(charsWithoutEllipsis).toBe(6000);
+  });
+
+  it("caps at QUOTE_MAX_TOTAL_CHARS (100,000 chars)", () => {
+    // 20 passages of 6000 chars each = 120,000 chars total -> only 16 fit (16 * 6000 = 96,000)
+    const passages: StoredQuotePassage[] = Array.from({ length: 20 }, (_, i) => ({
+      header: `h${i}`,
+      lines: ["x".repeat(6000)],
+      first: true,
+    }));
+    const capped = capPassages(passages);
+    expect(capped.total).toBe(20);
+    expect(capped.passages.length).toBe(16);
   });
 });
 
@@ -369,6 +386,34 @@ describe("quoteBodyText", () => {
     expect(text).toContain("> group <\u200d!subteam^S123|team>");
     expect(text).toContain("> ping @\u200dchannel and @\u200dhere and @\u200deveryone");
   });
+
+  it("caps body post at 12000 chars and ends with '… <k> more passage(s): open them with Answer.'", () => {
+    // 5 passages, each ~3500 chars. Total ~17500 chars.
+    // Passages 1, 2, 3 fit (~10500 chars + header < 12000 chars).
+    // Passage 4 would push plain body over 12000 chars, so it stops and omits 2 passages.
+    const replies = Array.from({ length: 5 }, (_, i) => ({
+      header: `# 11-24 13:0${i} · reply ${i + 1}`,
+      passages: [[`line for p${i + 1}: ${"x".repeat(3400)}`]],
+      inProgress: false,
+    }));
+    const result: QuoteResult = {
+      summary: null,
+      replies,
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: null,
+    };
+
+    const text = quoteBodyText(result, "since", "label");
+    expect(text.length).toBeLessThanOrEqual(12000);
+    expect(text).toContain("[1] 11-24 13:00 · reply 1");
+    expect(text).toContain("[2] 11-24 13:01 · reply 2");
+    expect(text).toContain("[3] 11-24 13:02 · reply 3");
+    expect(text).not.toContain("[4]");
+    expect(text).not.toContain("[5]");
+    expect(text).toMatch(/… 2 more passage\(s\): open them with Answer\.$/);
+  });
 });
 
 describe("quoteBodyMarkdown", () => {
@@ -422,13 +467,16 @@ describe("quoteBodyMarkdown", () => {
   });
 
   it("returns null when length exceeds SLACK_RICH_MAX_CHARS", () => {
-    const hugeLine = "a".repeat(SLACK_RICH_MAX_CHARS);
+    // 6,000 '*' characters fit within single passage and plain body limits,
+    // but escaping each '*' to '\*' doubles the length to 12,000 chars, which
+    // with header lines exceeds SLACK_RICH_MAX_CHARS (12,000).
+    const lineWithSpecial = "*".repeat(6000);
     const result: QuoteResult = {
       summary: "summary",
       replies: [
         {
           header: "# h",
-          passages: [[hugeLine]],
+          passages: [[lineWithSpecial]],
           inProgress: false,
         },
       ],

@@ -1090,7 +1090,7 @@ describe("interactivity: view_submission", () => {
     };
     await putQuote(env.DB, quoteId, stored);
 
-    // Answer to a2 is huge (over 10,000 chars)
+    // Answer to a2 is huge (over 10,000 chars, answers dominate > 8000)
     const res = await sendSubmission(box, {
       id: "V_TOOLONG",
       callback_id: "quote_answer",
@@ -1105,7 +1105,48 @@ describe("interactivity: view_submission", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(body.response_action).toBe("errors");
-    expect(body.errors.a2).toMatch(/Too long to send \(\d+ of 10000 characters\)\. Shorten an answer or answer fewer passages\./);
+    expect(body.errors.a2).toBe("Your answers are too long (10001 characters); shorten them.");
+  });
+
+  it("too-long composed text where passages dominate returns 'Too long to send (<n> of 10000 characters); answer fewer passages.'", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    // 8 passages of ~1200 chars each (each <= 12 lines and <= 1500 chars so not elided)
+    // plus answers totaling 4000 chars (<= 8000 chars)
+    // Total text > 10,000 chars
+    const passages = Array.from({ length: 8 }, (_, i) => ({
+      header: `# Header ${i + 1}`,
+      lines: [
+        `line 1: ${"a".repeat(300)}`,
+        `line 2: ${"b".repeat(300)}`,
+        `line 3: ${"c".repeat(300)}`,
+      ],
+      first: true,
+    }));
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages,
+      total: 8,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    const values: Record<string, { answer: { value: string } }> = {};
+    for (let i = 1; i <= 8; i++) {
+      values[`a${i}`] = { answer: { value: "ans".repeat(150) } }; // 450 chars * 8 = 3600 chars
+    }
+
+    const res = await sendSubmission(box, {
+      id: "V_TOOLONG_PASSAGES",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: { values },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    expect(body.response_action).toBe("errors");
+    expect(body.errors.a1).toMatch(/^Too long to send \(\d+ of 10000 characters\); answer fewer passages\.$/);
   });
 
   it("queue full returns response_action errors on the first answer block", async () => {
@@ -1569,7 +1610,7 @@ describe("slash commands: queueing and refusals", () => {
     const res = await sendCommand(box, "/quote", `${target} full 3`, alerts.channelId);
     const body = await json(res);
     expect(body.response_type).toBe("ephemeral");
-    expect(body.text).toContain("⏳ Quoting last 3 (full) for inbound. The trim can take a minute or two; the quote will be posted here.");
+    expect(body.text).toContain("⏳ Quoting last 3 (full) for inbound. The trim can take a minute or two; the quote will be posted in the session's channel.");
     const rows = await commandsFor(box.machineId);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({

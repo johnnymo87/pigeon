@@ -315,4 +315,95 @@ describe("composeAnswer", () => {
       "answer 3";
     expect(text).toBe(expected);
   });
+
+  it("elides an answered passage longer than 12 lines to first 4, '> …', and last 4 lines", () => {
+    const rawLines = Array.from({ length: 16 }, (_, i) => `line ${i + 1}`);
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "ses_long_lines",
+      passages: [
+        {
+          header: "# 11-24 13:05 · ask",
+          lines: rawLines,
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    const answers = new Map([[1, "my answer"]]);
+    const text = composeAnswer(stored, answers);
+    const expected =
+      "# 11-24 13:05 · ask\n" +
+      "> line 1\n" +
+      "> line 2\n" +
+      "> line 3\n" +
+      "> line 4\n" +
+      "> …\n" +
+      "> line 13\n" +
+      "> line 14\n" +
+      "> line 15\n" +
+      "> line 16\n" +
+      "my answer";
+    expect(text).toBe(expected);
+  });
+
+  it("elides an answered passage with <= 12 lines but > 1500 chars, truncating kept lines at ~180 chars if still over 1500 chars", () => {
+    // 10 lines of 200 chars each = 2000 chars total (> 1500 chars, but <= 12 lines)
+    const rawLines = Array.from({ length: 10 }, (_, i) => `L${i + 1}_${"x".repeat(195)}`);
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "ses_long_chars",
+      passages: [
+        {
+          header: "# 11-24 13:05 · ask",
+          lines: rawLines,
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    const answers = new Map([[1, "my answer"]]);
+    const text = composeAnswer(stored, answers);
+
+    // Kept lines are first 4 and last 4, plus '> …'
+    // But 8 lines of 200 chars = 1600 chars > 1500 chars!
+    // So kept lines longer than 180 chars must be truncated at 180 chars with "…"
+    const expectedLine = (i: number) => `> ${`L${i + 1}_${"x".repeat(195)}`.slice(0, 180)}…`;
+    const expected =
+      "# 11-24 13:05 · ask\n" +
+      `${expectedLine(0)}\n` +
+      `${expectedLine(1)}\n` +
+      `${expectedLine(2)}\n` +
+      `${expectedLine(3)}\n` +
+      "> …\n" +
+      `${expectedLine(6)}\n` +
+      `${expectedLine(7)}\n` +
+      `${expectedLine(8)}\n` +
+      `${expectedLine(9)}\n` +
+      "my answer";
+    expect(text).toBe(expected);
+  });
+
+  it("does not truncate lines at 180 chars if kept lines are <= 1500 chars", () => {
+    // 14 lines of 50 chars each = 700 chars total (< 1500 chars, but > 12 lines)
+    const rawLines = Array.from({ length: 14 }, (_, i) => `line ${i + 1}: ${"a".repeat(40)}`);
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "ses_14_short",
+      passages: [
+        {
+          header: "# Header",
+          lines: rawLines,
+          first: true,
+        },
+      ],
+      total: 1,
+    };
+    const answers = new Map([[1, "answer"]]);
+    const text = composeAnswer(stored, answers);
+
+    // Kept lines (8 lines * 49 chars = ~392 chars <= 1500) -> not truncated at 180
+    expect(text).toContain(`> line 1: ${"a".repeat(40)}`);
+    expect(text).toContain("> …\n> line 11:");
+  });
 });
