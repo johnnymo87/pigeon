@@ -694,6 +694,10 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     return commandReply(`Renamed session \`${resolved.sessionId}\` to "${formatted}".`, true);
   }
 
+  if (parsed.kind === "quote") {
+    return commandReply("Not implemented yet", false);
+  }
+
   // /tag. The channel's session decides which machine's backlog (oc-tags is per machine), as the
   // topic does on Telegram. `/tag <session-id> <tag>` also works where there is none (#alerts, a
   // named channel): the named session is then the context too (spec §5, "/tag works anywhere").
@@ -729,6 +733,7 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     metadataJson = JSON.stringify({ targetSessionId: target });
     ack = `Tagging session ${target} as ${tagArgs.tag} on ${resolved.machineId}...`;
   }
+
   const ok = await queue({
     machineId: resolved.machineId,
     sessionId: resolved.sessionId,
