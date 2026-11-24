@@ -15,6 +15,7 @@ import { handleRelay, handleRelayAck, handleRelayFail, runRelayExpiry } from "./
 import { handleLaunchRelay, handleLaunchRelayAck, runLaunchExpiry } from "./remote-launch";
 import { handleRemoteSessions } from "./remote-sessions";
 import { sweepSlackPosts } from "./chat/slack-posts";
+import { sweepSlackQuotes } from "./slack-quotes";
 import { hasSlackWorkspaceSecret } from "./chat/slack-config";
 import { handleNamedTopic, handleNamedTopicBind, handleNamedTopicUnbind } from "./named-topics";
 
@@ -238,6 +239,8 @@ export default {
         if (swept > 0) console.log("[slack] slack_posts retention", { swept });
         const seen = await sweepSlackSeenEvents(env.DB);
         if (seen > 0) console.log("[slack] slack_seen_events retention", { swept: seen });
+        const quotes = await sweepSlackQuotes(env.DB);
+        if (quotes > 0) console.log("[slack] slack_quotes retention", { swept: quotes });
       } catch (err) {
         console.error("Slack post retention failed:", err);
       }
