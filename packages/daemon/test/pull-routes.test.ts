@@ -928,6 +928,72 @@ describe("pull routes", () => {
     });
   });
 
+  describe("POST /session-start notify handling for pull sessions", () => {
+    it("persists notify: false and suppresses chat notice on banked swarm message", async () => {
+      const { app, storage: s } = newApp();
+      const startRes = await post(app, "/session-start", {
+        session_id: "ses_pull_quiet",
+        backend_kind: PULL_BACKEND_KIND,
+        notify: false,
+        pull_sources: ["chat-reply", "swarm"],
+      });
+      expect(startRes.status).toBe(200);
+      const session = s.sessions.get("ses_pull_quiet");
+      expect(session).not.toBeNull();
+      expect(session!.backendKind).toBe(PULL_BACKEND_KIND);
+      expect(session!.notify).toBe(false);
+
+      const sendRes = await post(app, "/swarm/send", {
+        from: "ses_sender",
+        to: "ses_pull_quiet",
+        kind: "chat",
+        payload: "hello quiet pull session",
+      });
+      expect(sendRes.status).toBe(202);
+      const sendBody = (await sendRes.json()) as { accepted: boolean; banked?: boolean; msg_id: string };
+      expect(sendBody.accepted).toBe(true);
+      expect(sendBody.banked).toBe(true);
+
+      // Banked in pull_inbox
+      expect(s.pullInbox.claim("ses_pull_quiet", 10_000)).toHaveLength(1);
+
+      // No chat notice in outbox
+      expect(s.outbox.getByNotificationId(`w:${sendBody.msg_id}`)).toBeNull();
+    });
+
+    it("persists notify: true and emits chat notice on banked swarm message", async () => {
+      const { app, storage: s } = newApp();
+      const startRes = await post(app, "/session-start", {
+        session_id: "ses_pull_loud",
+        backend_kind: PULL_BACKEND_KIND,
+        notify: true,
+        pull_sources: ["chat-reply", "swarm"],
+      });
+      expect(startRes.status).toBe(200);
+      const session = s.sessions.get("ses_pull_loud");
+      expect(session).not.toBeNull();
+      expect(session!.backendKind).toBe(PULL_BACKEND_KIND);
+      expect(session!.notify).toBe(true);
+
+      const sendRes = await post(app, "/swarm/send", {
+        from: "ses_sender",
+        to: "ses_pull_loud",
+        kind: "chat",
+        payload: "hello loud pull session",
+      });
+      expect(sendRes.status).toBe(202);
+      const sendBody = (await sendRes.json()) as { accepted: boolean; banked?: boolean; msg_id: string };
+      expect(sendBody.accepted).toBe(true);
+      expect(sendBody.banked).toBe(true);
+
+      // Banked in pull_inbox
+      expect(s.pullInbox.claim("ses_pull_loud", 10_000)).toHaveLength(1);
+
+      // Chat notice IS in outbox
+      expect(s.outbox.getByNotificationId(`w:${sendBody.msg_id}`)).not.toBeNull();
+    });
+  });
+
   describe("auth", () => {
     it("requires the bearer token like every other non-anonymous route", async () => {
       storage = openStorageDb(":memory:");

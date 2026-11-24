@@ -1,6 +1,7 @@
 import type { StorageDb } from "../storage/database";
 import type { SwarmMessageRecord } from "../storage/swarm-repo";
 import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
+import { isPullBackend } from "../adapters/goose-pull";
 import { excerptOf } from "../text";
 import {
   displayName,
@@ -49,7 +50,11 @@ export function enqueueSwarmChatNotice(
     }
 
     const target = storage.sessions.get(record.toSession);
-    if (target && target.backendKind === GOOSE_BACKEND_KIND && !target.notify) {
+    if (
+      target &&
+      ((target.backendKind === GOOSE_BACKEND_KIND && !target.notify) ||
+        (isPullBackend(target) && target.notify === false))
+    ) {
       console.log(
         `[swarm-notice] quieted msgId=${record.msgId} sessionId=${record.toSession} reason=goose_notify_false`,
       );

@@ -516,7 +516,7 @@ Note what this does *not* change: a genuine non-abort `Error` under `errors-only
 - **Swarm banking for opted-in pull sessions**: All insertions into `swarm_messages` route through one helper (`bankOrInsertSwarmMessage`). When a swarm message targets a session with a pull backend (`goose-pull`) that opted into `"swarm"` via `pull_sources`:
   - It is banked directly into `pull_inbox` (`source: "swarm"`, `sender_id = from`, preserving `msg_id`, `kind`, and `reply_to`).
   - The background `SwarmArbiter` is bypassed entirely — no `prompt_async` calls, no 10-attempt retry loop, and no TargetUnavailableError.
-  - Recipient chat notice (topic or channel) is still enqueued at insert time (`enqueueSwarmChatNotice`) on fresh inserts (skipped on idempotent repeats).
+  - Recipient chat notice (topic or channel) is still enqueued at insert time (`enqueueSwarmChatNotice`) on fresh inserts (skipped on idempotent repeats), unless the pull session was registered with `notify: false` (which suppresses chat notices, and outbox sender drops any orphaned entries terminally with `notify_false_goose`).
   - `POST /swarm/send` returns `202 {accepted: true, msg_id: "...", banked: true}`. Non-banked sends omit `banked`.
 - **Refusals at send time**:
   - `POST /swarm/schedule` targeting an opted-in pull session returns `409 {error: "scheduled messages cannot be banked for a pull session"}`. A pull session has no delivery clock to honour `deliver_at`, and moving scheduling onto the recipient was rejected.
