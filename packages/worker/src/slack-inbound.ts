@@ -26,7 +26,7 @@ import { getBySession, getByThread, topicName } from "./topics";
 import { currentDirSuffix, editTopicName } from "./topic-rename";
 import { commandInsertStatement, isMachineRecent, isQueueFull, MAX_QUEUE_PER_MACHINE, queueCommand } from "./d1-ops";
 import { transportForChat } from "./chat";
-import { parseChatCommand, sessionCommandAck, SESSION_COMMAND_USAGE_TEXT } from "./chat/commands";
+import { parseChatCommand, quotePickLabel, sessionCommandAck, SESSION_COMMAND_USAGE_TEXT } from "./chat/commands";
 import { ambiguousRefText, noSessionRefText, resolveSessionRef } from "./chat/session-ref";
 import { slackChatId, slackWorkspaceForMachine, type SlackWorkspace } from "./chat/slack-config";
 import { verifySlackSignature } from "./chat/slack-verify";
@@ -69,7 +69,17 @@ const NOT_FOUND = () => Response.json({ error: "Not found" }, { status: 404 });
  * message. The command already ran; injecting the echo would hand the session its own command as
  * a prompt (live check pigeon-4ogz.8), and in an unbound named channel it drew the digest hint.
  */
-export const SLACK_APP_COMMANDS = ["/launch", "/kill", "/interrupt", "/compact", "/retitle", "/mcp", "/model", "/tag"] as const;
+export const SLACK_APP_COMMANDS = [
+  "/launch",
+  "/kill",
+  "/interrupt",
+  "/compact",
+  "/retitle",
+  "/mcp",
+  "/model",
+  "/tag",
+  "/quote",
+] as const;
 
 function isSlashCommandEcho(event: SlackMessageEvent): boolean {
   if (event.subtype !== undefined || (Array.isArray(event.files) && event.files.length > 0)) return false;
@@ -695,7 +705,51 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
   }
 
   if (parsed.kind === "quote") {
-    return commandReply("Not implemented yet", false);
+    let resolved: Resolved | string;
+    if (parsed.target !== undefined) {
+      resolved = await namedSession(db, parsed.target);
+    } else {
+      const ctx = await channelContext(db, chat, handle);
+      if (ctx.kind !== "none") {
+        resolved = await contextSession(db, ctx);
+      } else {
+        let boundId: string | null = null;
+        if (handle !== null) {
+          boundId = await getBoundSessionByThread(db, chat, handle);
+        }
+        if (boundId) {
+          const s = await db
+            .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+            .bind(boundId)
+            .first<{ machine_id: string; label: string | null }>();
+          if (!s) {
+            resolved = `Session \`${boundId}\` not found.`;
+          } else if (!(await isMachineRecent(db, s.machine_id))) {
+            resolved = `${s.machine_id} is not recently seen.`;
+          } else {
+            resolved = { sessionId: boundId, machineId: s.machine_id, label: s.label };
+          }
+        } else {
+          resolved = NO_CHANNEL_SESSION;
+        }
+      }
+    }
+    if (typeof resolved === "string") return commandReply(resolved, false);
+
+    const ok = await queue({
+      machineId: resolved.machineId,
+      sessionId: resolved.sessionId,
+      command: args ? `${name} ${args}` : name,
+      commandType: "quote",
+      label: resolved.label,
+      metadataJson: JSON.stringify({ pick: parsed.pick, full: parsed.full }),
+    });
+    if (!ok) return queueFull(resolved.label || resolved.machineId);
+
+    return commandReply(
+      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted here.`,
+      false,
+    );
   }
 
   // /tag. The channel's session decides which machine's backlog (oc-tags is per machine), as the

@@ -30,7 +30,7 @@ const BOT_SCOPES = [
   "files:write",
   "incoming-webhook",
 ];
-const COMMANDS = ["/compact", "/interrupt", "/kill", "/launch", "/mcp", "/model", "/retitle", "/tag"];
+const COMMANDS = ["/compact", "/interrupt", "/kill", "/launch", "/mcp", "/model", "/quote", "/retitle", "/tag"];
 
 function run(args: string[]): { code: number; stdout: string; stderr: string } {
   try {
@@ -83,7 +83,7 @@ describe("render", () => {
     expect(m.settings.event_subscriptions.user_events).toBeUndefined();
   });
 
-  it("registers exactly the eight commands, with /retitle instead of /rename", () => {
+  it("registers exactly the nine commands, with /retitle instead of /rename", () => {
     const names = m.features.slash_commands.map((c: { command: string }) => c.command).sort();
     expect(names).toEqual(COMMANDS);
     expect(names).not.toContain("/rename");

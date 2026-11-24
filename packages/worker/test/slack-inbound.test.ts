@@ -1105,4 +1105,93 @@ describe("slash commands: queueing and refusals", () => {
     const label = await env.DB.prepare("SELECT label FROM sessions WHERE session_id = ?").bind(ch.sessionId).first<{ label: string }>();
     expect(label!.label).toBe("inbound");
   });
+
+  it("/quote in a session's channel queues a quote and replies ephemeral", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendCommand(box, "/quote", "5", ch.channelId);
+    const body = await json(res);
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain("⏳ Quoting last 5 for inbound. The trim can take a minute or two; the quote will be posted here.");
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      command_type: "quote",
+      command: "/quote 5",
+      session_id: ch.sessionId,
+      chat_id: box.chat,
+      message_thread_id: ch.handle,
+    });
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({
+      pick: { kind: "last", n: 5 },
+      full: false,
+    });
+  });
+
+  it("/quote in a coordinator's bound named channel queues for the bound session", async () => {
+    const box = await mkBox();
+    const coord = await seedSession(box.machineId);
+    const named = await seedNamedChannel(box, "stallwatch:prog3");
+    await env.DB.prepare("INSERT INTO named_topic_bindings (chat_id, topic_key, session_id, bound_at) VALUES (?, ?, ?, ?)")
+      .bind(box.chat, "stallwatch:prog3", coord, Date.now())
+      .run();
+    const res = await sendCommand(box, "/quote", "prev", named.channelId);
+    const body = await json(res);
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain("⏳ Quoting since your previous message for inbound. The trim can take a minute or two; the quote will be posted here.");
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      command_type: "quote",
+      command: "/quote prev",
+      session_id: coord,
+      message_thread_id: named.handle,
+    });
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({
+      pick: { kind: "prev" },
+      full: false,
+    });
+  });
+
+  it("/quote with explicit session id works anywhere and overrides the channel", async () => {
+    const box = await mkBox();
+    const target = await seedSession(box.machineId);
+    const alerts = await seedNamedChannel(box, "_alerts");
+    const res = await sendCommand(box, "/quote", `${target} full 3`, alerts.channelId);
+    const body = await json(res);
+    expect(body.response_type).toBe("ephemeral");
+    expect(body.text).toContain("⏳ Quoting last 3 (full) for inbound. The trim can take a minute or two; the quote will be posted here.");
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      command_type: "quote",
+      command: `/quote ${target} full 3`,
+      session_id: target,
+      message_thread_id: alerts.handle,
+    });
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({
+      pick: { kind: "last", n: 3 },
+      full: true,
+    });
+  });
+
+  it("/quote with unknown session or no session is refused, and malformed args answer usage", async () => {
+    const box = await mkBox();
+    const alerts = await seedNamedChannel(box, "_alerts");
+    const ch = await seedSessionChannel(box);
+
+    const none = await json(await sendCommand(box, "/quote", "ses_nosuchsession00", alerts.channelId));
+    expect(none.response_type).toBe("ephemeral");
+    expect(none.text).toMatch(/No session matches/);
+
+    const noChan = await json(await sendCommand(box, "/quote", "", alerts.channelId));
+    expect(noChan.response_type).toBe("ephemeral");
+    expect(noChan.text).toContain("This channel has no session");
+
+    const usage = await json(await sendCommand(box, "/quote", "0", ch.channelId));
+    expect(usage.response_type).toBe("ephemeral");
+    expect(usage.text).toContain("Usage (the session id is optional");
+
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
 });

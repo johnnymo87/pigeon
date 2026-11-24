@@ -29,6 +29,22 @@ export type QuotePick =
   | { kind: "prev" }
   | { kind: "last"; n: number };
 
+export function quotePickLabel(pick: QuotePick, full: boolean): string {
+  let text: string;
+  switch (pick.kind) {
+    case "since":
+      text = "since your last message";
+      break;
+    case "prev":
+      text = "since your previous message";
+      break;
+    case "last":
+      text = `last ${pick.n}`;
+      break;
+  }
+  return full ? `${text} (full)` : text;
+}
+
 export type ChatCommand =
   | { kind: "launch"; launch: LaunchCommand }
   /**

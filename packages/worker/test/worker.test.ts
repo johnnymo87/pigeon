@@ -2736,6 +2736,22 @@ describe("poll and ack endpoints", () => {
     expect(body.sessionId).toBe("sess-tag-top-1");
   });
 
+  it("handlePollNext returns sessionId, command, and metadata for quote", async () => {
+    const now = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO commands (command_id, machine_id, session_id, command_type, command, chat_id, metadata_json, status, created_at)
+       VALUES (?, ?, ?, 'quote', ?, ?, ?, 'pending', ?)`,
+    ).bind("quote-cmd-1", "machine-quote", "sess-quote-1", "/quote 5", "8248645256",
+           JSON.stringify({ pick: { kind: "last", n: 5 }, full: false }), now).run();
+
+    const res = await handlePollNext(env.DB, env, makeRequest("https://worker/machines/machine-quote/next"), "machine-quote");
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.commandType).toBe("quote");
+    expect(body.sessionId).toBe("sess-quote-1");
+    expect(body.command).toBe("/quote 5");
+    expect(body.metadata).toEqual({ pick: { kind: "last", n: 5 }, full: false });
+  });
+
   it("handlePollNext returns tag and targetSessionId for tag_set", async () => {
     const now = Date.now();
     await env.DB.prepare(
