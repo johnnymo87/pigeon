@@ -1,6 +1,8 @@
 # Slack `/quote` (pigeon-14uk) — options
 
-Status: **options, awaiting Jonathan's picks.** Nothing is built.
+Status: **decided 2026-11-24** — Jonathan: "go with the recommendations" (1.1 `/quote` slash
+command, 2a post + Answer button → answer modal, 3a session-wide, 4a honkd `_honk/quote`,
+including his OK to add `_honk/quote` to pigeon's `ALLOWED_ACP_METHODS`). Contract below.
 
 Jonathan (2026-11-24, honk pigeon channel): "this /quote stuff is working great and i need
 something like it in slack, the interface i use to communicate with you via pigeon when I'm on
@@ -178,3 +180,39 @@ scrolls on iOS. Cheap to check with a mock modal before the honk work lands.
 3. **"Since my last message":** session-wide, as honk (rec.) / per Slack thread / explicit anchor post.
 4. **Engine:** honkd `_honk/quote` (rec.; honk work, plus your OK for one method on pigeon's
    honkd allowlist) / pigeon ports the trim.
+
+## `_honk/quote` contract (for the honk bead)
+
+JSON-RPC request on a honkd viewer connection (pigeon's existing per-session socket):
+
+```jsonc
+{ "sessionId": "<goose session id>",
+  "pick": { "kind": "since" } | { "kind": "prev" } | { "kind": "last", "n": 5 },
+  "full": false,            // true = untrimmed, no model call (honk's /quote full)
+  "tag": "pigeon",          // optional session-tags tag for the oneshot's spend; overrides tagFrom
+  "quoteId": "<opaque>" }   // optional; "_honk/quote/cancel {quoteId}" cancels, as oneshot
+```
+
+Reply: honk's own pick and trim, as structured data instead of composer text, so pigeon can
+number passages and put an answer box under each without reparsing `#` lines:
+
+```jsonc
+{ "summary": "# honk: trimmed by claude-opus-5-5, kept 12 of 80 lines from 3 of 5 replies",
+                            // honk's first '#' line; null when nothing was trimmed
+  "replies": [
+    { "header": "# 11-24 13:05 (wake: mail) · ask",   // exactly as honk's composer shows it
+      "passages": [["line", "", "line"], ["line"]],   // kept runs of verbatim reply lines,
+                                                      // oldest first; honk's "# …" sits between
+      "inProgress": false } ],
+  "notices": ["…"],         // what honk would show as notices (e.g. fell back to the last 3)
+  "warnings": ["…"],        // e.g. trim failed, quoted in full; 2 of 5 calls failed
+  "empty": null,            // or "no_replies" | "never_spoke" | "nothing_since" | "one_prompt"
+                            //    | "nothing_kept", with the reason also in notices
+  "model": "claude-opus-5-5" }
+```
+
+Lines are unquoted (pigeon adds `> `). Unknown session → a JSON-RPC error. Requirements beyond
+honk chat's `/quote`: reads the session's log without loading an idle session into goose; the
+"same replies reuse the last answer" cache lives in honkd; `tag` overrides `tagFrom` (fixes the
+`stall-watcher-runs` attribution for honk chat's `/quote` too, if honk chat passes its program).
+Timeout: honk's per-call 90 s budget, batches as today; pigeon waits up to 10 min.
