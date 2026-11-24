@@ -1434,7 +1434,8 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
             const fromMachine =
               inbound &&
               inbound.fromSession === m.senderId &&
-              inbound.toSession === sessionId
+              inbound.toSession === sessionId &&
+              inbound.receivedAt === m.createdAt
                 ? inbound.fromMachine
                 : null;
             return {
