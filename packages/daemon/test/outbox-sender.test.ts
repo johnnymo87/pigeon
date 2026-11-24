@@ -136,6 +136,49 @@ describe("OutboxSender.processOnce()", () => {
     });
   });
 
+  it("passes quote from outbox payload on the last chunk to sendNotification", async () => {
+    const storedQuote = {
+      v: 1,
+      sessionId: "sess-quote-1",
+      passages: [{ header: "# 11-24 · ask", lines: ["quote line"], first: true }],
+      total: 1,
+    };
+    storage.outbox.upsert({
+      notificationId: "notif-quote-1",
+      sessionId: "sess-quote-1",
+      requestId: "req-1",
+      kind: "quote",
+      payload: JSON.stringify({
+        messages: [{ text: "Chunk 1" }, { text: "Chunk 2" }],
+        replyMarkup: { inline_keyboard: [[{ text: "Answer", callback_data: "quote:123" }]] },
+        notificationId: "notif-quote-1",
+        quote: storedQuote,
+      }),
+      token: "tok-abc",
+    }, 1_000);
+
+    const sendNotification = makeSendNotification({ ok: true });
+    const sender = new OutboxSender({
+      storage,
+      sendNotification,
+      nowFn: () => 5_000,
+    });
+
+    await sender.processOnce();
+
+    expect(sendNotification).toHaveBeenCalledTimes(2);
+    expect(sendNotification).toHaveBeenNthCalledWith(
+      1,
+      expect.not.objectContaining({ quote: expect.anything() }),
+    );
+    expect(sendNotification).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        quote: storedQuote,
+      }),
+    );
+  });
+
   it("retries on transient failure with backoff (ok: false)", async () => {
     storage.outbox.upsert(BASE_OUTBOX_INPUT, 1_000);
 

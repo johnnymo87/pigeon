@@ -77,6 +77,13 @@ describe("session events repo", () => {
     expect(repo.unreadBySession().get("s1")?.unread).toBe(1);
   });
 
+  it("excludes quote notifications requested by the user", () => {
+    const { repo } = seeded();
+    repo.append({ sessionId: "s1", notificationId: "n1", kind: "quote", sentAt: 1 });
+    repo.append({ sessionId: "s1", notificationId: "n2", kind: "swarm", sentAt: 2 });
+    expect(repo.unreadBySession().get("s1")?.unread).toBe(1);
+  });
+
   it("counts unknown kinds -- topic-visible is the safe default", () => {
     const { repo } = seeded();
     repo.append({ sessionId: "s1", notificationId: "n1", kind: "something-new", sentAt: 1 });

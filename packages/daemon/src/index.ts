@@ -64,6 +64,7 @@ import { dropGooseRunnerWithSwarmNotify } from "./goose/runner-rotation.js";
 import { settleSwarmMessage } from "./swarm/swarm-settle.js";
 import { GooseAcpClient, ownRunPolicy } from "./goose/acp-client.js";
 import { webSocketTransport } from "./goose/ws-transport.js";
+import { createQuoteHandler } from "./goose/quote-command.js";
 import { ingestGooseLaunchCommand } from "./goose/launch-ingest.js";
 import { GooseRunnerRegistry, GooseSessionRunner } from "./goose/session-runner.js";
 import { recoverGooseTurns } from "./goose/recover-inflight.js";
@@ -897,6 +898,25 @@ poller = config.workerUrl && config.workerApiKey && config.machineId
             sendChatReply: createChatReplySender(sendChatMessage, msg),
           });
         },
+        onQuote: createQuoteHandler({
+          getSession: (id) => storage.sessions.get(id),
+          createClient: (url, token) =>
+            new GooseAcpClient({
+              url,
+              transportFactory: webSocketTransport(token),
+              log: (m, f) => console.log(`[goose-quote] ${m}`, f ?? ""),
+            }),
+          reply: async (text, msg) => {
+            if (msg) {
+              const sendReply = createChatReplySender(sendChatMessage, msg);
+              await sendReply(msg.chatId, text);
+            }
+          },
+          upsertOutbox: (input, now) => storage.outbox.upsert(input, now),
+          machineId: config.machineId ?? "",
+          now: () => Date.now(),
+          log: (m, ...args) => console.log(`[quote-command] ${m}`, ...args),
+        }),
         onMcpList: async (msg) => {
           if (await handleGooseControl("mcp", msg)) return;
           const client = clientForSession(msg.sessionId);

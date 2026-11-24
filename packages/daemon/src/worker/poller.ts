@@ -9,7 +9,7 @@ import { SWARM_RELAY_HEADER } from "./relay-client";
 import { BACKENDS_HEADER } from "./backends";
 import type { WorkerHealthObserver } from "./worker-health";
 import type { TopicMap } from "../alert-links";
-import type { QuotePick } from "../goose/quote-types";
+import type { QuotePick, StoredQuote } from "../goose/quote-types";
 
 export interface SendNotificationInput {
   sessionId: string;
@@ -31,6 +31,8 @@ export interface SendNotificationInput {
   rich?: { markdown: string; dialect: "slack" };
   /** Ask for the owner mention (Slack only; pigeon-4ogz.5). Sent only when true. */
   notifyOwner?: boolean;
+  /** Stored quote payload for /quote answer button (pigeon-14uk). */
+  quote?: StoredQuote;
 }
 
 export type WorkerResultSuccess<T = unknown> = {
@@ -1077,7 +1079,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner } = input;
+    const { sessionId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner, quote } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -1098,6 +1100,7 @@ export class Poller {
           ...(onTopicUnavailable !== undefined ? { onTopicUnavailable } : {}),
           ...(rich ? { rich } : {}),
           ...(notifyOwner === true ? { notifyOwner: true } : {}),
+          ...(quote ? { quote } : {}),
         }),
       }),
     );

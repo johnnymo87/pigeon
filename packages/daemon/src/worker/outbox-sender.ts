@@ -12,6 +12,7 @@ import { GOOSE_BACKEND_KIND } from "../goose/backend-kind";
 import { isPullBackend } from "../adapters/goose-pull";
 import { PENDING_QUESTION_TTL_MS, REPLY_TOKEN_TTL_MS } from "../storage/schema";
 import type { SendNotificationInput, UploadMediaResult, WorkerResult } from "./poller";
+import type { StoredQuote } from "../goose/quote-types";
 import {
   outboundMediaKey,
   readPendingMedia,
@@ -161,6 +162,7 @@ const EXPIRY_BY_KIND: Record<string, number> = {
   card: REPLY_TOKEN_TTL_MS,
   swarm: REPLY_TOKEN_TTL_MS,
   mirror: MIRROR_TTL_MS,
+  quote: REPLY_TOKEN_TTL_MS,
 };
 
 export function expiryForKind(kind: string): number {
@@ -815,6 +817,7 @@ export class OutboxSender {
         let threaded: boolean | undefined;
         let rich: { markdown: string; dialect: "slack" } | undefined;
         let notifyOwner: true | undefined;
+        let quote: StoredQuote | undefined;
         try {
           const parsed = JSON.parse(entry.payload) as {
             messages?: Array<{ text: string; entities?: unknown[] }>;
@@ -826,6 +829,7 @@ export class OutboxSender {
             threaded?: boolean;
             rich?: { markdown?: unknown; dialect?: unknown };
             notifyOwner?: unknown;
+            quote?: unknown;
           };
           messages = parsed.messages ?? (parsed.message ? [parsed.message] : []);
           replyMarkup = parsed.replyMarkup;
@@ -843,6 +847,13 @@ export class OutboxSender {
               : undefined;
           // Set at enqueue (pigeon-4ogz.5); the worker decides whether it becomes a mention.
           notifyOwner = parsed.notifyOwner === true ? true : undefined;
+          if (
+            parsed.quote &&
+            typeof parsed.quote === "object" &&
+            (parsed.quote as { v?: unknown }).v === 1
+          ) {
+            quote = parsed.quote as StoredQuote;
+          }
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           this.markTerminal(entry, now, "payload_parse_failed", errMsg);
@@ -979,6 +990,7 @@ export class OutboxSender {
               // a fixed chunk means a retry that resumes later never posts them a second time.
               ...(i === 0 && media.length > 0 ? { media } : {}),
               ...(notifyOwner ? { notifyOwner } : {}),
+              ...(isLast && quote ? { quote } : {}),
             });
 
             if (onTopicUnavailable === "general") {

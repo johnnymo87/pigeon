@@ -5,13 +5,14 @@ import type BetterSqlite3 from "better-sqlite3";
  *
  * `mirror` is the user's own prompt echoed back into the topic. Counting it would
  * mean typing a message to yourself increments your own unread badge.
+ * `quote` is a transcript trim requested by the user (/quote).
  *
  * Everything else counts, including kinds that do not exist yet. Topic-visible is
  * the safe default: a new kind that should not count produces a badge that is too
  * high and gets noticed, whereas defaulting to "don't count" produces a badge that
  * is too low and is indistinguishable from having read everything.
  */
-const UNCOUNTED_KINDS = ["mirror"] as const;
+const UNCOUNTED_KINDS = ["mirror", "quote"] as const;
 
 export interface AppendInput {
   sessionId: string;
