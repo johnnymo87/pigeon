@@ -56,6 +56,21 @@ export class QuoteUnsupportedError extends Error {
   }
 }
 
+export function isValidQuotePick(raw: unknown): raw is QuotePick {
+  if (typeof raw !== "object" || raw === null) return false;
+  const p = raw as Record<string, unknown>;
+  if (p.kind === "since" || p.kind === "prev") return true;
+  if (p.kind === "last" && typeof p.n === "number" && Number.isInteger(p.n) && p.n > 0) return true;
+  return false;
+}
+
+export function isValidQuoteMetadata(raw: unknown): raw is { pick: QuotePick; full: boolean } {
+  if (typeof raw !== "object" || raw === null) return false;
+  const m = raw as Record<string, unknown>;
+  if (typeof m.full !== "boolean") return false;
+  return isValidQuotePick(m.pick);
+}
+
 const VALID_EMPTY_REASONS = new Set<QuoteEmptyReason>([
   "no_replies",
   "never_spoke",

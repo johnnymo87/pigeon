@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   parseQuoteResult,
   QuoteUnsupportedError,
+  isValidQuotePick,
+  isValidQuoteMetadata,
   type QuoteResult,
 } from "../src/goose/quote-types.js";
 
@@ -185,5 +187,29 @@ describe("parseQuoteResult", () => {
         warnings: [null],
       }),
     ).toThrow(/malformed _honk\/quote result/);
+  });
+});
+
+describe("isValidQuotePick and isValidQuoteMetadata", () => {
+  it("validates quote picks", () => {
+    expect(isValidQuotePick({ kind: "since" })).toBe(true);
+    expect(isValidQuotePick({ kind: "prev" })).toBe(true);
+    expect(isValidQuotePick({ kind: "last", n: 3 })).toBe(true);
+    expect(isValidQuotePick({ kind: "last", n: 0 })).toBe(false);
+    expect(isValidQuotePick({ kind: "last", n: -1 })).toBe(false);
+    expect(isValidQuotePick({ kind: "last", n: 1.5 })).toBe(false);
+    expect(isValidQuotePick({ kind: "unknown" })).toBe(false);
+    expect(isValidQuotePick(null)).toBe(false);
+    expect(isValidQuotePick("since")).toBe(false);
+  });
+
+  it("validates quote metadata", () => {
+    expect(isValidQuoteMetadata({ pick: { kind: "since" }, full: false })).toBe(true);
+    expect(isValidQuoteMetadata({ pick: { kind: "prev" }, full: true })).toBe(true);
+    expect(isValidQuoteMetadata({ pick: { kind: "last", n: 5 }, full: false })).toBe(true);
+    expect(isValidQuoteMetadata({ pick: { kind: "since" } })).toBe(false);
+    expect(isValidQuoteMetadata({ pick: "since", full: false })).toBe(false);
+    expect(isValidQuoteMetadata(null)).toBe(false);
+    expect(isValidQuoteMetadata({})).toBe(false);
   });
 });
