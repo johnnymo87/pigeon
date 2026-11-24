@@ -209,6 +209,130 @@ describe("pull routes", () => {
       expect(swMsg.reply_to).toBe("orig_1");
     });
 
+    it("returns from_machine for relayed messages, null for local messages", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
+
+      // Local chat row (no relay_inbound record)
+      bank(s, "m_local", 2_000);
+
+      // Local swarm row (no relay_inbound record)
+      s.pullInbox.bank(
+        {
+          msgId: "m_sw_local",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "local swarm",
+          senderId: "ses_local_peer",
+        },
+        2_050,
+      );
+
+      // Relayed swarm row matching sender and to_session
+      s.pullInbox.bank(
+        {
+          msgId: "m_relayed",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "relayed swarm",
+          senderId: "ses_remote_sender",
+        },
+        2_100,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_relayed",
+          fromMachine: "devbox",
+          fromSession: "ses_remote_sender",
+          toSession: "ses_pull",
+          fromLabel: null,
+        },
+        2_100,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const localChat = body.messages.find((m) => m.msg_id === "m_local")!;
+      expect(localChat).toHaveProperty("from_machine", null);
+
+      const localSwarm = body.messages.find((m) => m.msg_id === "m_sw_local")!;
+      expect(localSwarm).toHaveProperty("from_machine", null);
+
+      const relayed = body.messages.find((m) => m.msg_id === "m_relayed")!;
+      expect(relayed).toHaveProperty("from_machine", "devbox");
+    });
+
+    it("returns from_machine as null when relay_inbound sender or recipient mismatches", async () => {
+      const { app, storage: s } = newApp();
+      s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
+
+      // Mismatched senderId vs relay_inbound fromSession
+      s.pullInbox.bank(
+        {
+          msgId: "m_mismatched_sender",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "spoofed sender",
+          senderId: "ses_spoofed",
+        },
+        2_100,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_mismatched_sender",
+          fromMachine: "devbox",
+          fromSession: "ses_actual_sender",
+          toSession: "ses_pull",
+          fromLabel: null,
+        },
+        2_100,
+      );
+
+      // Mismatched sessionId vs relay_inbound toSession
+      s.pullInbox.bank(
+        {
+          msgId: "m_mismatched_recipient",
+          sessionId: "ses_pull",
+          source: "swarm",
+          payload: "mismatched recipient",
+          senderId: "ses_sender",
+        },
+        2_200,
+      );
+      s.relayInbound.record(
+        {
+          msgId: "m_mismatched_recipient",
+          fromMachine: "devbox",
+          fromSession: "ses_sender",
+          toSession: "ses_other",
+          fromLabel: null,
+        },
+        2_200,
+      );
+
+      const res = await post(app, "/pull/drain", { session_id: "ses_pull" });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        messages: Array<{
+          msg_id: string;
+          from_machine: string | null;
+        }>;
+      };
+
+      const mismatchedSender = body.messages.find((m) => m.msg_id === "m_mismatched_sender")!;
+      expect(mismatchedSender).toHaveProperty("from_machine", null);
+
+      const mismatchedRecipient = body.messages.find((m) => m.msg_id === "m_mismatched_recipient")!;
+      expect(mismatchedRecipient).toHaveProperty("from_machine", null);
+    });
+
     it("claims chat-reply rows before swarm rows under limit", async () => {
       const { app, storage: s } = newApp();
       s.sessions.setPullSources("ses_pull", ["chat-reply", "swarm"]);
