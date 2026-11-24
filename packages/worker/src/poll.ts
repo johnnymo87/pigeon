@@ -353,6 +353,16 @@ function buildCommandBody(result: Awaited<ReturnType<typeof pollNextCommand>> & 
     } else {
       body.pattern = meta.pattern;
     }
+  } else if (result.commandType === "quote") {
+    body.sessionId = result.sessionId;
+    body.command = result.command;
+    if (result.metadataJson) {
+      try {
+        body.metadata = JSON.parse(result.metadataJson);
+      } catch {
+        // Ignore malformed metadata JSON
+      }
+    }
   } else {
     // "execute" -- regular command
     body.sessionId = result.sessionId;

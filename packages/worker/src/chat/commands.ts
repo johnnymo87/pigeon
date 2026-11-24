@@ -24,6 +24,27 @@ export type SessionCommandType =
   | "model_list"
   | "model_set";
 
+export type QuotePick =
+  | { kind: "since" }
+  | { kind: "prev" }
+  | { kind: "last"; n: number };
+
+export function quotePickLabel(pick: QuotePick, full: boolean): string {
+  let text: string;
+  switch (pick.kind) {
+    case "since":
+      text = "since your last message";
+      break;
+    case "prev":
+      text = "since your previous message";
+      break;
+    case "last":
+      text = `last ${pick.n}`;
+      break;
+  }
+  return full ? `${text} (full)` : text;
+}
+
 export type ChatCommand =
   | { kind: "launch"; launch: LaunchCommand }
   /**
@@ -35,6 +56,7 @@ export type ChatCommand =
   | { kind: "session"; type: SessionCommandType; arg: string; target?: string }
   | { kind: "rename"; title: string | undefined }
   | { kind: "tag"; args: TagCommand }
+  | { kind: "quote"; pick: QuotePick; full: boolean; target?: string }
   /**
    * A session command whose arguments do not parse (`/kill now`, `/kill ses_e7128` with a
    * too-short id, `/mcp`). Answered with `SESSION_COMMAND_USAGE_TEXT`, never forwarded: the same
@@ -51,10 +73,11 @@ export const SESSION_COMMAND_USAGE_TEXT = [
   "/compact [<session-id>]",
   "/mcp [<session-id>] list | enable <server> | disable <server>",
   "/model [<session-id>] [<provider/model>]",
+  "/quote [<session-id>] [N|prev|full]",
 ].join("\n");
 
 /** Command names whose malformed forms answer with usage (`/killall` is not one of them). */
-const SESSION_COMMAND_NAME_RE = /^\/(kill|interrupt|compact|mcp)(?=$|\s)/;
+const SESSION_COMMAND_NAME_RE = /^\/(kill|interrupt|compact|mcp|quote)(?=$|\s)/;
 
 /**
  * A session reference: an opencode (`ses_`) or goose (`gse_`) id, whole or cut short after at
@@ -74,6 +97,50 @@ const TAG_RE = /^\/tag(?:\s+([\s\S]*))?$/;
 
 function session(type: SessionCommandType, arg: string, target: string | undefined): ChatCommand {
   return target ? { kind: "session", type, arg, target } : { kind: "session", type, arg };
+}
+
+function parseQuoteCommand(text: string): ChatCommand | null {
+  if (!/^\/quote(?=$|\s)/.test(text)) return null;
+  const tokens = text.trim().split(/\s+/);
+  const args = tokens.slice(1);
+  let idx = 0;
+  let target: string | undefined;
+
+  if (idx < args.length && SESSION_REF_RE.test(args[idx]!)) {
+    target = args[idx];
+    idx++;
+  }
+
+  let full = false;
+  if (idx < args.length && (args[idx] === "full" || args[idx] === "all")) {
+    full = true;
+    idx++;
+  }
+
+  let pick: QuotePick = { kind: "since" };
+  if (idx < args.length) {
+    const token = args[idx]!;
+    if (token === "prev") {
+      pick = { kind: "prev" };
+      idx++;
+    } else if (/^\d+$/.test(token)) {
+      const n = Number(token);
+      if (Number.isInteger(n) && n >= 1 && n <= 1000) {
+        pick = { kind: "last", n };
+        idx++;
+      } else {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  }
+
+  if (idx < args.length) {
+    return null;
+  }
+
+  return target ? { kind: "quote", pick, full, target } : { kind: "quote", pick, full };
 }
 
 export function parseChatCommand(text: string): ChatCommand | null {
@@ -107,6 +174,9 @@ export function parseChatCommand(text: string): ChatCommand | null {
 
   const tag = text.match(TAG_RE);
   if (tag) return { kind: "tag", args: parseTagArgs(tag[1]) };
+
+  const quote = parseQuoteCommand(text);
+  if (quote) return quote;
 
   // /model always parses (any single argument without "/" lists), so it never reaches here.
   const named = text.match(SESSION_COMMAND_NAME_RE);

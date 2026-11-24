@@ -15,6 +15,11 @@ import {
   type AcpTransportFactory,
   type GooseAcpClientOptions,
 } from "../src/goose/acp-client.js";
+import {
+  QuoteUnsupportedError,
+  type QuoteRequest,
+  type QuoteResult,
+} from "../src/goose/quote-types.js";
 
 /**
  * A fake ACP peer driven message-by-message.
@@ -1465,6 +1470,7 @@ describe("GooseAcpClient", () => {
         "session/cancel",
         "_goose/unstable/session/rename",
         "session/load",
+        "_honk/quote",
       ]);
     });
 
@@ -1576,6 +1582,209 @@ describe("GooseAcpClient", () => {
       await client.connect();
 
       await expect(client.renameSession("sess-1", "New Title")).rejects.toThrow(GooseProtocolError);
+    });
+
+    it("sends _honk/quote request with params and resolves validated QuoteResult", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      const expectedResult: QuoteResult = {
+        summary: "# honk: trimmed by claude-opus-5-5, kept 5 of 10 lines",
+        replies: [
+          {
+            header: "# 11-24 13:05 (wake: mail) · ask",
+            passages: [["first line", "second line"]],
+            inProgress: false,
+          },
+        ],
+        notices: ["fell back to last 3"],
+        warnings: [],
+        empty: null,
+        model: "claude-opus-5-5",
+      };
+
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_honk/quote") {
+          p.reply(msg.id, expectedResult);
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const req: QuoteRequest = {
+        sessionId: "sess-1",
+        pick: { kind: "last", n: 5 },
+        full: false,
+        tag: "pigeon-tag",
+        quoteId: "cmd-456",
+      };
+
+      const result = await client.quote(req, { timeoutMs: 5000 });
+
+      const quoteMsg = peer.lastOf("_honk/quote");
+      expect(quoteMsg).toBeDefined();
+      expect(quoteMsg).toMatchObject({
+        jsonrpc: "2.0",
+        method: "_honk/quote",
+        params: {
+          sessionId: "sess-1",
+          pick: { kind: "last", n: 5 },
+          full: false,
+          tag: "pigeon-tag",
+          quoteId: "cmd-456",
+        },
+      });
+      expect(quoteMsg).toHaveProperty("id");
+      expect(result).toEqual(expectedResult);
+    });
+
+    it("omits tag and quoteId when undefined", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_honk/quote") {
+          p.reply(msg.id, {
+            summary: null,
+            replies: [],
+            notices: [],
+            warnings: [],
+            empty: "nothing_since",
+            model: null,
+          });
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const req: QuoteRequest = {
+        sessionId: "sess-2",
+        pick: { kind: "since" },
+        full: true,
+      };
+
+      await client.quote(req);
+
+      const quoteMsg = peer.lastOf("_honk/quote");
+      expect(quoteMsg).toBeDefined();
+      expect(quoteMsg!.params).toEqual({
+        sessionId: "sess-2",
+        pick: { kind: "since" },
+        full: true,
+      });
+      expect(quoteMsg!.params).not.toHaveProperty("tag");
+      expect(quoteMsg!.params).not.toHaveProperty("quoteId");
+    });
+
+    it("rejects with QuoteUnsupportedError on JSON-RPC error -32601", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_honk/quote") {
+          p.replyError(msg.id, -32601, "Method not found");
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const req: QuoteRequest = {
+        sessionId: "sess-1",
+        pick: { kind: "prev" },
+        full: false,
+      };
+
+      await expect(client.quote(req)).rejects.toThrow(QuoteUnsupportedError);
+    });
+
+    it("rejects with GooseProtocolError on other JSON-RPC error", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_honk/quote") {
+          p.replyError(msg.id, -32000, "session not found", "detail text");
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const req: QuoteRequest = {
+        sessionId: "sess-1",
+        pick: { kind: "since" },
+        full: false,
+      };
+
+      await expect(client.quote(req)).rejects.toThrow(GooseProtocolError);
+      await expect(client.quote(req)).rejects.toThrow(/session not found/);
+    });
+
+    it("rejects with GooseProtocolError('malformed _honk/quote result') on malformed result", async () => {
+      const peer = new FakePeer();
+      autoHandshake(peer);
+      let replyResult: unknown = {};
+      const prevOnRequest = peer.onRequest;
+      peer.onRequest = (msg, p) => {
+        prevOnRequest(msg, p);
+        if (msg.method === "_honk/quote") {
+          p.reply(msg.id, replyResult);
+        }
+      };
+      const client = makeClient(peer);
+      await client.connect();
+
+      const req: QuoteRequest = {
+        sessionId: "sess-1",
+        pick: { kind: "since" },
+        full: false,
+      };
+
+      // Missing replies
+      replyResult = { summary: "summary" };
+      await expect(client.quote(req)).rejects.toThrow(GooseProtocolError);
+      await expect(client.quote(req)).rejects.toThrow("malformed _honk/quote result");
+
+      // A passage that is not string[]
+      replyResult = {
+        replies: [
+          {
+            header: "hdr",
+            passages: [[123]],
+            inProgress: false,
+          },
+        ],
+      };
+      await expect(client.quote(req)).rejects.toThrow(GooseProtocolError);
+      await expect(client.quote(req)).rejects.toThrow("malformed _honk/quote result");
+    });
+
+    it("rejects with a timeout error if no reply within timeoutMs", async () => {
+      vi.useFakeTimers();
+      try {
+        const peer = new FakePeer();
+        autoHandshake(peer);
+        // Do not reply to _honk/quote
+        const client = makeClient(peer);
+        await client.connect();
+
+        const req: QuoteRequest = {
+          sessionId: "sess-1",
+          pick: { kind: "since" },
+          full: false,
+        };
+
+        const quotePromise = client.quote(req, { timeoutMs: 100 });
+        const assertion = expect(quotePromise).rejects.toThrow(/did not answer within 100ms/);
+
+        await vi.advanceTimersByTimeAsync(100);
+        await assertion;
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

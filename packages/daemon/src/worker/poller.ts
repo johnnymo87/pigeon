@@ -9,6 +9,7 @@ import { SWARM_RELAY_HEADER } from "./relay-client";
 import { BACKENDS_HEADER } from "./backends";
 import type { WorkerHealthObserver } from "./worker-health";
 import type { TopicMap } from "../alert-links";
+import type { QuotePick, StoredQuote } from "../goose/quote-types";
 
 export interface SendNotificationInput {
   sessionId: string;
@@ -30,6 +31,8 @@ export interface SendNotificationInput {
   rich?: { markdown: string; dialect: "slack" };
   /** Ask for the owner mention (Slack only; pigeon-4ogz.5). Sent only when true. */
   notifyOwner?: boolean;
+  /** Stored quote payload for /quote answer button (pigeon-14uk). */
+  quote?: StoredQuote;
 }
 
 export type WorkerResultSuccess<T = unknown> = {
@@ -373,6 +376,20 @@ export interface TagSetDirMessage {
   messageThreadId?: number;
 }
 
+export interface QuoteMessage {
+  commandId: string;
+  commandType: "quote";
+  sessionId: string;
+  chatId: string;
+  command?: string;
+  messageThreadId?: number;
+  media?: { key: string; mime: string; filename: string; size: number };
+  metadata?: {
+    pick: QuotePick;
+    full: boolean;
+  };
+}
+
 export type TagMessage = TagTopMessage | TagListMessage | TagSetMessage | TagSetDirMessage;
 
 export type WorkerMessage =
@@ -389,7 +406,8 @@ export type WorkerMessage =
   | TagTopMessage
   | TagListMessage
   | TagSetMessage
-  | TagSetDirMessage;
+  | TagSetDirMessage
+  | QuoteMessage;
 
 export interface PollerCallbacks {
   onCommand: (msg: ExecuteMessage) => Promise<void>;
@@ -407,6 +425,7 @@ export interface PollerCallbacks {
   onTagSet: (msg: TagSetMessage) => Promise<void>;
   /** Optional handler for stale tag_set_dir commands during deploy skew. */
   onTagSetDir?: (msg: TagSetDirMessage) => Promise<void>;
+  onQuote?: (msg: QuoteMessage) => Promise<void>;
   /**
    * Called for every inbound message that names a session, before it is dispatched.
    *
@@ -666,6 +685,7 @@ export class Poller {
     "execute", "launch", "kill", "interrupt", "compact",
     "mcp_list", "mcp_enable", "mcp_disable", "model_list", "model_set",
     "tag_top", "tag_list", "tag_set", "tag_set_dir",
+    "quote",
   ]);
 
   private isKnownCommandType(msg: WorkerMessage): boolean {
@@ -737,6 +757,10 @@ export class Poller {
       } else if (msg.commandType === "tag_set_dir") {
         if (this.callbacks.onTagSetDir) {
           await this.callbacks.onTagSetDir(msg);
+        }
+      } else if (msg.commandType === "quote") {
+        if (this.callbacks.onQuote) {
+          await this.callbacks.onQuote(msg);
         }
       }
     } catch (err) {
@@ -1055,7 +1079,7 @@ export class Poller {
   async sendNotification(
     input: SendNotificationInput,
   ): Promise<WorkerResult> {
-    const { sessionId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner } = input;
+    const { sessionId, text, replyMarkup, media, notificationId, entities, title, dir, threaded, onTopicUnavailable, rich, notifyOwner, quote } = input;
     const result = await safeExecuteWorkerFetch(() =>
       this.fetchFn(`${this.config.workerUrl}/notifications/send`, {
         method: "POST",
@@ -1076,6 +1100,7 @@ export class Poller {
           ...(onTopicUnavailable !== undefined ? { onTopicUnavailable } : {}),
           ...(rich ? { rich } : {}),
           ...(notifyOwner === true ? { notifyOwner: true } : {}),
+          ...(quote ? { quote } : {}),
         }),
       }),
     );

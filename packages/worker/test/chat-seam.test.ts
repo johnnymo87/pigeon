@@ -9,7 +9,7 @@ import d1Schema from "../src/d1-schema.sql?raw";
 import { fakeTransport, results } from "./slack-harness";
 import { isSlackChatId, transportForChat, type ChatTransport } from "../src/chat";
 import { failureDetails, isPermanentTopicFailure } from "../src/chat/failures";
-import { parseChatCommand, SESSION_REF_RE } from "../src/chat/commands";
+import { parseChatCommand, SESSION_COMMAND_USAGE_TEXT, SESSION_REF_RE } from "../src/chat/commands";
 import { resolveSessionRef } from "../src/chat/session-ref";
 import { deleteBySession, finalize, getBySession, markOpen, renameProvisional, reserve } from "../src/topics";
 import { resolveTopic } from "../src/topic-manager";
@@ -255,6 +255,81 @@ describe("parseChatCommand", () => {
       kind: "launch",
       launch: { kind: "launch", machineId: "devbox", prompt: "hi" },
     });
+  });
+
+  it("parses valid /quote forms", () => {
+    expect(parseChatCommand("/quote")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+    });
+    expect(parseChatCommand("/quote 5")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 5 },
+      full: false,
+    });
+    expect(parseChatCommand("/quote prev")).toEqual({
+      kind: "quote",
+      pick: { kind: "prev" },
+      full: false,
+    });
+    expect(parseChatCommand("/quote full")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: true,
+    });
+    expect(parseChatCommand("/quote full 5")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 5 },
+      full: true,
+    });
+    expect(parseChatCommand("/quote all prev")).toEqual({
+      kind: "quote",
+      pick: { kind: "prev" },
+      full: true,
+    });
+    const id = "ses_xxxxxxxx";
+    expect(parseChatCommand(`/quote ${id} 3`)).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 3 },
+      full: false,
+      target: id,
+    });
+    expect(parseChatCommand(`/quote ${id}`)).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      target: id,
+    });
+    expect(parseChatCommand(`/quote ${id} full`)).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: true,
+      target: id,
+    });
+    expect(parseChatCommand(`/quote ${id} all 10`)).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 10 },
+      full: true,
+      target: id,
+    });
+    expect(parseChatCommand("/quote 1000")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 1000 },
+      full: false,
+    });
+  });
+
+  it("answers malformed /quote with usage", () => {
+    expect(parseChatCommand("/quote 0")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote -1")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote prev 3")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote fulll")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote 1001")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote ses_abc")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote full 0")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quotex")).toBeNull();
+    expect(SESSION_COMMAND_USAGE_TEXT).toContain("/quote [<session-id>] [N|prev|full]");
   });
 
   it("SESSION_REF_RE matches full ids and >=8-char prefixes only", () => {

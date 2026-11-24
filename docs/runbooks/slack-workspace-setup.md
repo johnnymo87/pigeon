@@ -109,7 +109,8 @@ It names the app `pigeon <m>` and points every request URL at
 Bot scopes `chat:write channels:manage channels:read channels:history channels:join commands
 files:read files:write incoming-webhook`; user scope `channels:write` (unarchive, and the real-mute
 candidate); bot event `message.channels`; interactivity on; slash commands `/launch /kill
-/interrupt /compact /retitle /mcp /model /tag` (`/rename` is a Slack built-in, hence `/retitle`);
+/interrupt /compact /retitle /mcp /model /tag /quote` (`/rename` is a Slack built-in, hence `/retitle`;
+adding `/quote` to a live app is a manifest edit without app reinstall);
 token rotation off (rotated tokens expire in 12 h, and nothing in the worker refreshes them).
 
 ### 2. Create the workspace

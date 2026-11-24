@@ -26,7 +26,7 @@ import { getBySession, getByThread, topicName } from "./topics";
 import { currentDirSuffix, editTopicName } from "./topic-rename";
 import { commandInsertStatement, isMachineRecent, isQueueFull, MAX_QUEUE_PER_MACHINE, queueCommand } from "./d1-ops";
 import { transportForChat } from "./chat";
-import { parseChatCommand, sessionCommandAck, SESSION_COMMAND_USAGE_TEXT } from "./chat/commands";
+import { parseChatCommand, quotePickLabel, sessionCommandAck, SESSION_COMMAND_USAGE_TEXT } from "./chat/commands";
 import { ambiguousRefText, noSessionRefText, resolveSessionRef } from "./chat/session-ref";
 import { slackChatId, slackWorkspaceForMachine, type SlackWorkspace } from "./chat/slack-config";
 import { verifySlackSignature } from "./chat/slack-verify";
@@ -36,6 +36,8 @@ import { LAUNCH_USAGE_TEXT } from "./launch-command";
 import { TAG_USAGE_TEXT } from "./tag-command";
 import type { MediaRef } from "./media";
 import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
+import { getQuote } from "./slack-quotes";
+import { buildAnswerModal, composeAnswer } from "./slack-quote-modal";
 
 export type SlackEndpoint = "events" | "commands" | "interactivity";
 
@@ -69,7 +71,17 @@ const NOT_FOUND = () => Response.json({ error: "Not found" }, { status: 404 });
  * message. The command already ran; injecting the echo would hand the session its own command as
  * a prompt (live check pigeon-4ogz.8), and in an unbound named channel it drew the digest hint.
  */
-export const SLACK_APP_COMMANDS = ["/launch", "/kill", "/interrupt", "/compact", "/retitle", "/mcp", "/model", "/tag"] as const;
+export const SLACK_APP_COMMANDS = [
+  "/launch",
+  "/kill",
+  "/interrupt",
+  "/compact",
+  "/retitle",
+  "/mcp",
+  "/model",
+  "/tag",
+  "/quote",
+] as const;
 
 function isSlashCommandEcho(event: SlackMessageEvent): boolean {
   if (event.subtype !== undefined || (Array.isArray(event.files) && event.files.length > 0)) return false;
@@ -221,7 +233,7 @@ export async function handleSlackRequest(
 
   if (endpoint === "events") return handleEvents(db, env, ws, raw, waitUntil);
   if (endpoint === "commands") return handleCommand(db, env, ws, raw);
-  return handleInteractivity(db, env, ws, raw);
+  return handleInteractivity(db, env, ws, raw, waitUntil);
 }
 
 function teamMismatch(ws: SlackWorkspace, teamId: unknown, appId: unknown): boolean {
@@ -694,6 +706,70 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     return commandReply(`Renamed session \`${resolved.sessionId}\` to "${formatted}".`, true);
   }
 
+  if (parsed.kind === "quote") {
+    let resolved: Resolved | string;
+    let isOwnChannel = true;
+    if (parsed.target !== undefined) {
+      resolved = await namedSession(db, parsed.target);
+      if (typeof resolved !== "string") {
+        isOwnChannel = false;
+        if (handle !== null) {
+          const topic = await getByThread(db, chat, handle);
+          if (topic && topic.session_id === resolved.sessionId) {
+            isOwnChannel = true;
+          } else {
+            const boundId = await getBoundSessionByThread(db, chat, handle);
+            if (boundId === resolved.sessionId) {
+              isOwnChannel = true;
+            }
+          }
+        }
+      }
+    } else {
+      const ctx = await channelContext(db, chat, handle);
+      if (ctx.kind !== "none") {
+        resolved = await contextSession(db, ctx);
+      } else {
+        let boundId: string | null = null;
+        if (handle !== null) {
+          boundId = await getBoundSessionByThread(db, chat, handle);
+        }
+        if (boundId) {
+          const s = await db
+            .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+            .bind(boundId)
+            .first<{ machine_id: string; label: string | null }>();
+          if (!s) {
+            resolved = `Session \`${boundId}\` not found.`;
+          } else if (!(await isMachineRecent(db, s.machine_id))) {
+            resolved = `${s.machine_id} is not recently seen.`;
+          } else {
+            resolved = { sessionId: boundId, machineId: s.machine_id, label: s.label };
+          }
+        } else {
+          resolved = NO_CHANNEL_SESSION;
+        }
+      }
+    }
+    if (typeof resolved === "string") return commandReply(resolved, false);
+
+    const ok = await queue({
+      machineId: resolved.machineId,
+      sessionId: resolved.sessionId,
+      command: args ? `${name} ${args}` : name,
+      commandType: "quote",
+      label: resolved.label,
+      metadataJson: JSON.stringify({ pick: parsed.pick, full: parsed.full }),
+    });
+    if (!ok) return queueFull(resolved.label || resolved.machineId);
+
+    const destination = isOwnChannel ? "here" : "in the session's channel";
+    return commandReply(
+      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted ${destination}.`,
+      false,
+    );
+  }
+
   // /tag. The channel's session decides which machine's backlog (oc-tags is per machine), as the
   // topic does on Telegram. `/tag <session-id> <tag>` also works where there is none (#alerts, a
   // named channel): the named session is then the context too (spec §5, "/tag works anywhere").
@@ -729,6 +805,7 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
     metadataJson = JSON.stringify({ targetSessionId: target });
     ack = `Tagging session ${target} as ${tagArgs.tag} on ${resolved.machineId}...`;
   }
+
   const ok = await queue({
     machineId: resolved.machineId,
     sessionId: resolved.sessionId,
@@ -743,20 +820,35 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
 
 // ─── interactivity ─────────────────────────────────────────────────────────
 
-interface BlockActionsPayload {
+interface InteractivityPayload {
   type?: string;
+  trigger_id?: string;
   api_app_id?: string;
   team?: { id?: string };
   user?: { id?: string };
   channel?: { id?: string };
   container?: { channel_id?: string };
   actions?: Array<{ value?: string; url?: string }>;
+  view?: {
+    id?: string;
+    callback_id?: string;
+    private_metadata?: string;
+    state?: {
+      values?: Record<string, Record<string, { value?: string | null }>>;
+    };
+  };
 }
 
-async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace, raw: string): Promise<Response> {
-  let payload: BlockActionsPayload;
+async function handleInteractivity(
+  db: D1Database,
+  env: Env,
+  ws: SlackWorkspace,
+  raw: string,
+  waitUntil?: WaitUntil,
+): Promise<Response> {
+  let payload: InteractivityPayload;
   try {
-    payload = JSON.parse(new URLSearchParams(raw).get("payload") ?? "") as BlockActionsPayload;
+    payload = JSON.parse(new URLSearchParams(raw).get("payload") ?? "") as InteractivityPayload;
   } catch {
     return Response.json({ error: "invalid payload" }, { status: 400 });
   }
@@ -765,14 +857,53 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
     console.warn("[slack-inbound] interaction for another team or app refused");
     return new Response("Forbidden", { status: 403 });
   }
+
+  if (payload.type === "view_submission") {
+    return handleViewSubmission(db, env, ws, payload, waitUntil);
+  }
+
   if (payload.type !== "block_actions") return OK();
   if (payload.user?.id !== ws.ownerUserId) return OK(); // owner only, silently (D5)
 
   // A URL button's press is reported too; Slack has already opened the link, so it is acked and ignored.
   const value = payload.actions?.[0]?.value;
-  if (typeof value !== "string" || !value.startsWith("cmd:")) return OK();
+  if (typeof value !== "string") return OK();
   const channelId = payload.channel?.id ?? payload.container?.channel_id;
   if (typeof channelId !== "string" || !channelId) return OK();
+
+  if (value.startsWith("quote:")) {
+    const quoteId = value.slice("quote:".length);
+    const stored = await getQuote(db, quoteId);
+    if (!stored) {
+      await postEphemeral(ws, channelId, "This quote has expired. Run /quote again.");
+      return OK();
+    }
+    const view = buildAnswerModal(quoteId, channelId, stored);
+    try {
+      const res = await callSlack(
+        ws.botToken,
+        "views.open",
+        {
+          trigger_id: payload.trigger_id,
+          view,
+        },
+        { signal: AbortSignal.timeout(2500) },
+      );
+      if (!res.ok) {
+        const errorMsg =
+          (res.response as { error?: string } | undefined)?.error ??
+          (res.kind === "error" ? res.description : res.kind);
+        console.warn("[slack-inbound] views.open failed", { error: errorMsg, kind: res.kind });
+        await postEphemeral(ws, channelId, errorMsg ?? "Could not open modal");
+      }
+    } catch (err) {
+      console.warn("[slack-inbound] views.open threw", { err: String(err) });
+      await postEphemeral(ws, channelId, "Could not open modal");
+    }
+    return OK();
+  }
+
+  if (!value.startsWith("cmd:")) return OK();
 
   // The button value is the daemon's callback_data: cmd:TOKEN:ACTION.
   const parts = value.split(":");
@@ -812,4 +943,161 @@ async function handleInteractivity(db: D1Database, env: Env, ws: SlackWorkspace,
     await postEphemeral(ws, channelId, `Queue full for ${session.label || session.machine_id}.`);
   }
   return OK();
+}
+
+async function handleViewSubmission(
+  db: D1Database,
+  env: Env,
+  ws: SlackWorkspace,
+  payload: InteractivityPayload,
+  waitUntil?: WaitUntil,
+): Promise<Response> {
+  // 1. Owner check
+  if (payload.user?.id !== ws.ownerUserId) return Response.json({});
+  if (payload.view?.callback_id !== "quote_answer") return Response.json({});
+
+  // 2. quoteId from private_metadata; getQuote; missing → error
+  let privateMeta: { quoteId?: string; channelId?: string } = {};
+  try {
+    privateMeta = JSON.parse(payload.view?.private_metadata ?? "{}");
+  } catch {
+    // malformed
+  }
+  const quoteId = privateMeta.quoteId;
+  const channelId = privateMeta.channelId;
+  if (!quoteId || !channelId) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+    });
+  }
+
+  const stored = await getQuote(db, quoteId);
+  if (!stored) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+    });
+  }
+
+  // 3. Answers from payload.view.state.values["a<i>"].answer.value
+  const values = payload.view?.state?.values ?? {};
+  const answers = new Map<number, string>();
+  let firstAnsweredBlock: string | null = null;
+
+  for (let i = 1; i <= stored.passages.length; i++) {
+    const val = values[`a${i}`]?.answer?.value;
+    if (typeof val === "string") {
+      answers.set(i, val);
+      if (!firstAnsweredBlock && val.trim() !== "") {
+        firstAnsweredBlock = `a${i}`;
+      }
+    }
+  }
+
+  // 4. composeAnswer null → errors on a1
+  const text = composeAnswer(stored, answers);
+  if (!text) {
+    return Response.json({
+      response_action: "errors",
+      errors: { a1: "Type an answer under at least one passage." },
+    });
+  }
+
+  // 5. Length > MAX_COMMAND_LENGTH → errors on the first answered block
+  const errorBlock = firstAnsweredBlock ?? "a1";
+  if (text.length > MAX_COMMAND_LENGTH) {
+    let answersChars = 0;
+    for (const rawAnswer of answers.values()) {
+      if (rawAnswer && rawAnswer.trim() !== "") {
+        answersChars += rawAnswer.trimEnd().length;
+      }
+    }
+    const message =
+      answersChars > 8000
+        ? `Your answers are too long (${answersChars} characters); shorten them.`
+        : `Too long to send (${text.length} of ${MAX_COMMAND_LENGTH} characters); answer fewer passages.`;
+    return Response.json({
+      response_action: "errors",
+      errors: {
+        [errorBlock]: message,
+      },
+    });
+  }
+
+  // 6. Target session: from channelId in private_metadata:
+  // channelHandle, then its topics row session, else getBoundSessionByThread.
+  // None found → the quote's session_id if it still exists in sessions, else errors "That session has ended."
+  const chat = slackChatId(ws);
+  const handle = await channelHandle(db, ws, channelId, true);
+  let resolvedSessionId: string | null = null;
+  if (handle !== null) {
+    const topic = await getByThread(db, chat, handle);
+    if (topic) resolvedSessionId = topic.session_id;
+    if (!resolvedSessionId) {
+      resolvedSessionId = await getBoundSessionByThread(db, chat, handle);
+    }
+  }
+
+  if (!resolvedSessionId) {
+    resolvedSessionId = stored.sessionId;
+  }
+
+  const session = await db
+    .prepare("SELECT machine_id, label FROM sessions WHERE session_id = ?")
+    .bind(resolvedSessionId)
+    .first<{ machine_id: string; label: string | null }>();
+
+  if (!session) {
+    return Response.json({
+      response_action: "errors",
+      errors: { [errorBlock]: "That session has ended." },
+    });
+  }
+
+  if (await isQueueFull(db, session.machine_id)) {
+    return Response.json({
+      response_action: "errors",
+      errors: { [errorBlock]: `Queue full for ${session.machine_id}; try again shortly.` },
+    });
+  }
+
+  const isReplaced = resolvedSessionId !== stored.sessionId;
+
+  // 7. One db.batch([seenInsert(db, "view:" + payload.view.id), touch, statement]);
+  // a seen-conflict → 200 {} (duplicate tap).
+  const viewId = payload.view?.id ?? "";
+  const eventId = `view:${viewId}`;
+  const touch = db
+    .prepare("UPDATE sessions SET updated_at = ? WHERE session_id = ?")
+    .bind(Date.now(), resolvedSessionId);
+
+  const { statement } = commandInsertStatement(db, {
+    machineId: session.machine_id,
+    sessionId: resolvedSessionId,
+    command: text,
+    chatId: chat,
+    commandType: "execute",
+    metadataJson: JSON.stringify({ senderId: payload.user?.id }),
+    messageThreadId: handle,
+  });
+
+  try {
+    await db.batch([seenInsert(db, eventId), touch, statement]);
+  } catch (err) {
+    if (isSeenConflict(err)) return Response.json({});
+    throw err;
+  }
+
+  // 8. Return {response_action:"clear"}; in ctx.waitUntil, post the copy into that channel:
+  // 🧑 via /quote\n<text> via postInChannel.
+  if (handle !== null) {
+    const copyPrefix = isReplaced ? "(the quoted session was replaced; sent to the current one)\n" : "";
+    const copyText = `${copyPrefix}🧑 via /quote\n${text}`;
+    const work = postInChannel(env, db, ws, handle, copyText);
+    if (waitUntil) waitUntil(work);
+    else await work;
+  }
+
+  return Response.json({ response_action: "clear" });
 }

@@ -13,6 +13,13 @@ import { deleteTopicBySession } from "./topics";
 import { getBindingForSession } from "./named-topics";
 import { withD1, StorageError } from "./d1";
 import { hasButtons, resolveMentionKeyboard } from "./mention-links";
+import {
+  isValidStoredQuote,
+  extractQuoteIdFromReplyMarkup,
+  putQuote,
+  MAX_QUOTE_PAYLOAD_CHARS,
+  type StoredQuote,
+} from "./slack-quotes";
 
 interface SendNotificationBody {
   sessionId: string;
@@ -35,6 +42,8 @@ interface SendNotificationBody {
   rich?: { markdown?: unknown; dialect?: unknown };
   /** Mention the workspace owner so this post notifies them (gated by `SLACK_NOTIFY_OWNER`). */
   notifyOwner?: boolean;
+  /** Answer-modal data for /quote posts (pigeon-14uk). */
+  quote?: unknown;
 }
 
 /**
@@ -342,6 +351,24 @@ export async function handleSendNotification(
       return json({ error: "Session not found" }, 404);
     }
 
+    // Validate quote if provided (pigeon-14uk)
+    let quoteToStore: StoredQuote | null = null;
+    let quoteIdToStore: string | null = null;
+    if (body.quote !== undefined) {
+      if (!isValidStoredQuote(body.quote) || body.quote.sessionId !== sessionId) {
+        return json({ error: "Invalid quote" }, 400);
+      }
+      const payloadJson = JSON.stringify(body.quote);
+      if (payloadJson.length > MAX_QUOTE_PAYLOAD_CHARS) {
+        return json({ error: "Invalid quote: payload exceeds maximum size" }, 400);
+      }
+      const quoteId = extractQuoteIdFromReplyMarkup(replyMarkup);
+      if (quoteId) {
+        quoteToStore = body.quote;
+        quoteIdToStore = quoteId;
+      }
+    }
+
     // Where this notification goes. Resolved ONCE, here, and used for everything below: a
     // machine on Slack targets its workspace whatever chat id its daemon sent. A machine with no
     // workspace has nowhere to post: a configuration error, answered 503 with no `retryAfter` so
@@ -513,6 +540,11 @@ export async function handleSendNotification(
     };
     let lastSendWasRich = false;
     let richError: unknown;
+
+    // Store /quote modal data before posting (so the button never exists without its data; pigeon-14uk)
+    if (quoteToStore && quoteIdToStore) {
+      await putQuote(db, quoteIdToStore, quoteToStore);
+    }
 
     // Buttons to the topics of sessions the text mentions (pigeon-ylx3), unless the caller sent
     // a keyboard of its own (a question's answer buttons). Decoration: if the provider rejects the

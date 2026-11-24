@@ -227,3 +227,13 @@ CREATE TABLE IF NOT EXISTS slack_seen_events (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slack_seen_events_created ON slack_seen_events(created_at);
+
+-- Answer-modal data for /quote posts (pigeon-14uk). Kept 7 days, swept hourly.
+CREATE TABLE IF NOT EXISTS slack_quotes (
+  quote_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slack_quotes_created ON slack_quotes(created_at);
+

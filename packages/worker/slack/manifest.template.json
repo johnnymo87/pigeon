@@ -74,6 +74,13 @@
         "description": "Tag sessions for spend attribution",
         "usage_hint": "[list | <tag> | <session-id> <tag>]",
         "should_escape": false
+      },
+      {
+        "command": "/quote",
+        "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
+        "description": "Quote the session's replies so you can answer them",
+        "usage_hint": "[N|prev|full]",
+        "should_escape": false
       }
     ]
   },

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Poller, UNREGISTER_TIMEOUT_MS, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type TagMessage } from "../src/worker/poller";
+import { Poller, UNREGISTER_TIMEOUT_MS, type PollerCallbacks, type PollerConfig, type ExecuteMessage, type LaunchMessage, type KillMessage, type InterruptMessage, type CompactMessage, type McpListMessage, type McpEnableMessage, type McpDisableMessage, type ModelListMessage, type ModelSetMessage, type TagMessage, type QuoteMessage } from "../src/worker/poller";
 
 const BASE_CONFIG: PollerConfig = {
   workerUrl: "http://localhost:8787",
@@ -75,6 +75,22 @@ function makeCallbacks(overrides?: Partial<PollerCallbacks>): PollerCallbacks {
     onTagList: vi.fn().mockResolvedValue(undefined),
     onTagSet: vi.fn().mockResolvedValue(undefined),
     onTagSetDir: vi.fn().mockResolvedValue(undefined),
+    onQuote: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+}
+
+function makeQuoteMsg(overrides?: Partial<QuoteMessage>): QuoteMessage {
+  return {
+    commandId: "cmd-quote-1",
+    chatId: "chat-1",
+    commandType: "quote",
+    sessionId: "sess-1",
+    command: "/quote",
+    metadata: {
+      pick: { kind: "since" },
+      full: false,
+    },
     ...overrides,
   };
 }
@@ -402,6 +418,89 @@ describe("Poller start/stop", () => {
     expect(callbacks.onCommand).not.toHaveBeenCalled();
     expect(callbacks.onLaunch).not.toHaveBeenCalled();
     expect(callbacks.onKill).not.toHaveBeenCalled();
+    poller.stop();
+  });
+
+  it("dispatches quote commands to onQuote callback and acks", async () => {
+    const msg = makeQuoteMsg();
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onQuote).toHaveBeenCalledWith(msg);
+    expect(callbacks.onCommand).not.toHaveBeenCalled();
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string]>;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]![0]).toBe(`http://localhost:8787/commands/${msg.commandId}/ack`);
+    poller.stop();
+  });
+
+  it("dispatches quote commands with malformed metadata to onQuote and acks", async () => {
+    const msg = {
+      commandId: "cmd-quote-malformed",
+      chatId: "chat-1",
+      commandType: "quote" as const,
+      sessionId: "sess-1",
+      command: "/quote bad",
+      metadata: undefined,
+    };
+    const callbacks = makeCallbacks();
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(callbacks.onQuote).toHaveBeenCalledWith(msg);
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string]>;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]![0]).toBe(`http://localhost:8787/commands/${msg.commandId}/ack`);
+    poller.stop();
+  });
+
+  it("acks quote command when onQuote callback is not provided", async () => {
+    const msg = makeQuoteMsg();
+    const callbacks = makeCallbacks({ onQuote: undefined });
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string]>;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]![0]).toBe(`http://localhost:8787/commands/${msg.commandId}/ack`);
+    poller.stop();
+  });
+
+  it("does not ack quote command when onQuote throws", async () => {
+    const msg = makeQuoteMsg();
+    const callbacks = makeCallbacks({
+      onQuote: vi.fn().mockRejectedValue(new Error("quote failed")),
+    });
+    const fetchFn = makeFetch([
+      () => json200(msg),
+      () => ackOk(),
+    ]);
+    const poller = new Poller(BASE_CONFIG, callbacks, { fetchFn });
+
+    poller.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const calls = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls as Array<[string]>;
+    expect(calls).toHaveLength(1); // No ack call
     poller.stop();
   });
 

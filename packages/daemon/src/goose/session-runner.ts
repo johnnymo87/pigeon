@@ -59,6 +59,7 @@ import {
   type RunState,
   type RunStateInfo,
 } from "./acp-client.js";
+import { withDeadline } from "./deadline.js";
 import {
   capText,
   DEFAULT_MAX_TRANSCRIPT_BYTES,
@@ -342,22 +343,7 @@ const CANCEL_CONNECT_TIMEOUT_MS = 3_000;
  * A half-open socket (NAT idle drop, serve SIGKILL with no FIN) emits no close
  * event, so this is the only thing that ends such a wait.
  */
-const NON_TURN_TIMEOUT_MS = 10_000;
-
-/** Rejects if `p` has not settled within `ms`. Does not cancel `p`. */
-async function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      p,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`goose ${what} did not answer within ${ms}ms`)), ms);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
+export const NON_TURN_TIMEOUT_MS = 10_000;
 
 /**
  * goose's name for a session it has not named yet (acp/server/new_session.rs).

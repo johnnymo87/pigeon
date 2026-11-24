@@ -256,7 +256,7 @@ function neutralizeBroadcast(text: string): string {
     .replace(/(?<![A-Za-z0-9_.])@(?=(?:channel|here|everyone)(?![A-Za-z0-9_]))/gi, `@${ZWJ}`);
 }
 
-function escapeMrkdwn(text: string): string {
+export function escapeMrkdwn(text: string): string {
   return neutralizeBroadcast(text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"));
 }
 

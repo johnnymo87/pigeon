@@ -72,6 +72,7 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `machine_launch_accept`: which machines a target accepts remote launches from, from its poll header
 - `slack_conversations`, `slack_posts`: Slack handles (>= 2^40) to channel / channel + ts, per team (pigeon-4ogz.3). `slack_posts` rows live 30 days (swept hourly). Apply the schema before creating any `SLACK_WORKSPACE_<MACHINE>` secret.
 - `slack_seen_events`: Slack `event_id` dedup for the Events API (pigeon-4ogz.4), 48 h, swept by the Slack-gated cron. Inserted in one `db.batch` with the command, so a retried event is a 200 duplicate.
+- `slack_quotes`: answer-modal data for `/quote` posts (pigeon-14uk). Kept 7 days, swept hourly by the Slack-gated cron.
 - Slack rows also live in the shared tables (`topics`, `named_topics`, `named_topic_bindings`, `messages`, `commands`) under `chat_id = 'slack:<teamId>'`; the integer `message_thread_id` / `message_id` columns hold handles that `slack_conversations` / `slack_posts` map to Slack ids. So a "topic" is a channel, and the unthreaded target is that workspace's `#alerts` (a `named_topics` row with the reserved key `_alerts`).
 
 ## Endpoint Contracts
@@ -89,16 +90,16 @@ The worker binds an R2 bucket (`MEDIA`, bucket `pigeon-media`) for bidirectional
 - `POST /topics/named` (Bearer) `{chatId, key, name, staleThreadId?}` -> `{chatId, messageThreadId, created}`. Find-or-create a caller-keyed channel (D1 `named_topics`, exempt from the orphan-closer and reaper). `staleThreadId` reports a thread deleted out of band and gets a new topic. Every non-200 means "post to `#alerts`" to the daemon.
 - `POST /topics/named/bind` (Bearer) `{chatId, key, name, sessionId}` -> `{chatId, messageThreadId, created, bound: true, sessionId}`; `409 session not registered` when `sessions` has no row. Plain messages typed in the bound topic route to that session (D1 `named_topic_bindings`; slash commands do not follow bindings).
 - `POST /topics/named/unbind` (Bearer) `{sessionId}` -> `{unbound: n}` (0 is success).
-- `POST /notifications/send` (Bearer) -> send a chat message (a machine goes to its own `slack:<team>` whatever `chatId` it sent, which is optional: one channel per session, `#alerts` unthreaded; a machine with no workspace gets `503 no_transport`; optional `notifyOwner` (flags the post; the owner mention is applied only when its category, `questions` for a `q:` notificationId else `errors`, is listed in the `SLACK_NOTIFY_OWNER` var, default none; named channels and `#alerts` follow the `named`/`alerts` categories; never a broadcast); `rich.dialect: "slack"` for a markdown block; every provider failure adds top-level `errorClass`) + store mapping; optional `media[]` uploads files into the post's thread; optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling the provider)
+- `POST /notifications/send` (Bearer) -> send a chat message (a machine goes to its own `slack:<team>` whatever `chatId` it sent, which is optional: one channel per session, `#alerts` unthreaded; a machine with no workspace gets `503 no_transport`; optional `notifyOwner` (flags the post; the owner mention is applied only when its category, `questions` for a `q:` notificationId else `errors`, is listed in the `SLACK_NOTIFY_OWNER` var, default none; named channels and `#alerts` follow the `named`/`alerts` categories; never a broadcast); `rich.dialect: "slack"` for a markdown block; every provider failure adds top-level `errorClass`) + store mapping; optional `media[]` uploads files into the post's thread; optional `quote` (StoredQuote object stored in `slack_quotes` before posting when a `quote:<id>` button is in `replyMarkup`; pigeon-14uk); optional `notificationId` enables idempotent delivery (returns `{ok: true, messageId, deduplicated: true}` if already delivered, without calling the provider)
 - `POST /notifications/edit` (Bearer) -> edit an existing chat message by `notificationId`; looks up `(chat_id, message_id)` from the `messages` table. Used by the daemon for wizard step transitions. A Slack row is editable only by a machine of that team (403 otherwise); with the team's secret deleted it is a transient failure with no Slack call.
 - `GET /whoami` adds `transport: "slack"` for a machine with a workspace (informational). `POST /messages/send` routes by the stored address and returns `chatId`; a numeric `chatId` there is a 403. `POST /topics/unpin` is gone (404).
 - `POST /media/upload` (Bearer) -> upload file to R2 (multipart form)
 - `GET /media/<key>` (Bearer) -> download file from R2
-- `POST /slack/<machine>/events`, `/commands`, `/interactivity` (no bearer: Slack's v0 `X-Slack-Signature`, checked against that machine's `signingSecret` on the raw body, +-5 min, else 401; then `team_id`/`api_app_id` (403; skipped for `url_verification`), then the owner: anyone but `ownerUserId` gets a silent 200). A machine with no `SLACK_WORKSPACE_<MACHINE>` secret gets the router's ordinary 404. Events: only `message` with no subtype, `file_share` or `thread_broadcast`, no `bot_id`; session resolution is thread parent (`slack_posts` -> `messages`) -> the channel's `topics` row -> a bound named channel; an unbound named channel (incl. `#alerts`) gets a rate-limited hint. `src/slack-inbound.ts`.
+- `POST /slack/<machine>/events`, `/commands`, `/interactivity` (no bearer: Slack's v0 `X-Slack-Signature`, checked against that machine's `signingSecret` on the raw body, +-5 min, else 401; then `team_id`/`api_app_id` (403; skipped for `url_verification`), then the owner: anyone but `ownerUserId` gets a silent 200). A machine with no `SLACK_WORKSPACE_<MACHINE>` secret gets the router's ordinary 404. Events: only `message` with no subtype, `file_share` or `thread_broadcast`, no `bot_id`; session resolution is thread parent (`slack_posts` -> `messages`) -> the channel's `topics` row -> a bound named channel; an unbound named channel (incl. `#alerts`) gets a rate-limited hint. Interactivity handles action buttons (including `quote:<id>` opening the answer modal via `views.open`) and `view_submission` (`quote_answer` modal composing the prompt and queuing an `execute` command with `senderId`, posting a `🧑 via /quote` channel copy). `src/slack-inbound.ts`.
 
 ## Chat Commands
 
-Where a command is typed: in the session's Slack channel (or anywhere, with an explicit session id). Slack app slash commands do not work inside a thread. `/rename` is a Slack built-in, so it is `/retitle` (`SLACK_APP_COMMANDS` in `slack-inbound.ts`); the parsers are shared (`src/chat/commands.ts`). `/kill /interrupt /compact /mcp /model` take an optional session id (full id, or a unique prefix of at least 8 characters after `ses_`/`gse_`; ambiguous is refused with the candidates), which is how they work from `#alerts`. Where this section says "reply to a notification", read "typed in the session's channel".
+Where a command is typed: in the session's Slack channel (or anywhere, with an explicit session id). Slack app slash commands do not work inside a thread. `/rename` is a Slack built-in, so it is `/retitle` (`SLACK_APP_COMMANDS` in `slack-inbound.ts`); the parsers are shared (`src/chat/commands.ts`). `/kill /interrupt /compact /mcp /model /quote` take an optional session id (full id, or a unique prefix of at least 8 characters after `ses_`/`gse_`; ambiguous is refused with the candidates), which is how they work from `#alerts`. Where this section says "reply to a notification", read "typed in the session's channel".
 
 ### `/launch <machine> <directory> [--tag <tag>] <prompt>`
 
@@ -192,9 +193,23 @@ act on one. That is not ceremony: oc-tags reads a single machine's `opencode.db`
 "whose backlog?" is a real question, and the session the message arrived in is the only
 answer the user actually chose.
 
+### `/quote [<session-id>] [full] [prev|<N>]`
+
+Quotes recent assistant turns from a goose session for interactive answering via Slack modal dialog (pigeon-14uk). Goose sessions only.
+
+1. Worker parses `/quote` syntax (`QuotePick`: `since` (default), `prev`, `last N`; optional `full`/`all` flag; optional `<session-id>`).
+2. Resolves session (topic channel, bound coordinator channel, or explicit session id). Checks machine online.
+3. Replies ephemerally: `⏳ Quoting <pick> for <label>. The trim can take a minute or two; the quote will be posted here.`.
+4. Queues a `"quote"` type command in D1 with `metadataJson: {pick, full}`.
+5. Daemon poller dispatches to `createQuoteHandler`, which opens a honkd viewer connection and invokes `_honk/quote` over ACP.
+6. Daemon enqueues body post (`qt:<sessionId>:<cmdId>`) and answer post (`qa:<sessionId>:<cmdId>`) with inline "Answer" button (`quote:<cmdId>`) and `StoredQuote` payload into the outbox.
+7. Worker receives `/notifications/send`, stores the quote payload into D1 `slack_quotes` (7-day TTL), and posts to Slack.
+8. Tapping "Answer" checks owner and opens the answer modal via `views.open` within Slack's 3-second trigger window.
+9. Modal submission (`view_submission`, callback_id `quote_answer`) validates non-blank answers, enforces ≤10,000 chars, dedupes on view id in `slack_seen_events`, re-resolves the target session from channel handle, queues the composed prompt as `execute` with `metadataJson.senderId`, returns `{response_action: "clear"}`, and in `ctx.waitUntil` posts the `🧑 via /quote\n<text>` copy to the channel.
+
 ## Command Types
 
-`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set"` (the `commands.command_type` values; the session ones are `SessionCommandType` in `src/chat/commands.ts`)
+`CommandType = "execute" | "launch" | "kill" | "interrupt" | "compact" | "mcp_list" | "mcp_enable" | "mcp_disable" | "model_list" | "model_set" | "tag_top" | "tag_list" | "tag_set" | "quote"` (the `commands.command_type` values; the session ones are `SessionCommandType` in `src/chat/commands.ts`)
 
 - `execute`: regular command injection into an existing session (default)
 - `launch`: create a new headless session + send initial prompt
@@ -208,6 +223,7 @@ answer the user actually chose.
 - `tag_top`: list untagged sessions ranked by list-price dollars
 - `tag_list`: list tags defined so far
 - `tag_set`: tag one session (`command` = tag, `metadata_json.targetSessionId` = session tagged)
+- `quote`: quote goose session turns via honkd `_honk/quote`, store quote data, and post with modal Answer button (pigeon-14uk)
 - `tag_set_dir`: removed. The worker no longer creates it; the daemon still acks a stale
   queued row with a removal reply, so a deploy-skew leftover is not redelivered for 24h.
 
@@ -238,6 +254,7 @@ Cross-machine remote session launching (`docs/plans/2026-10-29-remote-launch-des
   - `runRelayExpiry(env.DB)` -- expires uncollected relays and prunes past retention
   - `runLaunchExpiry(env.DB)` -- expires overdue remote launches and prunes past retention
   - `sweepSlackPosts(env.DB)` and `sweepSlackSeenEvents(env.DB)` -- delete `slack_posts` older than 30 days (5000 per tick, never the `_seed` row) and `slack_seen_events` older than 48 h; run only when some `SLACK_WORKSPACE_*` secret exists, best-effort
+  - `sweepSlackQuotes(env.DB)` -- delete `slack_quotes` older than 7 days (5000 per tick); runs only when some `SLACK_WORKSPACE_*` secret exists, best-effort (pigeon-14uk)
   - the topic reaper: Slack rows are archived by the orphan-closer and forgotten (no provider call) by the reaper
 
 ## Future Improvement: Long Polling
