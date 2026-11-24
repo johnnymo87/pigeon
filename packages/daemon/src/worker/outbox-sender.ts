@@ -773,6 +773,7 @@ export class OutboxSender {
         // Defence in depth: an outbox entry whose session is a goose-acp or pull
         // row with notify: false is dropped terminally (notify_false_goose) before any send
         // or re-register, so no future producer can create a topic for a --no-chat session.
+        // Reason string retains legacy name notify_false_goose but also covers pull-mode sessions.
         const sessionRow = this.storage.sessions.get(entry.sessionId);
         if (
           sessionRow &&

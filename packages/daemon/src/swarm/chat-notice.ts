@@ -55,6 +55,7 @@ export function enqueueSwarmChatNotice(
       ((target.backendKind === GOOSE_BACKEND_KIND && !target.notify) ||
         (isPullBackend(target) && target.notify === false))
     ) {
+      // Reason string retains legacy name goose_notify_false but also covers pull-mode sessions.
       console.log(
         `[swarm-notice] quieted msgId=${record.msgId} sessionId=${record.toSession} reason=goose_notify_false`,
       );

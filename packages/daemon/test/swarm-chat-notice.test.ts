@@ -10,6 +10,7 @@ import type { SwarmMessageRecord } from "../src/storage/swarm-repo";
 import { notifySenderOfFailure } from "../src/swarm/notify-sender";
 import { DeliveryWatchdog, type WatchdogClient } from "../src/swarm/delivery-watchdog";
 import { PULL_BACKEND_KIND } from "../src/adapters/goose-pull";
+import { createApp } from "../src/app";
 
 function makeRecord(overrides: Partial<SwarmMessageRecord> = {}): SwarmMessageRecord {
   return {
@@ -206,13 +207,31 @@ describe("swarm notices for goose-pull targets", () => {
     expect(upsertCalls[0]!.input.notificationId).toBe("w:msg_1001");
   });
 
-  it("still emits the chat notice when a goose-pull target has notify unset (default true)", () => {
-    const { storage, upsertCalls } = mockStorage({
-      targetSession: { backendKind: PULL_BACKEND_KIND },
-    });
-    enqueueSwarmChatNotice(storage, makeRecord(), 1786363205000);
-    expect(upsertCalls).toHaveLength(1);
-    expect(upsertCalls[0]!.input.notificationId).toBe("w:msg_1001");
+  it("suppresses the chat notice when a goose-pull target is registered via /session-start without notify", async () => {
+    const storage = openStorageDb(":memory:");
+    try {
+      const app = createApp(storage);
+      const res = await app(
+        new Request("http://localhost/session-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: "ses_receiver",
+            backend_kind: PULL_BACKEND_KIND,
+          }),
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const target = storage.sessions.get("ses_receiver");
+      expect(target).not.toBeNull();
+      expect(target!.notify).toBe(false);
+
+      enqueueSwarmChatNotice(storage, makeRecord({ toSession: "ses_receiver" }), 1786363205000);
+      expect(storage.outbox.getByNotificationId("w:msg_1001")).toBeNull();
+    } finally {
+      storage.db.close();
+    }
   });
 
   it("still emits the chat notice when an opencode target has notify: false", () => {
