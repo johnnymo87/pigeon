@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   capPassages,
+  defuseBroadcasts,
   emptyText,
   flattenPassages,
   pickLabel,
@@ -115,6 +116,64 @@ describe("flattenPassages", () => {
 
     const passages = flattenPassages(result);
     expect(passages[0]?.header).toBe("# 11-24 15:00 · ask · in progress");
+  });
+
+  it("splits passage lines on embedded newlines so lines are single lines", () => {
+    const result: QuoteResult = {
+      summary: null,
+      replies: [
+        {
+          header: "# 11-24 15:00 · ask",
+          passages: [["intro", "\n\n# heading", "outro"]],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: null,
+    };
+
+    const passages = flattenPassages(result);
+    expect(passages).toHaveLength(1);
+    expect(passages[0]?.lines).toEqual(["intro", "", "", "# heading", "outro"]);
+
+    // Test rendered forms: each line gets its own > prefix, no bare # heading
+    const text = quoteBodyText(result, "since", "label");
+    expect(text).toContain("> intro\n>\n>\n> # heading\n> outro");
+
+    const md = quoteBodyMarkdown(result, "since", "label");
+    expect(md).not.toBeNull();
+    expect(md).toContain("> intro  \n>  \n>  \n> \\# heading  \n> outro");
+  });
+});
+
+describe("defuseBroadcasts", () => {
+  it("defuses <!channel>, <!here>, <!everyone>, and <!subteam...>", () => {
+    expect(defuseBroadcasts("hello <!channel> world")).toBe("hello <\u200d!channel> world");
+    expect(defuseBroadcasts("check <!here>")).toBe("check <\u200d!here>");
+    expect(defuseBroadcasts("hey <!everyone>")).toBe("hey <\u200d!everyone>");
+    expect(defuseBroadcasts("team <!subteam^S12345>")).toBe("team <\u200d!subteam^S12345>");
+    expect(defuseBroadcasts("team <!subteam^S12345|engineers>")).toBe("team <\u200d!subteam^S12345|engineers>");
+    expect(defuseBroadcasts("space <!  channel>")).toBe("space <\u200d!  channel>");
+  });
+
+  it("defuses bare @channel, @here, @everyone", () => {
+    expect(defuseBroadcasts("alert @channel")).toBe("alert @\u200dchannel");
+    expect(defuseBroadcasts("ping @here now")).toBe("ping @\u200dhere now");
+    expect(defuseBroadcasts("call @everyone")).toBe("call @\u200deveryone");
+  });
+
+  it("is case-insensitive for broadcast patterns", () => {
+    expect(defuseBroadcasts("<!CHANNEL> and @HERE")).toBe("<\u200d!CHANNEL> and @\u200dHERE");
+    expect(defuseBroadcasts("<!subTeam^abc>")).toBe("<\u200d!subTeam^abc>");
+  });
+
+  it("does not defuse normal emails or words containing channel/here/everyone", () => {
+    expect(defuseBroadcasts("contact user@channel.com")).toBe("contact user@channel.com");
+    expect(defuseBroadcasts("@channel_alert")).toBe("@channel_alert");
+    expect(defuseBroadcasts("@here_we_go")).toBe("@here_we_go");
+    expect(defuseBroadcasts("@everyone_group")).toBe("@everyone_group");
   });
 });
 
@@ -300,6 +359,36 @@ describe("quoteBodyText", () => {
     expect(text).toContain("quoted in full");
     expect(text).toContain("[1] 11-24 13:05 · ask\n> full line");
   });
+
+  it("defuses Slack broadcast mentions in quoted lines", () => {
+    const result: QuoteResult = {
+      summary: null,
+      replies: [
+        {
+          header: "# 11-24 13:00 · ask",
+          passages: [[
+            "hey <!channel>",
+            "look <!here>",
+            "all <!everyone>",
+            "group <!subteam^S123|team>",
+            "ping @channel and @here and @everyone",
+          ]],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: null,
+    };
+
+    const text = quoteBodyText(result, "since", "label");
+    expect(text).toContain("> hey <\u200d!channel>");
+    expect(text).toContain("> look <\u200d!here>");
+    expect(text).toContain("> all <\u200d!everyone>");
+    expect(text).toContain("> group <\u200d!subteam^S123|team>");
+    expect(text).toContain("> ping @\u200dchannel and @\u200dhere and @\u200deveryone");
+  });
 });
 
 describe("quoteBodyMarkdown", () => {
@@ -371,5 +460,36 @@ describe("quoteBodyMarkdown", () => {
 
     const md = quoteBodyMarkdown(result, "since", "label");
     expect(md).toBeNull();
+  });
+
+  it("defuses Slack broadcast mentions in quoted lines", () => {
+    const result: QuoteResult = {
+      summary: null,
+      replies: [
+        {
+          header: "# 11-24 13:00 · ask",
+          passages: [[
+            "hey <!channel>",
+            "look <!here>",
+            "all <!everyone>",
+            "group <!subteam^S123|team>",
+            "ping @channel and @here and @everyone",
+          ]],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: null,
+    };
+
+    const md = quoteBodyMarkdown(result, "since", "label");
+    expect(md).not.toBeNull();
+    expect(md).toContain("> hey <\u200d!channel>");
+    expect(md).toContain("> look <\u200d!here>");
+    expect(md).toContain("> all <\u200d!everyone>");
+    expect(md).toContain("> group <\u200d!subteam^S123\\|team>");
+    expect(md).toContain("> ping @\u200dchannel and @\u200dhere and @\u200deveryone");
   });
 });

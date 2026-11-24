@@ -54,7 +54,7 @@ export function flattenPassages(result: QuoteResult): StoredQuotePassage[] {
       const p = reply.passages[i]!;
       passages.push({
         header,
-        lines: [...p],
+        lines: p.flatMap((l) => l.split("\n")),
         first: i === 0,
       });
     }
@@ -123,6 +123,19 @@ export function emptyText(result: QuoteResult, _pickLabel?: string): string {
   return lines.join("\n");
 }
 
+const ZWJ = "\u200d";
+
+/**
+ * Defuses Slack broadcast mentions in untrusted text using a zero-width joiner (ZWJ).
+ * Prevents `<!channel>`, `<!here>`, `<!everyone>`, `<!subteam…>`, and bare
+ * `@channel` / `@here` / `@everyone` from triggering broadcast notifications.
+ */
+export function defuseBroadcasts(text: string): string {
+  return text
+    .replace(/<!(?=\s*(?:channel|here|everyone|subteam))/gi, `<${ZWJ}!`)
+    .replace(/(?<![A-Za-z0-9_.])@(?=(?:channel|here|everyone)(?![A-Za-z0-9_]))/gi, `@${ZWJ}`);
+}
+
 function stripHeader(header: string): string {
   return header.replace(/^#\s*/, "");
 }
@@ -166,7 +179,8 @@ export function quoteBodyText(result: QuoteResult, pickLabel: string, label: str
       passageLines.push(`[${i + 1}] …`);
     }
     for (const line of passage.lines) {
-      passageLines.push(line === "" ? ">" : `> ${line}`);
+      const defused = defuseBroadcasts(line);
+      passageLines.push(defused === "" ? ">" : `> ${defused}`);
     }
   }
 
@@ -178,7 +192,7 @@ export function quoteBodyText(result: QuoteResult, pickLabel: string, label: str
  * as markdown structure (headings, blockquotes, lists, rules, emphasis, code, links).
  */
 export function escapeQuoteLine(line: string): string {
-  let escaped = escapePlainSlack(line);
+  let escaped = escapePlainSlack(defuseBroadcasts(line));
   escaped = escaped.replace(/^(\s*)([#>\-+])/g, "$1\\$2");
   escaped = escaped.replace(/^(\s*\d+)([.)])/g, "$1\\$2");
   return escaped;

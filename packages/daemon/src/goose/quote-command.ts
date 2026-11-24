@@ -128,13 +128,19 @@ export function createQuoteHandler(
       }
     }
 
+    const pLabel = pickLabel(msg.metadata!.pick, msg.metadata!.full);
+
     if (result.empty) {
-      const pLabel = pickLabel(msg.metadata!.pick, msg.metadata!.full);
       await sendReply(emptyText(result, pLabel), msg, deps);
       return;
     }
 
-    const pLabel = pickLabel(msg.metadata!.pick, msg.metadata!.full);
+    const flattened = flattenPassages(result);
+    if (flattened.length === 0) {
+      await sendReply(emptyText(result, pLabel), msg, deps);
+      return;
+    }
+
     const label = displayName({
       title: session.title,
       label: session.label,
@@ -176,7 +182,6 @@ export function createQuoteHandler(
       nowTime,
     );
 
-    const flattened = flattenPassages(result);
     const { passages: cappedPassages, total } = capPassages(flattened);
     const storedQuote: StoredQuote = {
       v: 1,

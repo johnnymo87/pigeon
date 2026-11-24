@@ -347,6 +347,35 @@ describe("createQuoteHandler", () => {
     expect(replies).toEqual(["/quote failed: socket timeout"]);
   });
 
+  it("calls close() and sends a '/quote failed: …' reply when client.connect() rejects", async () => {
+    const replies: string[] = [];
+    const client = {
+      isHonk: true,
+      connect: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED 127.0.0.1:4000")),
+      quote: vi.fn(),
+      close: vi.fn(),
+    };
+
+    const outbox: UpsertOutboxInput[] = [];
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => client,
+      reply: async (text: string) => {
+        replies.push(text);
+      },
+      upsertOutbox: (input: UpsertOutboxInput) => outbox.push(input),
+      machineId: "devbox",
+    });
+
+    await handler(makeMessage());
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(client.close).toHaveBeenCalledTimes(1);
+    expect(client.quote).not.toHaveBeenCalled();
+    expect(outbox).toHaveLength(0);
+    expect(replies).toEqual(["/quote failed: connect ECONNREFUSED 127.0.0.1:4000"]);
+  });
+
   it("replies emptyText when result.empty is present", async () => {
     const replies: string[] = [];
     const client = {
@@ -379,6 +408,46 @@ describe("createQuoteHandler", () => {
     expect(outbox).toHaveLength(0);
     expect(replies).toHaveLength(1);
     expect(replies[0]).toContain("Nothing has replied since your last message");
+  });
+
+  it("replies emptyText instead of posting when result.empty is null but zero passages after flattening", async () => {
+    const replies: string[] = [];
+    const client = {
+      isHonk: true,
+      connect: vi.fn().mockResolvedValue(undefined),
+      quote: vi.fn().mockResolvedValue(
+        makeQuoteResult({
+          empty: null,
+          replies: [
+            {
+              header: "# 11-24 13:00 · ask",
+              passages: [],
+              inProgress: false,
+            },
+          ],
+          summary: null,
+        }),
+      ),
+      close: vi.fn(),
+    };
+
+    const outbox: UpsertOutboxInput[] = [];
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => client,
+      reply: async (text: string) => {
+        replies.push(text);
+      },
+      upsertOutbox: (input: UpsertOutboxInput) => outbox.push(input),
+      machineId: "devbox",
+    });
+
+    await handler(makeMessage());
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(outbox).toHaveLength(0);
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toBe("No replies to quote.");
   });
 
   it("upserts body and answer outbox entries with correct shapes and ordering", async () => {
