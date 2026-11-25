@@ -37,7 +37,7 @@ import { TAG_USAGE_TEXT } from "./tag-command";
 import type { MediaRef } from "./media";
 import { IN_REPLY_TO_MAX_CHARS, MAX_COMMAND_LENGTH, MAX_FILE_SIZE, MAX_IMAGE_DIMENSION } from "./chat/limits";
 import { getQuote } from "./slack-quotes";
-import { buildAnswerModal, composeAnswer } from "./slack-quote-modal";
+import { buildAnswerModal, composeAnswer, splitCopyPost } from "./slack-quote-modal";
 
 export type SlackEndpoint = "events" | "commands" | "interactivity";
 
@@ -1014,7 +1014,7 @@ async function handleViewSubmission(
       }
     }
     const message =
-      answersChars > 8000
+      answersChars > 30000
         ? `Your answers are too long (${answersChars} characters); shorten them.`
         : `Too long to send (${text.length} of ${MAX_COMMAND_LENGTH} characters); answer fewer passages.`;
     return Response.json({
@@ -1090,11 +1090,16 @@ async function handleViewSubmission(
   }
 
   // 8. Return {response_action:"clear"}; in ctx.waitUntil, post the copy into that channel:
-  // 🧑 via /quote\n<text> via postInChannel.
+  // 🧑 via /quote\n<text> via postInChannel (split into <= 3500-char chunks if needed).
   if (handle !== null) {
     const copyPrefix = isReplaced ? "(the quoted session was replaced; sent to the current one)\n" : "";
-    const copyText = `${copyPrefix}🧑 via /quote\n${text}`;
-    const work = postInChannel(env, db, ws, handle, copyText);
+    const firstPrefix = `${copyPrefix}🧑 via /quote\n`;
+    const posts = splitCopyPost(text, firstPrefix, 3500);
+    const work = (async () => {
+      for (const p of posts) {
+        await postInChannel(env, db, ws, handle, p);
+      }
+    })();
     if (waitUntil) waitUntil(work);
     else await work;
   }

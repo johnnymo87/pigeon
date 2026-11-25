@@ -205,7 +205,7 @@ Quotes recent assistant turns from a goose session for interactive answering via
 6. Daemon enqueues body post (`qt:<sessionId>:<cmdId>`) and answer post (`qa:<sessionId>:<cmdId>`) with inline "Answer" button (`quote:<cmdId>`) and `StoredQuote` payload into the outbox.
 7. Worker receives `/notifications/send`, stores the quote payload into D1 `slack_quotes` (7-day TTL), and posts to Slack.
 8. Tapping "Answer" checks owner and opens the answer modal via `views.open` within Slack's 3-second trigger window.
-9. Modal submission (`view_submission`, callback_id `quote_answer`) validates non-blank answers, enforces ≤10,000 chars, dedupes on view id in `slack_seen_events`, re-resolves the target session from channel handle, queues the composed prompt as `execute` with `metadataJson.senderId`, returns `{response_action: "clear"}`, and in `ctx.waitUntil` posts the `🧑 via /quote\n<text>` copy to the channel.
+9. Modal submission (`view_submission`, callback_id `quote_answer`) validates non-blank answers, enforces ≤35,000 chars, dedupes on view id in `slack_seen_events`, re-resolves the target session from channel handle, queues the composed prompt as `execute` with `metadataJson.senderId`, returns `{response_action: "clear"}`, and in `ctx.waitUntil` posts the `🧑 via /quote\n<text>` copy to the channel.
 
 ## Command Types
 

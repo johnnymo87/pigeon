@@ -1090,7 +1090,7 @@ describe("interactivity: view_submission", () => {
     };
     await putQuote(env.DB, quoteId, stored);
 
-    // Answer to a2 is huge (over 10,000 chars, answers dominate > 8000)
+    // Answer to a2 is huge (over 35,000 chars, answers dominate > 30,000)
     const res = await sendSubmission(box, {
       id: "V_TOOLONG",
       callback_id: "quote_answer",
@@ -1098,24 +1098,24 @@ describe("interactivity: view_submission", () => {
       state: {
         values: {
           a1: { answer: { value: "" } },
-          a2: { answer: { value: "x".repeat(10_001) } },
+          a2: { answer: { value: "x".repeat(35_001) } },
         },
       },
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(body.response_action).toBe("errors");
-    expect(body.errors.a2).toBe("Your answers are too long (10001 characters); shorten them.");
+    expect(body.errors.a2).toBe("Your answers are too long (35001 characters); shorten them.");
   });
 
-  it("too-long composed text where passages dominate returns 'Too long to send (<n> of 10000 characters); answer fewer passages.'", async () => {
+  it("too-long composed text where passages dominate returns 'Too long to send (<n> of 35000 characters); answer fewer passages.'", async () => {
     const box = await mkBox();
     const ch = await seedSessionChannel(box);
     const quoteId = `qid_${stamp()}`;
-    // 8 passages of ~1200 chars each (each <= 12 lines and <= 1500 chars so not elided)
-    // plus answers totaling 4000 chars (<= 8000 chars)
-    // Total text > 10,000 chars
-    const passages = Array.from({ length: 8 }, (_, i) => ({
+    // 35 passages of ~900 line chars each (each <= 12 lines and <= 1500 chars so not elided)
+    // plus answers totaling ~7000 chars (<= 30000 chars)
+    // Total text > 35,000 chars (~38,000 chars)
+    const passages = Array.from({ length: 35 }, (_, i) => ({
       header: `# Header ${i + 1}`,
       lines: [
         `line 1: ${"a".repeat(300)}`,
@@ -1128,13 +1128,13 @@ describe("interactivity: view_submission", () => {
       v: 1,
       sessionId: ch.sessionId,
       passages,
-      total: 8,
+      total: 35,
     };
     await putQuote(env.DB, quoteId, stored);
 
     const values: Record<string, { answer: { value: string } }> = {};
-    for (let i = 1; i <= 8; i++) {
-      values[`a${i}`] = { answer: { value: "ans".repeat(150) } }; // 450 chars * 8 = 3600 chars
+    for (let i = 1; i <= 35; i++) {
+      values[`a${i}`] = { answer: { value: "ans".repeat(67) } }; // 201 chars * 35 = 7035 chars
     }
 
     const res = await sendSubmission(box, {
@@ -1146,7 +1146,7 @@ describe("interactivity: view_submission", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     expect(body.response_action).toBe("errors");
-    expect(body.errors.a1).toMatch(/^Too long to send \(\d+ of 10000 characters\); answer fewer passages\.$/);
+    expect(body.errors.a1).toMatch(/^Too long to send \(\d+ of 35000 characters\); answer fewer passages\.$/);
   });
 
   it("queue full returns response_action errors on the first answer block", async () => {
@@ -1238,6 +1238,65 @@ describe("interactivity: view_submission", () => {
     const posts = slackOf("chat.postMessage");
     expect(posts).toHaveLength(1);
     expect(posts[0]!.params.get("text")).toBe("🧑 via /quote\n# 11-24 13:05 (wake: mail) · ask\n&gt; q1\nmy answer to 1");
+  });
+
+  it("splits the copy post into multiple posts when answer is long (> 3500 chars)", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    // 3 passages, each answered with ~2000 chars -> total composed text ~6500 chars
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [
+        { header: "# Header 1", lines: ["q1"], first: true },
+        { header: "# Header 2", lines: ["q2"], first: true },
+        { header: "# Header 3", lines: ["q3"], first: true },
+      ],
+      total: 3,
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000100" });
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000101" });
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000102" });
+
+    const ans1 = "1".repeat(2000);
+    const ans2 = "2".repeat(2000);
+    const ans3 = "3".repeat(2000);
+
+    const res = await sendSubmission(box, {
+      id: "V_LONG_SPLIT",
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: {
+        values: {
+          a1: { answer: { value: ans1 } },
+          a2: { answer: { value: ans2 } },
+          a3: { answer: { value: ans3 } },
+        },
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ response_action: "clear" });
+
+    // Verify command was queued
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+
+    // Verify copy post was split into multiple posts
+    const posts = slackOf("chat.postMessage");
+    expect(posts.length).toBeGreaterThan(1);
+    for (const post of posts) {
+      expect(post.params.get("text")!.length).toBeLessThanOrEqual(3500);
+    }
+    // First post has prefix
+    expect(posts[0]!.params.get("text")).toMatch(/^🧑 via \/quote\n/);
+    // Subsequent posts do not have prefix
+    for (let i = 1; i < posts.length; i++) {
+      expect(posts[i]!.params.get("text")).not.toMatch(/^🧑 via \/quote\n/);
+    }
   });
 
   it("duplicate view id is ignored (returns {})", async () => {
@@ -1403,6 +1462,26 @@ describe("events: refusals and bound channels", () => {
     slack("chat.postMessage", { ok: true, ts: "1700000032.000100", channel: ch.channelId });
     await sendEvent(box, { channel: ch.channelId, text: "x".repeat(MAX_COMMAND_LENGTH + 1) });
     expect(slackOf("chat.postMessage")[0]!.params.get("text")).toContain("Command too long");
+    expect(await commandsFor(box.machineId)).toEqual([]);
+  });
+
+  it("a 30k message is accepted", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    await sendEvent(box, { channel: ch.channelId, text: "x".repeat(30_000) });
+    const cmds = await commandsFor(box.machineId);
+    expect(cmds).toHaveLength(1);
+    expect(cmds[0]!.command).toBe("x".repeat(30_000));
+  });
+
+  it("a 36k message is refused with the new number", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    slack("chat.postMessage", { ok: true, ts: "1700000032.000100", channel: ch.channelId });
+    await sendEvent(box, { channel: ch.channelId, text: "x".repeat(36_000) });
+    const posts = slackOf("chat.postMessage");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.params.get("text")).toBe("Command too long (36000 chars, max 35000)");
     expect(await commandsFor(box.machineId)).toEqual([]);
   });
 });
