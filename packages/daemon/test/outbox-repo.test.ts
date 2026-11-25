@@ -562,4 +562,29 @@ describe("OutboxRepository", () => {
 
     storage.db.close();
   });
+
+  it("delivers quote rows ahead of earlier swarm and mirror rows from other sessions while preserving after_notification_id dependency", () => {
+    const storage = createStorage();
+
+    // Earlier swarm and mirror rows for other sessions
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "w:1", sessionId: "ses_swarm", requestId: "r1", kind: "swarm", payload: "{}" }, 1_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "m:1", sessionId: "ses_mirror", requestId: "r2", kind: "mirror", payload: "{}" }, 2_000);
+
+    // Later quote body (qt:) and answer (qa:) for quote session
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "qt:ses_quote:cmd1", sessionId: "ses_quote", requestId: "r3", kind: "quote", payload: "{}" }, 3_000);
+    storage.outbox.upsert({ ...BASE_INPUT, notificationId: "qa:ses_quote:cmd1", sessionId: "ses_quote", requestId: "r4", kind: "quote", payload: "{}", afterNotificationId: "qt:ses_quote:cmd1" }, 3_001);
+
+    // Initial getReady: qt: should come first (ahead of swarm and mirror); qa: is held waiting on qt:
+    const ready1 = storage.outbox.getReady(10_000, 10);
+    expect(ready1.map((r) => r.notificationId)).toEqual(["qt:ses_quote:cmd1", "w:1", "m:1"]);
+
+    // Mark qt: as sent
+    storage.outbox.markSent("qt:ses_quote:cmd1", 4_000);
+
+    // Second getReady: qa: is now unblocked and comes ahead of swarm and mirror
+    const ready2 = storage.outbox.getReady(10_000, 10);
+    expect(ready2.map((r) => r.notificationId)).toEqual(["qa:ses_quote:cmd1", "w:1", "m:1"]);
+
+    storage.db.close();
+  });
 });
