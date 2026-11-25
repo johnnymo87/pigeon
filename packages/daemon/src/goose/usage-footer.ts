@@ -61,14 +61,33 @@ export function parseGooseUsage(x: unknown): GooseUsage | undefined {
   };
 }
 
+export interface FormatGooseUsageFooterOptions {
+  /** Whether to include the cost segment (default: true). False for stall-watch coordinators. */
+  includeCost?: boolean;
+  /** The model name that produced the turn (e.g. "gemini-4-neon", "claude-opus-5-5"). */
+  model?: string | null;
+}
+
 /**
- * Formats a GooseUsage object into a footer string:
- * `📊 <tokens> tokens · <pct>% · <cost>`
- * Returns undefined if used is 0 (nothing to show).
+ * Formats a GooseUsage object (and optional model) into a footer string:
+ * `📊 <tokens> tokens · <pct>% · <cost> · 🧠 <model>`
+ *
+ * When `includeCost` is false (stall-watch coordinators), the cost segment is omitted.
+ * When usage is absent or `used <= 0`, returns `🧠 <model>` if a model is present,
+ * otherwise `undefined`.
  */
-export function formatGooseUsageFooter(u: GooseUsage): string | undefined {
-  if (u.used <= 0) {
-    return undefined;
+export function formatGooseUsageFooter(
+  u: GooseUsage | undefined,
+  options: FormatGooseUsageFooterOptions = {},
+): string | undefined {
+  const includeCost = options.includeCost ?? true;
+  const model =
+    typeof options.model === "string" && options.model.trim() !== ""
+      ? options.model.trim()
+      : undefined;
+
+  if (!u || u.used <= 0) {
+    return model ? `🧠 ${model}` : undefined;
   }
 
   const segments: string[] = [];
@@ -79,7 +98,7 @@ export function formatGooseUsageFooter(u: GooseUsage): string | undefined {
     segments.push(`${pct}%`);
   }
 
-  if (u.cost && u.cost.amount > 0) {
+  if (includeCost && u.cost && u.cost.amount > 0) {
     let formattedCost: string;
     try {
       formattedCost = new Intl.NumberFormat("en-US", {
@@ -90,6 +109,10 @@ export function formatGooseUsageFooter(u: GooseUsage): string | undefined {
       formattedCost = `${u.cost.amount.toFixed(2)} ${u.cost.currency}`;
     }
     segments.push(formattedCost);
+  }
+
+  if (model) {
+    segments.push(`🧠 ${model}`);
   }
 
   return `📊 ${segments.join(" · ")}`;

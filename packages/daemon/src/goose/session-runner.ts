@@ -208,6 +208,10 @@ export interface GooseSessionRunnerOptions {
   honkReconnectMaxDelayMs?: number;
   /** Optional injectable sleep function for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /** Optional read-only lookup for the model this goose session used on its latest turn. */
+  lookupModel?: (backendSessionId: string) => string | undefined;
+  /** Whether this session is a stall-watch coordinator (hides cost in usage footer). */
+  isCoordinator?: () => boolean;
 }
 
 interface Turn {
@@ -1831,11 +1835,11 @@ export class GooseSessionRunner {
         }
       }
 
-      if (turn.usage) {
-        const footer = formatGooseUsageFooter(turn.usage);
-        if (footer) {
-          message += `\n\n${footer}`;
-        }
+      const model = this.opts.lookupModel?.(this.backendSessionId);
+      const includeCost = !(this.opts.isCoordinator?.() ?? false);
+      const footer = formatGooseUsageFooter(turn.usage, { includeCost, model });
+      if (footer) {
+        message += `\n\n${footer}`;
       }
 
       if (turnFailed) {

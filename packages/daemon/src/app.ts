@@ -20,6 +20,7 @@ import {
   ALLOWED_PULL_SOURCES,
   HUMAN_REPLY_SOURCE,
   LEGACY_HUMAN_REPLY_SOURCE,
+  backendSessionIdOf,
   normalizePullSource,
   type QuestionInfoData,
 } from "./storage/types";
@@ -379,6 +380,12 @@ export interface AppOptions {
    * Session rename options for `POST /sessions/:id/rename`.
    */
   sessionRename?: Omit<SessionRenameDeps, "storage"> & { storage?: StorageDb };
+  /**
+   * Optional read-only lookup for the model a goose session used on its latest turn.
+   * Wired to `lookupGooseSessionModel` in index.ts; omitted in tests that do not
+   * want to touch the host's goose sessions.db.
+   */
+  lookupGooseModel?: (backendSessionId: string) => string | undefined;
 }
 
 /** Bound on the worker call behind `GET /swarm/remote-sessions`. An agent is waiting on it. */
@@ -2097,7 +2104,12 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         if (body.type === "turn.ended") {
-          const r = renderHookTurn(body as HookTurnEndedEvent);
+          const isCoordinator = coordinatorProgram(row) !== null;
+          const model = opts.lookupGooseModel?.(backendSessionIdOf(row));
+          const r = renderHookTurn(body as HookTurnEndedEvent, {
+            includeCost: !isCoordinator,
+            model,
+          });
           const res = await handleStopBody(
             {
               session_id: row.sessionId,

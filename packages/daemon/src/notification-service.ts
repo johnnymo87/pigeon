@@ -149,8 +149,6 @@ export function formatChatNotification(input: NotificationInput): {
   footer: ChatMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
-  const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
-
   const headerBuilder = new ChatMessageBuilder()
     .append(`${eventEmoji(input.event)} `)
     .append(input.label);
@@ -158,16 +156,9 @@ export function formatChatNotification(input: NotificationInput): {
   const bodyBuilder = new ChatMessageBuilder().append(input.summary);
 
   const footerBuilder = new ChatMessageBuilder()
-    .append("📂 ")
-    .appendCode(cwdShort);
-  if (input.machineId) {
-    footerBuilder.append(` · 🖥 ${input.machineId}`);
-  }
-  appendTag(footerBuilder, input.tag);
-  footerBuilder
-    .newline()
     .append("🆔 ")
     .appendCode(input.sessionId);
+  appendTag(footerBuilder, input.tag);
 
   return {
     header: headerBuilder.build(),
@@ -284,7 +275,6 @@ export function formatQuestionNotification(input: {
   message: ChatMessage;
   replyMarkup: { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
 } {
-  const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
   const firstQuestion = input.questions[0];
   const isMulti = input.questions.length > 1;
 
@@ -321,12 +311,8 @@ export function formatQuestionNotification(input: {
     b.newline(2).appendItalic("answer in app or wait for wizard buttons");
   }
 
-  b.newline(2).append("📂 ").appendCode(cwdShort);
-  if (input.machineId) {
-    b.append(` · 🖥 ${input.machineId}`);
-  }
+  b.newline(2).append("🆔 ").appendCode(input.sessionId);
   appendTag(b, input.tag);
-  b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   if (input.questions.length === 1 && firstQuestion && firstQuestion.options.length > 0) {
@@ -360,7 +346,6 @@ export function formatQuestionWizardStep(input: {
 } {
   const totalSteps = input.questions.length;
   const currentQuestion = input.questions[input.currentStep]!;
-  const cwdShort = input.cwd ? input.cwd.split("/").slice(-2).join("/") : "unknown";
 
   const b = new ChatMessageBuilder()
     .append("❓ ")
@@ -382,12 +367,8 @@ export function formatQuestionWizardStep(input: {
     });
   }
 
-  b.newline(2).append("📂 ").appendCode(cwdShort);
-  if (input.machineId) {
-    b.append(` · 🖥 ${input.machineId}`);
-  }
+  b.newline(2).append("🆔 ").appendCode(input.sessionId);
   appendTag(b, input.tag);
-  b.newline().append("🆔 ").appendCode(input.sessionId);
 
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
   const options = currentQuestion.options;

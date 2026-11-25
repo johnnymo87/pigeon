@@ -59,6 +59,8 @@ import { createRequesterTagResolver } from "./swarm/requester-tag";
 import { createMarkGooseRemoteReachable } from "./goose/remote-reachable.js";
 import { createChatReplySender } from "./worker/reply-factory";
 import { GOOSE_BACKEND_KIND } from "./goose/backend-kind.js";
+import { lookupGooseSessionModel } from "./goose/model-lookup.js";
+import { coordinatorProgram } from "./swarm/coordinators";
 import { gooseControlVerdict } from "./goose/control-guard.js";
 import { dropGooseRunnerWithSwarmNotify } from "./goose/runner-rotation.js";
 import { settleSwarmMessage } from "./swarm/swarm-settle.js";
@@ -340,6 +342,8 @@ const gooseRunners = config.gooseAcpUrl
           },
           touch: (sessionId) => storage.sessions.touch(sessionId, Date.now()),
           setTitle: (sessionId, title) => storage.sessions.setTitle(sessionId, title, Date.now()),
+          lookupModel: (backendSessionId) => lookupGooseSessionModel(backendSessionId),
+          isCoordinator: () => coordinatorProgram(storage.sessions.get(session.sessionId)) !== null,
           log: (m, f) => console.log(`[goose] ${m}`, f ?? ""),
         }),
     })
@@ -1444,6 +1448,7 @@ const app = createApp(storage, {
   lookupSessionOwner: poller ? (id, signal) => poller.lookupSessionOwner(id, signal) : undefined,
   swarmRelaySend: config.swarmRelaySend,
   remoteLaunch: remoteLaunchRequester,
+  lookupGooseModel: (backendSessionId) => lookupGooseSessionModel(backendSessionId),
   sessionRename: {
     renameGoose: gooseRunners
       ? (session, title) => gooseRunners.get(session).rename(title)

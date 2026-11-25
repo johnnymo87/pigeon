@@ -596,6 +596,40 @@ describe("GooseSessionRunner failure containment", () => {
     expect(stops[0]!.message).toBe("Hello world\n\n📊 45.2K tokens · 23% · $1.84");
   });
 
+  it("includes looked-up model and hides cost for stall-watch coordinator sessions", async () => {
+    const worker = makeRunner({
+      lookupModel: () => "gemini-4-neon",
+      isCoordinator: () => false,
+    });
+    await worker.runner.deliver("c1", "x");
+    worker.runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Worker" } });
+    worker.runner.onUpdate({
+      sessionUpdate: "usage_update",
+      used: 45231,
+      size: 200000,
+      cost: { amount: 1.84, currency: "USD" },
+    });
+    worker.client.finishTurn();
+    await worker.runner.settled();
+    expect(worker.stops[0]!.message).toBe("Worker\n\n📊 45.2K tokens · 23% · $1.84 · 🧠 gemini-4-neon");
+
+    const coord = makeRunner({
+      lookupModel: () => "claude-opus-5-5",
+      isCoordinator: () => true,
+    });
+    await coord.runner.deliver("c2", "y");
+    coord.runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Coord" } });
+    coord.runner.onUpdate({
+      sessionUpdate: "usage_update",
+      used: 45231,
+      size: 200000,
+      cost: { amount: 1.84, currency: "USD" },
+    });
+    coord.client.finishTurn();
+    await coord.runner.settled();
+    expect(coord.stops[0]!.message).toBe("Coord\n\n📊 45.2K tokens · 23% · 🧠 claude-opus-5-5");
+  });
+
   it("no usage frames -> message unchanged", async () => {
     const { runner, client, stops } = makeRunner();
     await runner.deliver("c1", "x");

@@ -278,4 +278,41 @@ describe("formatGooseUsageFooter", () => {
     };
     expect(formatGooseUsageFooter(usage)).toBe("📊 1.5M tokens · 75%");
   });
+
+  it("appends model with 🧠 when provided", () => {
+    const usage: GooseUsage = {
+      used: 45200,
+      size: 200000,
+      cost: { amount: 1.84, currency: "USD" },
+    };
+    expect(formatGooseUsageFooter(usage, { model: "gemini-4-neon" })).toBe(
+      "📊 45.2K tokens · 23% · $1.84 · 🧠 gemini-4-neon",
+    );
+  });
+
+  it("excludes cost when includeCost is false (stall-watch coordinator)", () => {
+    const usage: GooseUsage = {
+      used: 45200,
+      size: 200000,
+      cost: { amount: 1.84, currency: "USD" },
+    };
+    expect(
+      formatGooseUsageFooter(usage, { includeCost: false, model: "claude-opus-5-5" }),
+    ).toBe("📊 45.2K tokens · 23% · 🧠 claude-opus-5-5");
+
+    expect(formatGooseUsageFooter(usage, { includeCost: false })).toBe(
+      "📊 45.2K tokens · 23%",
+    );
+  });
+
+  it("renders model alone when usage is absent or used is 0", () => {
+    expect(formatGooseUsageFooter(undefined, { model: "gemini-4-neon" })).toBe(
+      "🧠 gemini-4-neon",
+    );
+    expect(
+      formatGooseUsageFooter({ used: 0, size: 200000 }, { model: "claude-opus-5-5" }),
+    ).toBe("🧠 claude-opus-5-5");
+    expect(formatGooseUsageFooter(undefined, { model: "   " })).toBeUndefined();
+    expect(formatGooseUsageFooter(undefined)).toBeUndefined();
+  });
 });
