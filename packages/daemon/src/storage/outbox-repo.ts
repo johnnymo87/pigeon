@@ -149,10 +149,10 @@ export class OutboxRepository {
    * Returns entries ready to be delivered: state='queued' AND (next_retry_at IS NULL OR next_retry_at <= now).
    *
    * Session-level group ordering (subquery):
-   *   question=1, stop=2, card=3, swarm=4, mirror=5, else=6
+   *   question=1, stop=2, quote=2, card=3, swarm=4, mirror=5, else=6
    *
    * Per-row tier ordering (secondary CASE):
-   *   question/stop/card -> 1 (conversational tier)
+   *   question/stop/quote/card -> 1 (conversational tier)
    *   everything else (swarm, mirror, unknown) -> 2 (record tier)
    *
    * Within a session, order is created_at per tier. The conversational tier preempts the
@@ -174,9 +174,9 @@ export class OutboxRepository {
              WHERE dep.notification_id = outbox.after_notification_id
                AND dep.state IN ('queued', 'sending')
            ))
-         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
+         ORDER BY (SELECT MIN(CASE o2.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 2 WHEN 'quote' THEN 2 WHEN 'card' THEN 3 WHEN 'swarm' THEN 4 WHEN 'mirror' THEN 5 ELSE 6 END)
                    FROM outbox o2 WHERE o2.session_id = outbox.session_id AND o2.state = 'queued') ASC,
-                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 1 WHEN 'card' THEN 1 ELSE 2 END) ASC,
+                  (CASE outbox.kind WHEN 'question' THEN 1 WHEN 'stop' THEN 1 WHEN 'quote' THEN 1 WHEN 'card' THEN 1 ELSE 2 END) ASC,
                   created_at ASC,
                   rowid ASC
          LIMIT ?`,

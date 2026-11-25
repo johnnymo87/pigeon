@@ -1117,6 +1117,10 @@ describe("expiryForKind unit tests", () => {
     expect(expiryForKind("card")).toBe(24 * 60 * 60 * 1000);
   });
 
+  it("returns REPLY_TOKEN_TTL_MS (24h) for quote", () => {
+    expect(expiryForKind("quote")).toBe(24 * 60 * 60 * 1000);
+  });
+
   it("returns REPLY_TOKEN_TTL_MS (24h) default for unknown kind", () => {
     expect(expiryForKind("unknown_kind")).toBe(24 * 60 * 60 * 1000);
     expect(expiryForKind("")).toBe(24 * 60 * 60 * 1000);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildAnswerModal, composeAnswer } from "../src/slack-quote-modal";
+import { buildAnswerModal, composeAnswer, splitCopyPost } from "../src/slack-quote-modal";
 import type { StoredQuote } from "../src/slack-quotes";
 
 describe("buildAnswerModal", () => {
@@ -405,5 +405,75 @@ describe("composeAnswer", () => {
     // Kept lines (8 lines * 49 chars = ~392 chars <= 1500) -> not truncated at 180
     expect(text).toContain(`> line 1: ${"a".repeat(40)}`);
     expect(text).toContain("> …\n> line 11:");
+  });
+});
+
+describe("splitCopyPost", () => {
+  it("returns a single chunk when firstPrefix + text <= maxChunkLen", () => {
+    const text = "Short answer";
+    const chunks = splitCopyPost(text);
+    expect(chunks).toEqual(["🧑 via /quote\nShort answer"]);
+  });
+
+  it("splits at paragraph breaks when text exceeds maxChunkLen", () => {
+    const para1 = "A".repeat(2000);
+    const para2 = "B".repeat(2000);
+    const text = `${para1}\n\n${para2}`;
+    const chunks = splitCopyPost(text, "🧑 via /quote\n", 3500);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe(`🧑 via /quote\n${para1}`);
+    expect(chunks[1]).toBe(para2);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(3500);
+    }
+  });
+
+  it("splits at line breaks when no paragraph break fits", () => {
+    const line1 = "A".repeat(2000);
+    const line2 = "B".repeat(2000);
+    const text = `${line1}\n${line2}`;
+    const chunks = splitCopyPost(text, "🧑 via /quote\n", 3500);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe(`🧑 via /quote\n${line1}`);
+    expect(chunks[1]).toBe(line2);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(3500);
+    }
+  });
+
+  it("splits at sentence boundaries when no line break fits", () => {
+    const sent1 = "A".repeat(2000) + ".";
+    const sent2 = "B".repeat(2000);
+    const text = `${sent1} ${sent2}`;
+    const chunks = splitCopyPost(text, "🧑 via /quote\n", 3500);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe(`🧑 via /quote\n${sent1}`);
+    expect(chunks[1]).toBe(sent2);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(3500);
+    }
+  });
+
+  it("hard cuts without splitting surrogate pairs", () => {
+    // 4000 emoji chars (each 2 code units)
+    const text = "😀".repeat(2000);
+    const chunks = splitCopyPost(text, "🧑 via /quote\n", 100);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const c of chunks) {
+      expect(c.length).toBeLessThanOrEqual(100);
+      // Ensure no dangling surrogate
+      expect(c).toBe(c.toWellFormed());
+    }
+  });
+
+  it("supports custom prefix such as replaced coordinator note", () => {
+    const prefix = "(the quoted session was replaced; sent to the current one)\n🧑 via /quote\n";
+    const text = "A".repeat(2000) + "\n\n" + "B".repeat(2000);
+    const chunks = splitCopyPost(text, prefix, 3500);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe(`${prefix}${"A".repeat(2000)}`);
+    expect(chunks[1]).toBe("B".repeat(2000));
+    expect(chunks[0]!.length).toBeLessThanOrEqual(3500);
+    expect(chunks[1]!.length).toBeLessThanOrEqual(3500);
   });
 });

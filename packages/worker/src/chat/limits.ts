@@ -1,7 +1,7 @@
 /** Limits shared by every inbound chat ingress (Slack's). */
 
 /** Longest command body accepted. */
-export const MAX_COMMAND_LENGTH = 10_000;
+export const MAX_COMMAND_LENGTH = 35_000;
 
 /** Largest inbound file accepted, in bytes. */
 export const MAX_FILE_SIZE = 20 * 1024 * 1024;
