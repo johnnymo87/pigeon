@@ -5,6 +5,7 @@ import { registerGooseSession } from "./goose/register-session.js";
 import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
+import { parseGooseUsage } from "./goose/usage-footer.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, ChatSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -20,6 +21,7 @@ import {
   ALLOWED_PULL_SOURCES,
   HUMAN_REPLY_SOURCE,
   LEGACY_HUMAN_REPLY_SOURCE,
+  backendSessionIdOf,
   normalizePullSource,
   type QuestionInfoData,
 } from "./storage/types";
@@ -379,6 +381,12 @@ export interface AppOptions {
    * Session rename options for `POST /sessions/:id/rename`.
    */
   sessionRename?: Omit<SessionRenameDeps, "storage"> & { storage?: StorageDb };
+  /**
+   * Optional read-only lookup for the model a goose session used on its latest turn.
+   * Wired to `lookupGooseSessionModel` in index.ts; omitted in tests that do not
+   * want to touch the host's goose sessions.db.
+   */
+  lookupGooseModel?: (backendSessionId: string) => string | undefined;
 }
 
 /** Bound on the worker call behind `GET /swarm/remote-sessions`. An agent is waiting on it. */
@@ -2097,7 +2105,25 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         if (body.type === "turn.ended") {
-          const r = renderHookTurn(body as HookTurnEndedEvent);
+          const hasUsage = parseGooseUsage(body.usage)?.used ? true : false;
+          let isCoordinator = false;
+          try {
+            isCoordinator = coordinatorProgram(row) !== null;
+          } catch {
+            // Fail open: decorative footer decision must never cost a reply.
+          }
+          let model: string | undefined;
+          if (hasUsage) {
+            try {
+              model = opts.lookupGooseModel?.(backendSessionIdOf(row));
+            } catch {
+              // Fail open.
+            }
+          }
+          const r = renderHookTurn(body as HookTurnEndedEvent, {
+            includeCost: !isCoordinator,
+            model,
+          });
           const res = await handleStopBody(
             {
               session_id: row.sessionId,

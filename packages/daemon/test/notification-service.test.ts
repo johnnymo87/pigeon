@@ -73,19 +73,22 @@ describe("formatChatNotification", () => {
     // Body is the summary
     expect(result.body.text).toBe("Done");
 
-    // Footer contains cwd, sessionId
-    expect(result.footer.text).toContain("projects/pigeon");
-    expect(result.footer.text).toContain("sess-abc123");
+    // Footer contains sessionId only (no directory or machine)
+    expect(result.footer.text).toBe("🆔 sess-abc123");
+    expect(result.footer.text).not.toContain("projects/pigeon");
+    expect(result.footer.text).not.toContain("📂");
+    expect(result.footer.text).not.toContain("🖥");
     // No swipe-reply hint: swipe-reply still works, the trailing line was noise.
     expect(result.footer.text).not.toContain("Swipe-reply");
-    // Footer should have code entities for cwd and sessionId
+    // Footer should have code entity for sessionId
     const codeEntities = result.footer.entities.filter(e => e.type === "code");
-    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+    expect(codeEntities).toHaveLength(1);
+    expect(result.footer.text.slice(codeEntities[0]!.offset, codeEntities[0]!.offset + codeEntities[0]!.length)).toBe("sess-abc123");
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(0);
   });
 
-  it("renders the oc-tags tag on the cwd line when the session has one", () => {
+  it("renders the oc-tags tag on the session id line when the session has one", () => {
     const result = formatChatNotification({
       event: "Stop",
       label: "l",
@@ -96,9 +99,10 @@ describe("formatChatNotification", () => {
       sessionId: "sess-abc123",
       tag: "billing",
     });
-    expect(result.footer.text).toContain("🏷 billing");
-    // Same line as cwd and machine: three facts about WHERE the work happened.
-    expect(result.footer.text.split("\n")[0]).toContain("🏷 billing");
+    expect(result.footer.text).toBe("🆔 sess-abc123 · 🏷 billing");
+    expect(result.footer.text).not.toContain("📂");
+    expect(result.footer.text).not.toContain("🖥");
+    expect(result.footer.text).not.toContain("cloudbox");
   });
 
   it("caps an absurdly long tag rather than letting it eat the message", () => {
@@ -209,7 +213,7 @@ describe("formatChatNotification", () => {
     expect(permissionResult.header.text).toContain("🔐");
   });
 
-  it("includes machine ID in footer when provided", () => {
+  it("omits directory and machine ID from footer even when provided", () => {
     const result = formatChatNotification({
       event: "Stop",
       label: "test",
@@ -220,23 +224,10 @@ describe("formatChatNotification", () => {
       sessionId: "sess-xyz",
     });
 
-    expect(result.footer.text).toContain("projects/pigeon");
-    expect(result.footer.text).toContain("devbox");
-    expect(result.footer.text).toContain("sess-xyz");
-  });
-
-  it("omits machine ID from footer when not provided", () => {
-    const result = formatChatNotification({
-      event: "Stop",
-      label: "test",
-      summary: "Done",
-      cwd: "/home/dev/projects/pigeon",
-      token: "tok123",
-      sessionId: "sess-nomachine",
-    });
-
-    expect(result.footer.text).toContain("projects/pigeon");
-    expect(result.footer.text).toContain("sess-nomachine");
+    expect(result.footer.text).toBe("🆔 sess-xyz");
+    expect(result.footer.text).not.toContain("projects/pigeon");
+    expect(result.footer.text).not.toContain("📂");
+    expect(result.footer.text).not.toContain("devbox");
     expect(result.footer.text).not.toContain("🖥");
   });
 
@@ -290,6 +281,11 @@ describe("formatQuestionWizardStep", () => {
     expect(result.message.text).toContain("PostgreSQL");
     expect(result.message.text).toContain("SQLite");
     expect(result.message.text).not.toContain("ORM"); // future question not shown
+    expect(result.message.text).not.toContain("📂");
+    expect(result.message.text).not.toContain("projects/pigeon");
+    expect(result.message.text).not.toContain("🖥");
+    expect(result.message.text).not.toContain("devbox");
+    expect(result.message.text).toContain("🆔 sess-wiz");
 
     // "Question 1 of 2" should be bold
     const boldEntity = result.message.entities.find(e => e.type === "bold");
@@ -390,18 +386,21 @@ describe("formatQuestionNotification", () => {
     expect(result.message.text).toContain("Which database should I use?");
     expect(result.message.text).toContain("PostgreSQL");
     expect(result.message.text).toContain("SQLite");
-    expect(result.message.text).toContain("projects/pigeon");
-    expect(result.message.text).toContain("devbox");
-    expect(result.message.text).toContain("sess-q1");
+    expect(result.message.text).not.toContain("projects/pigeon");
+    expect(result.message.text).not.toContain("📂");
+    expect(result.message.text).not.toContain("devbox");
+    expect(result.message.text).not.toContain("🖥");
+    expect(result.message.text).toContain("🆔 sess-q1");
     expect(result.message.text).not.toContain("Swipe-reply");
 
     // "Question" should be bold
     const boldEntity = result.message.entities.find(e => e.type === "bold");
     expect(boldEntity).toBeDefined();
 
-    // sessionId and cwd should be code entities
+    // sessionId should be a code entity
     const codeEntities = result.message.entities.filter(e => e.type === "code");
-    expect(codeEntities.length).toBeGreaterThanOrEqual(2);
+    expect(codeEntities).toHaveLength(1);
+    expect(result.message.text.slice(codeEntities[0]!.offset, codeEntities[0]!.offset + codeEntities[0]!.length)).toBe("sess-q1");
 
     expect(result.replyMarkup.inline_keyboard).toHaveLength(1);
     expect(result.replyMarkup.inline_keyboard[0]).toHaveLength(2);

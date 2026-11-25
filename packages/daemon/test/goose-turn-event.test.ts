@@ -831,5 +831,92 @@ describe("POST /goose/turn-event", () => {
       expect(row).not.toBeNull();
       expect(row!.afterNotificationId).toBeNull();
     });
+
+    it("worker turn.ended includes cost and looked-up model; coordinator excludes cost", async () => {
+      const app = newApp(1_000, {
+        lookupGooseModel: (backendId: string) =>
+          backendId === "goose-worker" ? "gemini-4-neon" : "claude-opus-5-5",
+      });
+      const workerId = await registerGoose(app, "goose-worker");
+      const coordId = await registerGoose(app, "goose-coord");
+      storage!.sessions.setBoundTopicKey(coordId, "stallwatch:pigeon", 1_000);
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-worker",
+        upstream_id: "u-worker",
+        stop_reason: "end_turn",
+        final_text: "worker reply",
+        usage: { used: 45231, size: 200000, cost: { amount: 1.84, currency: "USD" } },
+      });
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-coord",
+        upstream_id: "u-coord",
+        stop_reason: "end_turn",
+        final_text: "coord reply",
+        usage: { used: 45231, size: 200000, cost: { amount: 1.84, currency: "USD" } },
+      });
+
+      const workerRow = storage!.outbox.getByNotificationId(`s:${workerId}:h-u-worker`)!;
+      const workerText = (JSON.parse(workerRow.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
+      expect(workerText).toContain("📊 45.2K tokens · 23% · $1.84 · 🧠 gemini-4-neon");
+      expect(workerText).not.toContain("📂");
+      expect(workerText).not.toContain("🖥");
+
+      const coordRow = storage!.outbox.getByNotificationId(`s:${coordId}:h-u-coord`)!;
+      const coordText = (JSON.parse(coordRow.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
+      expect(coordText).toContain("📊 45.2K tokens · 23% · 🧠 claude-opus-5-5");
+      expect(coordText).not.toContain("$1.84");
+    });
+
+    it("turn.ended event model takes precedence over lookupGooseModel", async () => {
+      const app = newApp(1_000, {
+        lookupGooseModel: () => "claude-opus-5-5",
+      });
+      const workerId = await registerGoose(app, "goose-worker-override");
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-worker-override",
+        upstream_id: "u-override",
+        stop_reason: "end_turn",
+        final_text: "override reply",
+        model: "gemini-4-neon",
+        usage: { used: 10000, size: 200000 },
+      });
+
+      const row = storage!.outbox.getByNotificationId(`s:${workerId}:h-u-override`)!;
+      const text = (JSON.parse(row.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
+      expect(text).toContain("📊 10.0K tokens · 5% · 🧠 gemini-4-neon");
+    });
+
+    it("turn.ended without usage does not attach a stale looked-up model", async () => {
+      let called = false;
+      const app = newApp(1_000, {
+        lookupGooseModel: () => {
+          called = true;
+          return "claude-opus-5-5";
+        },
+      });
+      const workerId = await registerGoose(app, "goose-no-usage");
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-no-usage",
+        upstream_id: "u-no-usage",
+        stop_reason: "end_turn",
+        error: "provider error",
+      });
+
+      expect(called).toBe(false);
+      const row = storage!.outbox.getByNotificationId(`s:${workerId}:h-u-no-usage`)!;
+      const text = (JSON.parse(row.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
+      expect(text).not.toContain("🧠");
+    });
   });
 });

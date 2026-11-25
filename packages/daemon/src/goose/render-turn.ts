@@ -6,7 +6,11 @@
  * - POST /goose/turn-event (rendering honkd turn.ended hook events)
  */
 
-import { formatGooseUsageFooter, parseGooseUsage } from "./usage-footer.js";
+import {
+  formatGooseUsageFooter,
+  parseGooseUsage,
+  type FormatGooseUsageFooterOptions,
+} from "./usage-footer.js";
 
 export const DEFAULT_MAX_TRANSCRIPT_BYTES = 64 * 1024;
 export const TRUNCATION_NOTICE = "\n\n[... truncated: the turn produced more output than pigeon buffers]";
@@ -76,6 +80,7 @@ export interface HookTurnEndedEvent {
   final_text_truncated?: boolean | null;
   error?: string | null;
   usage?: unknown;
+  model?: string | null;
   [key: string]: unknown;
 }
 
@@ -95,7 +100,10 @@ function formatCappedBody(text: string, truncated?: boolean | null): string {
 /**
  * Renders a honkd turn.ended event into a notification payload for pigeon's stop route.
  */
-export function renderHookTurn(ev: HookTurnEndedEvent): RenderedHookTurn {
+export function renderHookTurn(
+  ev: HookTurnEndedEvent,
+  options: FormatGooseUsageFooterOptions = {},
+): RenderedHookTurn {
   const isCancelled =
     ev.honk_reason === "cancelled" || (ev.stop_reason === "cancelled" && !ev.honk_reason);
 
@@ -125,14 +133,15 @@ export function renderHookTurn(ev: HookTurnEndedEvent): RenderedHookTurn {
     }
   }
 
-  if (ev.usage !== undefined) {
-    const parsed = parseGooseUsage(ev.usage);
-    if (parsed) {
-      const footer = formatGooseUsageFooter(parsed);
-      if (footer) {
-        message += `\n\n${footer}`;
-      }
-    }
+  const parsedUsage = ev.usage !== undefined ? parseGooseUsage(ev.usage) : undefined;
+  const evModel =
+    typeof ev.model === "string" && ev.model.trim() !== "" ? ev.model.trim() : undefined;
+  const footer = formatGooseUsageFooter(parsedUsage, {
+    includeCost: options.includeCost,
+    model: evModel ?? options.model,
+  });
+  if (footer) {
+    message += `\n\n${footer}`;
   }
 
   if (isCancelled) {
