@@ -5,6 +5,7 @@ import { registerGooseSession } from "./goose/register-session.js";
 import { ensureGooseSwarmMailbox } from "./goose/swarm-mailbox.js";
 import { sanitiseIdPart } from "./goose/session-runner.js";
 import { renderHookTurn, capText, type HookTurnEndedEvent } from "./goose/render-turn.js";
+import { parseGooseUsage } from "./goose/usage-footer.js";
 import { isNotifyPolicy, NOTIFY_POLICIES, type NotifyPolicy } from "./storage/session-origin-repo";
 import { PLAIN_ALERT_TIMEOUT_MS, ChatSendError, type StopNotifier } from "./notification-service";
 import { resolveAlertKeyboard, type TopicLookup } from "./alert-links";
@@ -2104,8 +2105,21 @@ export function createApp(storage: StorageDb, options: AppOptions = {}) {
         }
 
         if (body.type === "turn.ended") {
-          const isCoordinator = coordinatorProgram(row) !== null;
-          const model = opts.lookupGooseModel?.(backendSessionIdOf(row));
+          const hasUsage = parseGooseUsage(body.usage)?.used ? true : false;
+          let isCoordinator = false;
+          try {
+            isCoordinator = coordinatorProgram(row) !== null;
+          } catch {
+            // Fail open: decorative footer decision must never cost a reply.
+          }
+          let model: string | undefined;
+          if (hasUsage) {
+            try {
+              model = opts.lookupGooseModel?.(backendSessionIdOf(row));
+            } catch {
+              // Fail open.
+            }
+          }
           const r = renderHookTurn(body as HookTurnEndedEvent, {
             includeCost: !isCoordinator,
             model,

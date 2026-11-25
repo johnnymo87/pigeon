@@ -628,6 +628,18 @@ describe("GooseSessionRunner failure containment", () => {
     coord.client.finishTurn();
     await coord.runner.settled();
     expect(coord.stops[0]!.message).toBe("Coord\n\n📊 45.2K tokens · 23% · 🧠 claude-opus-5-5");
+
+    // When a turn has no usage (e.g. failed before an LLM call), do not look up a stale model.
+    const noUsage = makeRunner({
+      lookupModel: () => {
+        throw new Error("should not be called without usage");
+      },
+    });
+    await noUsage.runner.deliver("c3", "z");
+    noUsage.runner.onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "NoUsage" } });
+    noUsage.client.finishTurn();
+    await noUsage.runner.settled();
+    expect(noUsage.stops[0]!.message).toBe("NoUsage");
   });
 
   it("no usage frames -> message unchanged", async () => {

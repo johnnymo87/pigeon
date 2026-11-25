@@ -1835,11 +1835,23 @@ export class GooseSessionRunner {
         }
       }
 
-      const model = this.opts.lookupModel?.(this.backendSessionId);
-      const includeCost = !(this.opts.isCoordinator?.() ?? false);
-      const footer = formatGooseUsageFooter(turn.usage, { includeCost, model });
-      if (footer) {
-        message += `\n\n${footer}`;
+      if (turn.usage && turn.usage.used > 0) {
+        let model: string | undefined;
+        try {
+          model = this.opts.lookupModel?.(this.backendSessionId);
+        } catch {
+          // Fail open: decorative footer lookup must never cost a reply.
+        }
+        let includeCost = true;
+        try {
+          includeCost = !(this.opts.isCoordinator?.() ?? false);
+        } catch {
+          // Fail open.
+        }
+        const footer = formatGooseUsageFooter(turn.usage, { includeCost, model });
+        if (footer) {
+          message += `\n\n${footer}`;
+        }
       }
 
       if (turnFailed) {

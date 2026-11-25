@@ -893,5 +893,30 @@ describe("POST /goose/turn-event", () => {
       const text = (JSON.parse(row.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
       expect(text).toContain("📊 10.0K tokens · 5% · 🧠 gemini-4-neon");
     });
+
+    it("turn.ended without usage does not attach a stale looked-up model", async () => {
+      let called = false;
+      const app = newApp(1_000, {
+        lookupGooseModel: () => {
+          called = true;
+          return "claude-opus-5-5";
+        },
+      });
+      const workerId = await registerGoose(app, "goose-no-usage");
+
+      await postTurnEvent(app, {
+        v: 1,
+        type: "turn.ended",
+        session_id: "goose-no-usage",
+        upstream_id: "u-no-usage",
+        stop_reason: "end_turn",
+        error: "provider error",
+      });
+
+      expect(called).toBe(false);
+      const row = storage!.outbox.getByNotificationId(`s:${workerId}:h-u-no-usage`)!;
+      const text = (JSON.parse(row.payload) as { messages: Array<{ text: string }> }).messages[0]!.text;
+      expect(text).not.toContain("🧠");
+    });
   });
 });
