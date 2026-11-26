@@ -103,12 +103,17 @@ say "node:     $NODE_DIR/node ($("$NODE_DIR/node" -v), ABI $("$NODE_DIR/node" -p
 # Runs node/npm exactly as the service would see them. PATH is prefixed, not
 # just the binary named, because better-sqlite3's install scripts call `node`.
 with_node() { PATH="$NODE_DIR:$PATH" "$@"; }
+# The better-sqlite3 check and one-shot rebuild. The daemon's start script runs
+# the same script on every start (workstation repo), so a node change from a
+# system switch is handled there too; this is the copy that runs from the
+# caller's checkout, which may be newer than $REPO's before the pull.
+ENSURE="$(cd "$(dirname "$0")" && pwd)/ensure-native-modules.sh"
+[ -x "$ENSURE" ] || die "$ENSURE missing or not executable"
 # What the service needs from node_modules: tsx (a devDependency it execs) and
 # a better-sqlite3 binary built for ITS node's ABI.
+tsx_present() { [ -f "$REPO/node_modules/tsx/dist/cli.mjs" ]; }
 runtime_check() {
-  [ -f "$REPO/node_modules/tsx/dist/cli.mjs" ] || return 1
-  (cd "$REPO/packages/daemon" && with_node node -e \
-    'new (require("better-sqlite3"))(":memory:").close()') 2>/dev/null
+  tsx_present && "$ENSURE" --node-dir "$NODE_DIR" --repo "$REPO" --check-only 2>/dev/null
 }
 # npm install does not re-run install scripts for an unchanged package, so a
 # binary built earlier for the wrong ABI survives it; only a rebuild fixes that.
@@ -136,7 +141,7 @@ if [ "$DRY_RUN" = 1 ]; then
   say "dry run; would run:"
   say "  git -C $REPO pull --ff-only"
   say "  (cd $REPO && PATH=$NODE_DIR:\$PATH npm install --no-audit --no-fund)"
-  say "  tsx + better-sqlite3 check under $NODE_DIR/node (npm rebuild better-sqlite3 once if it fails)"
+  say "  tsx check; $ENSURE under $NODE_DIR/node (npm rebuild better-sqlite3 once if it fails)"
   say "  ${restart_cmd[*]}"
   say "  poll $HEALTH_URL"
   exit 0
@@ -169,12 +174,11 @@ trap on_exit EXIT
 
 (cd "$REPO" && with_node npm install --no-audit --no-fund)
 
-# Gate the restart on node_modules fitting the service's node.
-if ! runtime_check; then
-  say "node_modules does not fit $NODE_DIR/node; rebuilding better-sqlite3 once"
-  (cd "$REPO" && with_node npm rebuild better-sqlite3)
-  runtime_check || die "tsx missing or better-sqlite3 does not load under $NODE_DIR/node; NOT restarting"
-fi
+# Gate the restart on node_modules fitting the service's node (rebuilding
+# better-sqlite3 once if it does not).
+tsx_present || die "node_modules/tsx missing after npm install; NOT restarting"
+"$ENSURE" --node-dir "$NODE_DIR" --repo "$REPO" \
+  || die "better-sqlite3 does not load under $NODE_DIR/node even after a rebuild; NOT restarting"
 
 # --- 5. Restart and verify ----------------------------------------------------
 say "restarting: ${restart_cmd[*]}"

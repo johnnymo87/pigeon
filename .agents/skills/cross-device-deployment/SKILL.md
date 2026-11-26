@@ -66,6 +66,20 @@ guaranteed to be that node. On macOS an opencode bash call has **no `npm` at all
 is not loaded), so a bare `npm install` fails with `npm: command not found`, which is the benign
 form of the same bug.
 
+### The node can also change under the daemon
+
+A NixOS, home-manager or darwin switch that bumps `pkgs.nodejs` changes the daemon's node without
+any deploy (cloudbox's 26.05 switch, 2026-11-25: 54 restarts on `ERR_DLOPEN_FAILED` until a hand
+rebuild). So every machine's start script runs `scripts/ensure-native-modules.sh` (the same check
+`deploy-daemon.sh` uses) before it execs the daemon: about 0.1s when nothing changed; when
+`better-sqlite3` does not load, one `npm rebuild better-sqlite3` under the service's node, which
+usually **compiles** (about a minute on cloudbox; there is often no prebuilt binary for a new
+node). If that rebuild fails, the script posts once to the machine's Slack `#alerts` webhook and
+writes a latch at `~/.local/state/pigeon/native-rebuild-failed`; later starts fail fast with the
+fix instead of recompiling on every restart, and on devbox/cloudbox the unit stops restarting
+(exit 78, `RestartPreventExitStatus`). Fixing `node_modules` by hand (or a different node)
+clears the latch. Read the start log for `ensure-native-modules:` lines.
+
 ### Manual fallback
 
 If the script cannot run, do the same by hand: find the daemon's node, then put its directory
