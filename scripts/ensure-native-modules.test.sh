@@ -21,7 +21,7 @@ setup() {
   mkdir -p "$T/repo/packages/daemon" "$T/bin" "$T/state" "$T/sys" "$T/tools"
   # The systemd units' PATH holds only bash, coreutils and node, so the script
   # under test gets exactly that: a missing grep/sed fails here, not in prod.
-  for t in bash env cat head date mkdir rm dirname uname touch; do
+  for t in bash env cat head date mkdir rm dirname uname touch sleep; do
     ln -s "$(command -v "$t")" "$T/sys/$t"
   done
   # node: `-e CODE` loads better-sqlite3 (or posts the alarm); `-p EXPR`
@@ -107,7 +107,7 @@ teardown
 # 3. Rebuild fails: exit 1, latch written, alarm sent once.
 setup; WEBHOOK="https://example.invalid/hook"
 run --latch "$LATCH" --alarm
-check "broken: rc 1" is "$rc" 1
+check "broken: rc 3" is "$rc" 3
 check "broken: one rebuild attempt" is "$(npm_calls)" 1
 check "broken: latch written" test -s "$LATCH"
 check "broken: one alarm" is "$(alarms)" 1
@@ -116,7 +116,7 @@ check "broken: names the latch" has "$out" "$LATCH"
 
 # 4. Next start, same node: no second rebuild, no second alarm, still exit 1.
 run --latch "$LATCH" --alarm
-check "latched: rc 1" is "$rc" 1
+check "latched: rc 3" is "$rc" 3
 check "latched: no new rebuild" is "$(npm_calls)" 1
 check "latched: no new alarm" is "$(alarms)" 1
 check "latched: says it is not retrying" has "$out" "not retrying"
@@ -132,7 +132,7 @@ teardown; WEBHOOK=""
 # 5b. npm exits 0 but the binary still does not load: also a failure.
 setup; touch "$T/state/rebuild_noop"
 run --latch "$LATCH"
-check "noop rebuild: rc 1" is "$rc" 1
+check "noop rebuild: rc 3" is "$rc" 3
 check "noop rebuild: says it still does not load" has "$out" "still does not load after a successful rebuild"
 check "noop rebuild: latched" test -s "$LATCH"
 teardown
@@ -151,14 +151,14 @@ teardown
 # 7. --check-only never rebuilds.
 setup
 run --check-only
-check "check-only: rc 1" is "$rc" 1
+check "check-only: rc 3" is "$rc" 3
 check "check-only: no npm" is "$(npm_calls)" 0
 teardown
 
 # 8. --alarm without a webhook: no alarm, failure still reported.
 setup
 run --latch "$LATCH" --alarm
-check "no webhook: rc 1" is "$rc" 1
+check "no webhook: rc 3" is "$rc" 3
 check "no webhook: no alarm" is "$(alarms)" 0
 teardown
 
@@ -166,6 +166,28 @@ teardown
 setup
 run; run
 check "no latch: retries each call" is "$(npm_calls)" 2
+teardown
+
+# 9b. A stale lock (holder gone) is broken, and the rebuild goes ahead.
+setup; touch "$T/state/rebuild_ok"
+mkdir "$T/repo/node_modules" "$T/repo/node_modules/.ensure-native-modules.lock"
+echo 999999 > "$T/repo/node_modules/.ensure-native-modules.lock/pid"
+run
+check "stale lock: rc 0" is "$rc" 0
+check "stale lock: rebuilt" is "$(npm_calls)" 1
+check "stale lock: released" test ! -e "$T/repo/node_modules/.ensure-native-modules.lock"
+teardown
+
+# 9c. A live rebuild holds the lock: wait for it, then re-check, no 2nd rebuild.
+setup
+mkdir -p "$T/repo/node_modules/.ensure-native-modules.lock"
+( sleep 2; touch "$T/state/loads"; rm -rf "$T/repo/node_modules/.ensure-native-modules.lock" ) &
+echo $! > "$T/repo/node_modules/.ensure-native-modules.lock/pid"
+run
+wait
+check "live lock: rc 0" is "$rc" 0
+check "live lock: waited, did not rebuild" is "$(npm_calls)" 0
+check "live lock: said so" has "$out" "waiting for it"
 teardown
 
 # 10. Usage errors exit 2.

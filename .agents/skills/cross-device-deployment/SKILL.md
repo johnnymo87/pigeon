@@ -78,7 +78,11 @@ node). If that rebuild fails, the script posts once to the machine's Slack `#ale
 writes a latch at `~/.local/state/pigeon/native-rebuild-failed`; later starts fail fast with the
 fix instead of recompiling on every restart, and on devbox/cloudbox the unit stops restarting
 (exit 78, `RestartPreventExitStatus`). Fixing `node_modules` by hand (or a different node)
-clears the latch. Read the start log for `ensure-native-modules:` lines.
+clears the latch. Read the start log for `ensure-native-modules:` lines. If it shows
+`rebuilding better-sqlite3 once`, **wait** rather than rebuild by hand: a second `npm rebuild` in
+the same checkout deletes the first one's `build/` and fails both (`deploy-daemon.sh` and the start
+script take a lock in `node_modules/.ensure-native-modules.lock`; a hand rebuild does not). If the
+script itself breaks (any exit other than 3), the start script warns and starts the daemon anyway.
 
 ### Manual fallback
 

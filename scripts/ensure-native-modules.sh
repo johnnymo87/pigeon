@@ -18,7 +18,15 @@
 #   --alarm         when a rebuild fails, post once to
 #                   $PIGEON_SLACK_ALARM_WEBHOOK_URL (if set)
 #
-# Exit 0: it loads (possibly after a rebuild). 1: it does not. 2: usage.
+# Exit 0: it loads (possibly after a rebuild). 3: it does not (check-only,
+# latched, or the rebuild failed). 2: usage. Anything else means this script
+# itself broke; the start scripts treat only 3 as "do not start the daemon".
+#
+# Rebuilds are serialised by a lock directory in node_modules, so the start
+# script and deploy-daemon.sh never compile into the same build/ at once (a
+# node-gyp rebuild begins by deleting it). The second caller waits, then
+# re-checks before rebuilding. A hand-run `npm rebuild` does not take the lock:
+# if the log shows "rebuilding better-sqlite3 once", wait for it.
 #
 # Why: packages/daemon depends on better-sqlite3, a NATIVE module, built for one
 # node ABI. When the service's node changes under it -- a NixOS, home-manager or
@@ -95,7 +103,7 @@ loads() {
 key() {
   (cd "$REPO/packages/daemon" && with_node node -p \
     'process.execPath+" "+process.version+" abi"+process.versions.modules+" better-sqlite3@"+(()=>{try{return require("better-sqlite3/package.json").version}catch(e){return "missing"}})()' \
-    2>/dev/null) || echo unknown
+    2>/dev/null || echo unknown) | { read -r k || true; echo "$k build=$BUILD_PATH"; }
 }
 clear_latch() { [ -z "$LATCH" ] || rm -f "$LATCH"; }
 
@@ -106,7 +114,7 @@ fi
 say "better-sqlite3 does not load under $NODE_DIR/node ($(with_node node -v)): $LOAD_ERR"
 if [ "$CHECK_ONLY" = 1 ]; then
   say "fix: $HINT"
-  exit 1
+  exit 3
 fi
 
 k="$(key)"
@@ -116,7 +124,41 @@ if [ -n "$latched" ] && [ "$latched" = "$k" ]; then
   { read -r _; read -r when; } < "$LATCH" || true
   say "a rebuild for this node already failed (${when:-at an unknown time}); not retrying."
   say "fix: $HINT -- then restart the daemon. (Or delete $LATCH to retry automatically.)"
-  exit 1
+  exit 3
+fi
+
+LOCK="$REPO/node_modules/.ensure-native-modules.lock"
+# mkdir is atomic everywhere (flock is not on the units' PATH or on macOS).
+# A holder that is gone (killed mid-rebuild), or a lock with no pid after a
+# few seconds, is stale and broken.
+take_lock() {
+  local waited=0 stale=0 holder
+  mkdir -p "$(dirname "$LOCK")" || return 1
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    [ -d "$LOCK" ] || { say "cannot create $LOCK"; return 1; }
+    holder=""
+    [ ! -f "$LOCK/pid" ] || read -r holder < "$LOCK/pid" || true
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      stale=0
+      [ "$waited" != 0 ] || say "another rebuild (pid $holder) is running; waiting for it"
+      [ "$waited" -lt 900 ] || { say "gave up after 15 min waiting for pid $holder"; return 1; }
+    elif [ "$stale" -ge 3 ]; then
+      say "breaking a stale rebuild lock ${holder:+(pid $holder is gone)}"
+      rm -rf "$LOCK"; stale=0; continue
+    else
+      stale=$((stale + 1))
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+}
+take_lock || exit 3
+# Someone else's rebuild may have fixed it while we waited.
+if loads; then
+  say "better-sqlite3 loads now (rebuilt by another caller)"
+  clear_latch
+  exit 0
 fi
 
 say "rebuilding better-sqlite3 once: $HINT"
@@ -156,4 +198,4 @@ if [ "$ALARM" = 1 ] && [ -n "${PIGEON_SLACK_ALARM_WEBHOOK_URL:-}" ]; then
       .then(r => { if (!r.ok) console.error("alarm post: HTTP " + r.status) },
             e => console.error("alarm post failed: " + e.message))' "$msg" >&2 || true
 fi
-exit 1
+exit 3
