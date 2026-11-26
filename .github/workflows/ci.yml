@@ -67,6 +67,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # The daemon's start scripts on every machine run this before exec'ing
+      # the daemon; stub node/npm, so it takes well under a second.
+      - name: ensure-native-modules.sh tests
+        run: bash scripts/ensure-native-modules.test.sh
+
       # Plant a decoy at the hardcoded production secret path that
       # opencode-plugin/src/auth-token.ts falls back to.
       #
