@@ -79,7 +79,7 @@
         "command": "/quote",
         "url": "{{BASE_URL}}/slack/{{MACHINE}}/commands",
         "description": "Quote the session's replies so you can answer them",
-        "usage_hint": "[N|prev|full]",
+        "usage_hint": "[N|prev|full] [notes]",
         "should_escape": false
       }
     ]

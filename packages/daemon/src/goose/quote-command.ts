@@ -15,8 +15,10 @@ import {
 } from "./quote-types";
 import {
   capPassages,
+  defuseBroadcasts,
   emptyText,
   flattenPassages,
+  formatUnmatchedNotesPlain,
   pickLabel,
   quoteBodyMarkdown,
   quoteBodyText,
@@ -56,6 +58,11 @@ async function sendReply(
   }
 }
 
+function withPreservedNotes(text: string, notes: string | undefined): string {
+  if (!notes) return text;
+  return `${text}\n\nYour notes (copy before retrying):\n${defuseBroadcasts(notes)}`;
+}
+
 export function createQuoteHandler(
   deps: QuoteHandlerDeps,
 ): (msg: QuoteMessage) => Promise<void> {
@@ -64,19 +71,32 @@ export function createQuoteHandler(
   const log = deps.log ?? ((m: string, ...args: unknown[]) => console.log(`[quote-command] ${m}`, ...args));
 
   async function run(msg: QuoteMessage): Promise<void> {
+    const notes =
+      typeof msg.metadata!.notes === "string" && msg.metadata!.notes.trim() !== ""
+        ? msg.metadata!.notes.trim()
+        : undefined;
+
     const session = deps.getSession(msg.sessionId);
     if (!session) {
-      await sendReply("Session not found", msg, deps);
+      await sendReply(withPreservedNotes("Session not found", notes), msg, deps);
       return;
     }
 
     if (session.backendKind !== GOOSE_BACKEND_KIND) {
-      await sendReply("/quote works only for goose sessions for now.", msg, deps);
+      await sendReply(
+        withPreservedNotes("/quote works only for goose sessions for now.", notes),
+        msg,
+        deps,
+      );
       return;
     }
 
     if (!session.backendEndpoint) {
-      await sendReply(`Session ${msg.sessionId} has no backendEndpoint.`, msg, deps);
+      await sendReply(
+        withPreservedNotes(`Session ${msg.sessionId} has no backendEndpoint.`, notes),
+        msg,
+        deps,
+      );
       return;
     }
 
@@ -93,7 +113,7 @@ export function createQuoteHandler(
       await withDeadline(client.connect(), NON_TURN_TIMEOUT_MS, "connect");
       if (!client.isHonk) {
         await sendReply(
-          "this session is on bare goose, not honkd; /quote needs honkd",
+          withPreservedNotes("this session is on bare goose, not honkd; /quote needs honkd", notes),
           msg,
           deps,
         );
@@ -105,6 +125,7 @@ export function createQuoteHandler(
           sessionId: backendSessionIdOf(session),
           pick: msg.metadata!.pick,
           full: msg.metadata!.full,
+          ...(notes ? { notes } : {}),
           ...(tag ? { tag } : {}),
           quoteId: msg.commandId,
         },
@@ -113,13 +134,16 @@ export function createQuoteHandler(
     } catch (err) {
       if (err instanceof QuoteUnsupportedError) {
         await sendReply(
-          `honkd on ${deps.machineId} does not support /quote yet (needs honk-9qf.31.7).`,
+          withPreservedNotes(
+            `honkd on ${deps.machineId} does not support /quote yet (needs honk-9qf.31.7).`,
+            notes,
+          ),
           msg,
           deps,
         );
       } else {
         const errMsg = err instanceof Error ? err.message : String(err);
-        await sendReply(`/quote failed: ${errMsg}`, msg, deps);
+        await sendReply(withPreservedNotes(`/quote failed: ${errMsg}`, notes), msg, deps);
       }
       return;
     } finally {
@@ -132,14 +156,95 @@ export function createQuoteHandler(
 
     const pLabel = pickLabel(msg.metadata!.pick, msg.metadata!.full);
 
-    if (result.empty) {
-      await sendReply(emptyText(result, pLabel), msg, deps);
-      return;
+    // Deploy-skew guard: honkd with honk-9qf.31.8 guarantees that whenever non-empty notes are
+    // sent, either at least one passage has a non-empty prefill or unmatchedNotes is non-empty.
+    // If neither came back, an older honkd ignored `notes`; preserve them so nothing is lost.
+    const hasAnyPrefill = result.replies.some(
+      (r) =>
+        Array.isArray(r.prefills) &&
+        r.prefills.some((p) => typeof p === "string" && p.trim() !== ""),
+    );
+    const rawUnmatched = (result.unmatchedNotes ?? []).filter((n) => n.trim() !== "");
+    let effectiveResult = result;
+    let effectiveUnmatched = rawUnmatched;
+    if (notes && !hasAnyPrefill && rawUnmatched.length === 0) {
+      effectiveResult = {
+        ...result,
+        warnings: [
+          ...result.warnings,
+          `honkd on ${deps.machineId} did not match your notes (may need update); carried them into the Answer form.`,
+        ],
+        unmatchedNotes: [notes],
+      };
+      effectiveUnmatched = [notes];
     }
 
-    const flattened = flattenPassages(result);
-    if (flattened.length === 0) {
-      await sendReply(emptyText(result, pLabel), msg, deps);
+    const flattened = flattenPassages(effectiveResult);
+    const nowTime = nowFn();
+
+    if (effectiveResult.empty || flattened.length === 0) {
+      if (effectiveUnmatched.length === 0) {
+        await sendReply(emptyText(effectiveResult, pLabel), msg, deps);
+        return;
+      }
+
+      const emptyBodyText = `${emptyText(effectiveResult, pLabel)}\n\n${formatUnmatchedNotesPlain(effectiveUnmatched)}`;
+      const emptyChunks = splitChatMessage(
+        { text: "", entities: [] },
+        { text: emptyBodyText, entities: [] },
+        { text: "", entities: [] },
+      );
+      const bodyNotificationId = `qt:${session.sessionId}:${msg.commandId}`;
+      deps.upsertOutbox(
+        {
+          notificationId: bodyNotificationId,
+          sessionId: session.sessionId,
+          requestId: `quote-body-${session.sessionId}-${msg.commandId}`,
+          kind: "quote",
+          payload: JSON.stringify({
+            messages: emptyChunks.map((c) => ({ text: c.text, entities: c.entities })),
+            title: session.title ?? undefined,
+            dir: session.cwd ?? undefined,
+            threaded: true,
+          }),
+          token: "",
+          excerpt: excerptOf(emptyBodyText),
+        },
+        nowTime,
+      );
+
+      const storedQuote: StoredQuote = {
+        v: 1,
+        sessionId: session.sessionId,
+        passages: [],
+        total: 0,
+        unmatchedNotes: effectiveUnmatched,
+        ...(notes ? { notesRaw: notes } : {}),
+      };
+      const answerText = `✍️ Send ${effectiveUnmatched.length} unmatched note(s) from this /quote`;
+      const answerNotificationId = `qa:${session.sessionId}:${msg.commandId}`;
+      deps.upsertOutbox(
+        {
+          notificationId: answerNotificationId,
+          sessionId: session.sessionId,
+          requestId: `quote-answer-${session.sessionId}-${msg.commandId}`,
+          kind: "quote",
+          payload: JSON.stringify({
+            messages: [{ text: answerText }],
+            title: session.title ?? undefined,
+            dir: session.cwd ?? undefined,
+            threaded: true,
+            replyMarkup: {
+              inline_keyboard: [[{ text: "Answer", callback_data: `quote:${msg.commandId}` }]],
+            },
+            quote: storedQuote,
+          }),
+          token: "",
+          afterNotificationId: bodyNotificationId,
+          excerpt: excerptOf(answerText),
+        },
+        nowTime,
+      );
       return;
     }
 
@@ -150,13 +255,13 @@ export function createQuoteHandler(
       sessionId: session.sessionId,
     });
 
-    const bodyText = quoteBodyText(result, pLabel, label);
+    const bodyText = quoteBodyText(effectiveResult, pLabel, label);
     const chunks = splitChatMessage(
       { text: "", entities: [] },
       { text: bodyText, entities: [] },
       { text: "", entities: [] },
     );
-    const richMarkdown = quoteBodyMarkdown(result, pLabel, label);
+    const richMarkdown = quoteBodyMarkdown(effectiveResult, pLabel, label);
 
     const bodyNotificationId = `qt:${session.sessionId}:${msg.commandId}`;
     const bodyPayload = {
@@ -168,8 +273,6 @@ export function createQuoteHandler(
         ? { rich: { markdown: richMarkdown, dialect: "slack" as const } }
         : {}),
     };
-
-    const nowTime = nowFn();
 
     deps.upsertOutbox(
       {
@@ -184,18 +287,34 @@ export function createQuoteHandler(
       nowTime,
     );
 
-    const { passages: cappedPassages, total } = capPassages(flattened);
+    const { passages: cappedPassages, total, droppedPrefills } = capPassages(flattened);
+    const allUnmatched = [...effectiveUnmatched, ...droppedPrefills];
     const storedQuote: StoredQuote = {
       v: 1,
       sessionId: session.sessionId,
       passages: cappedPassages,
       total,
+      ...(allUnmatched.length > 0 ? { unmatchedNotes: allUnmatched } : {}),
+      ...(notes ? { notesRaw: notes } : {}),
     };
 
     const k = cappedPassages.length;
+    const prefilledCount = cappedPassages.filter(
+      (p) => typeof p.prefill === "string" && p.prefill.trim() !== "",
+    ).length;
     let answerText = `✍️ Answer ${k} passage(s) from this /quote`;
     if (total > cappedPassages.length) {
       answerText += ` — the first ${cappedPassages.length} of ${total}`;
+    }
+    const detailParts: string[] = [];
+    if (prefilledCount > 0) detailParts.push(`${prefilledCount} prefilled`);
+    if (allUnmatched.length > 0) {
+      detailParts.push(
+        `${allUnmatched.length} unmatched note${allUnmatched.length === 1 ? "" : "s"}`,
+      );
+    }
+    if (detailParts.length > 0) {
+      answerText += ` (${detailParts.join(", ")})`;
     }
 
     const answerNotificationId = `qa:${session.sessionId}:${msg.commandId}`;

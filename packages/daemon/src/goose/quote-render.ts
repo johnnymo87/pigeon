@@ -84,10 +84,14 @@ export function flattenPassages(result: QuoteResult): StoredQuotePassage[] {
     const header = reply.header;
     for (let i = 0; i < reply.passages.length; i++) {
       const p = reply.passages[i]!;
+      const rawPrefill = reply.prefills?.[i];
+      const prefill =
+        typeof rawPrefill === "string" && rawPrefill.trim() !== "" ? rawPrefill : undefined;
       passages.push({
         header,
         lines: p.flatMap((l) => l.split("\n")),
         first: i === 0,
+        ...(prefill !== undefined ? { prefill } : {}),
       });
     }
   }
@@ -98,27 +102,43 @@ export function flattenPassages(result: QuoteResult): StoredQuotePassage[] {
  * Caps passages at QUOTE_MAX_PASSAGES (45) and QUOTE_MAX_TOTAL_CHARS (100,000) total line chars,
  * and caps each single passage at QUOTE_MAX_SINGLE_PASSAGE_CHARS (6,000) chars.
  * `total` records the uncapped count before capping.
+ * `droppedPrefills` collects non-empty prefills from any passages dropped by the cap so no note is lost.
  */
 export function capPassages(
   passages: StoredQuotePassage[],
   maxPassages = QUOTE_MAX_PASSAGES,
   maxTotalChars = QUOTE_MAX_TOTAL_CHARS,
   maxSinglePassageChars = QUOTE_MAX_SINGLE_PASSAGE_CHARS,
-): { passages: StoredQuotePassage[]; total: number } {
+): { passages: StoredQuotePassage[]; total: number; droppedPrefills: string[] } {
   const total = passages.length;
   const capped: StoredQuotePassage[] = [];
+  const droppedPrefills: string[] = [];
   let totalChars = 0;
+  let stopped = false;
 
   for (const rawPassage of passages) {
-    if (capped.length >= maxPassages) break;
+    if (stopped || capped.length >= maxPassages) {
+      stopped = true;
+      if (rawPassage.prefill && rawPassage.prefill.trim() !== "") {
+        droppedPrefills.push(rawPassage.prefill);
+      }
+      continue;
+    }
     const passage = capSinglePassage(rawPassage, maxSinglePassageChars);
-    const passageChars = passage.lines.reduce((sum, l) => sum + l.length, 0);
-    if (totalChars + passageChars > maxTotalChars && capped.length > 0) break;
+    const passageChars =
+      passage.lines.reduce((sum, l) => sum + l.length, 0) + (passage.prefill?.length ?? 0);
+    if (totalChars + passageChars > maxTotalChars && capped.length > 0) {
+      stopped = true;
+      if (rawPassage.prefill && rawPassage.prefill.trim() !== "") {
+        droppedPrefills.push(rawPassage.prefill);
+      }
+      continue;
+    }
     capped.push(passage);
     totalChars += passageChars;
   }
 
-  return { passages: capped, total };
+  return { passages: capped, total, droppedPrefills };
 }
 
 function formatPassageLines(passage: StoredQuotePassage, i: number): string[] {
@@ -131,6 +151,13 @@ function formatPassageLines(passage: StoredQuotePassage, i: number): string[] {
   for (const line of passage.lines) {
     const defused = defuseBroadcasts(line);
     lines.push(defused === "" ? ">" : `> ${defused}`);
+  }
+  if (passage.prefill && passage.prefill.trim() !== "") {
+    const prefillLines = passage.prefill.split("\n");
+    lines.push(`📝 draft: ${defuseBroadcasts(prefillLines[0]!)}`);
+    for (let j = 1; j < prefillLines.length; j++) {
+      lines.push(`   ${defuseBroadcasts(prefillLines[j]!)}`);
+    }
   }
   return lines;
 }
@@ -235,6 +262,34 @@ function stripHeader(header: string): string {
   return header.replace(/^#\s*/, "");
 }
 
+export function formatUnmatchedNotesPlain(notes: string[]): string {
+  const clean = notes.filter((n) => n.trim() !== "");
+  if (clean.length === 0) return "";
+  const lines = ["Unmatched notes (carried into Answer modal):"];
+  for (const note of clean) {
+    const noteLines = note.split("\n");
+    lines.push(`- ${defuseBroadcasts(noteLines[0]!)}`);
+    for (let j = 1; j < noteLines.length; j++) {
+      lines.push(`  ${defuseBroadcasts(noteLines[j]!)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function formatUnmatchedNotesMarkdown(notes: string[]): string {
+  const clean = notes.filter((n) => n.trim() !== "");
+  if (clean.length === 0) return "";
+  const lines = ["**Unmatched notes (carried into Answer modal):**"];
+  for (const note of clean) {
+    const noteLines = note.split("\n");
+    lines.push(`- ${escapePlainSlack(defuseBroadcasts(noteLines[0]!))}`);
+    for (let j = 1; j < noteLines.length; j++) {
+      lines.push(`  ${escapePlainSlack(defuseBroadcasts(noteLines[j]!))}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 /**
  * Renders plain text for the body post:
  * 📋 /quote <pickLabel> · <label>
@@ -265,16 +320,23 @@ export function quoteBodyText(
     headerLines.push(n.startsWith("ℹ️") ? n : `ℹ️ ${n}`);
   }
 
-  const { passages } = capPassages(flattenPassages(result));
+  const { passages, droppedPrefills } = capPassages(flattenPassages(result));
+  const allUnmatched = [...(result.unmatchedNotes ?? []), ...droppedPrefills].filter(
+    (n) => n.trim() !== "",
+  );
+  const unmatchedPlain = formatUnmatchedNotesPlain(allUnmatched);
+
   if (passages.length === 0) {
-    return headerLines.join("\n");
+    const base = headerLines.join("\n");
+    return unmatchedPlain ? `${base}\n\n${unmatchedPlain}` : base;
   }
 
   const headerText = headerLines.join("\n");
+  const unmatchedReserve = unmatchedPlain ? unmatchedPlain.length + 2 : 0;
   const { visiblePassages, omittedCount } = selectBodyPassages(
     passages,
     headerText,
-    maxBodyChars,
+    Math.max(1, maxBodyChars - unmatchedReserve),
   );
 
   const passageLines: string[] = [];
@@ -285,7 +347,8 @@ export function quoteBodyText(
     passageLines.push(`… ${omittedCount} more passage(s): open them with Answer.`);
   }
 
-  return `${headerText}\n\n${passageLines.join("\n")}`;
+  const body = `${headerText}\n\n${passageLines.join("\n")}`;
+  return unmatchedPlain ? `${body}\n\n${unmatchedPlain}` : body;
 }
 
 /**
@@ -320,11 +383,17 @@ export function quoteBodyMarkdown(
     headerLines.push(`ℹ️ ${escapePlainSlack(n.replace(/^ℹ️\s*/, ""))}`);
   }
 
-  const { passages } = capPassages(flattenPassages(result));
+  const { passages, droppedPrefills } = capPassages(flattenPassages(result));
+  const allUnmatched = [...(result.unmatchedNotes ?? []), ...droppedPrefills].filter(
+    (n) => n.trim() !== "",
+  );
+  const unmatchedPlain = formatUnmatchedNotesPlain(allUnmatched);
+  const unmatchedMd = formatUnmatchedNotesMarkdown(allUnmatched);
   let rawMarkdown: string;
 
   if (passages.length === 0) {
-    rawMarkdown = headerLines.join("\n");
+    const base = headerLines.join("\n");
+    rawMarkdown = unmatchedMd ? `${base}\n\n${unmatchedMd}` : base;
   } else {
     const plainHeaderLines: string[] = [
       `📋 /quote ${pickLabel} · ${label}`,
@@ -337,10 +406,11 @@ export function quoteBodyMarkdown(
       plainHeaderLines.push(n.startsWith("ℹ️") ? n : `ℹ️ ${n}`);
     }
     const plainHeaderText = plainHeaderLines.join("\n");
+    const unmatchedReserve = unmatchedPlain ? unmatchedPlain.length + 2 : 0;
     const { visiblePassages, omittedCount } = selectBodyPassages(
       passages,
       plainHeaderText,
-      maxBodyChars,
+      Math.max(1, maxBodyChars - unmatchedReserve),
     );
 
     const passageLines: string[] = [];
@@ -354,11 +424,19 @@ export function quoteBodyMarkdown(
       for (const line of passage.lines) {
         passageLines.push(line === "" ? ">" : `> ${escapeQuoteLine(line)}`);
       }
+      if (passage.prefill && passage.prefill.trim() !== "") {
+        const prefillLines = passage.prefill.split("\n");
+        passageLines.push(`📝 draft: ${escapePlainSlack(defuseBroadcasts(prefillLines[0]!))}`);
+        for (let j = 1; j < prefillLines.length; j++) {
+          passageLines.push(`   ${escapePlainSlack(defuseBroadcasts(prefillLines[j]!))}`);
+        }
+      }
     }
     if (omittedCount > 0) {
       passageLines.push(`… ${omittedCount} more passage(s): open them with Answer.`);
     }
-    rawMarkdown = `${headerLines.join("\n")}\n\n${passageLines.join("\n")}`;
+    const body = `${headerLines.join("\n")}\n\n${passageLines.join("\n")}`;
+    rawMarkdown = unmatchedMd ? `${body}\n\n${unmatchedMd}` : body;
   }
 
   const sanitized = sanitizeBodyMarkdown(rawMarkdown);

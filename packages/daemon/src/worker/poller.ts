@@ -387,6 +387,7 @@ export interface QuoteMessage {
   metadata?: {
     pick: QuotePick;
     full: boolean;
+    notes?: string;
   };
 }
 

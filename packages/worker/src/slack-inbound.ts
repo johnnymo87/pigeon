@@ -599,8 +599,21 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
   // Taken as typed: with `should_escape: false` (the manifest) Slack sends command text raw, with
   // no `&lt;` escaping and no `<url|label>` markup, so message decoding would eat `<b ... >` as a
   // link (live check pigeon-4ogz.8). Slack's client may still turn straight quotes into curly ones.
-  const args = (form.get("text") ?? "").trim();
-  const parsed = parseChatCommand(args ? `${cmdName} ${args}` : cmdName);
+  const rawText = form.get("text") ?? "";
+  const args = rawText.trim();
+  // For /quote, preserve a leading newline (e.g. "/quote\n2 bugs left") so the first-line parser
+  // treats everything after the newline as notes instead of parsing "2" as last-2.
+  const commandInput =
+    cmdName === "/quote"
+      ? rawText.trim().length > 0
+        ? /^[ \t]*[\r\n]/.test(rawText)
+          ? `${cmdName}${rawText}`
+          : `${cmdName} ${rawText.replace(/^[ \t]+/, "")}`
+        : cmdName
+      : args
+        ? `${cmdName} ${args}`
+        : cmdName;
+  const parsed = parseChatCommand(commandInput);
   if (!parsed || !channelId) return commandReply(`Unknown command ${name}.`, false);
 
   const chat = slackChatId(ws);
@@ -751,7 +764,19 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
         }
       }
     }
-    if (typeof resolved === "string") return commandReply(resolved, false);
+    const withNotes = (msg: string): string => {
+      if (!parsed.notes) return msg;
+      const defused = parsed.notes
+        .replace(/<!(?=\s*(?:channel|here|everyone|subteam))/gi, "<\u200d!")
+        .replace(/(?<![A-Za-z0-9_.])@(?=(?:channel|here|everyone)(?![A-Za-z0-9_]))/gi, "@\u200d");
+      return `${msg}\n\nYour notes (copy before retrying):\n${defused}`;
+    };
+
+    if (typeof resolved === "string") return commandReply(withNotes(resolved), false);
+
+    if (parsed.notes && parsed.notes.length > 16_000) {
+      return commandReply(withNotes("Notes are too long (limit 16,000 characters)."), false);
+    }
 
     const ok = await queue({
       machineId: resolved.machineId,
@@ -759,13 +784,23 @@ async function handleCommand(db: D1Database, env: Env, ws: SlackWorkspace, raw: 
       command: args ? `${name} ${args}` : name,
       commandType: "quote",
       label: resolved.label,
-      metadataJson: JSON.stringify({ pick: parsed.pick, full: parsed.full }),
+      metadataJson: JSON.stringify({
+        pick: parsed.pick,
+        full: parsed.full,
+        ...(parsed.notes ? { notes: parsed.notes } : {}),
+      }),
     });
-    if (!ok) return queueFull(resolved.label || resolved.machineId);
+    if (!ok) {
+      return commandReply(
+        withNotes(`Queue full for ${resolved.label || resolved.machineId}.`),
+        false,
+      );
+    }
 
     const destination = isOwnChannel ? "here" : "in the session's channel";
+    const notesSuffix = parsed.notes ? " (with notes)" : "";
     return commandReply(
-      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted ${destination}.`,
+      `⏳ Quoting ${quotePickLabel(parsed.pick, parsed.full)}${notesSuffix} for ${resolved.label || resolved.sessionId}. The trim can take a minute or two; the quote will be posted ${destination}.`,
       false,
     );
   }
@@ -963,12 +998,13 @@ async function handleViewSubmission(
   } catch {
     // malformed
   }
+  const expiredErrorBlock = Object.keys(payload.view?.state?.values ?? {})[0] ?? "a1";
   const quoteId = privateMeta.quoteId;
   const channelId = privateMeta.channelId;
   if (!quoteId || !channelId) {
     return Response.json({
       response_action: "errors",
-      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+      errors: { [expiredErrorBlock]: "This quote has expired. Copy your answers and run /quote again." },
     });
   }
 
@@ -976,11 +1012,11 @@ async function handleViewSubmission(
   if (!stored) {
     return Response.json({
       response_action: "errors",
-      errors: { a1: "This quote has expired. Copy your answers and run /quote again." },
+      errors: { [expiredErrorBlock]: "This quote has expired. Copy your answers and run /quote again." },
     });
   }
 
-  // 3. Answers from payload.view.state.values["a<i>"].answer.value
+  // 3. Answers from payload.view.state.values["a<i>"].answer.value and optional "general"
   const values = payload.view?.state?.values ?? {};
   const answers = new Map<number, string>();
   let firstAnsweredBlock: string | null = null;
@@ -995,23 +1031,53 @@ async function handleViewSubmission(
     }
   }
 
-  // 4. composeAnswer null → errors on a1
-  const text = composeAnswer(stored, answers);
+  // Read general / general2..generalK boxes in numeric order so multi-box notes stay intact.
+  const generalKeys = Object.keys(values)
+    .filter((k) => /^general(\d*)$/.test(k))
+    .sort((a, b) => {
+      const na = a === "general" ? 1 : Number(a.slice("general".length));
+      const nb = b === "general" ? 1 : Number(b.slice("general".length));
+      return na - nb;
+    });
+  const generalParts: string[] = [];
+  for (const key of generalKeys) {
+    const val = values[key]?.answer?.value;
+    if (typeof val === "string" && val.trim() !== "") {
+      generalParts.push(val.trimEnd());
+      if (!firstAnsweredBlock) {
+        firstAnsweredBlock = key;
+      }
+    }
+  }
+  const generalAnswer = generalParts.length > 0 ? generalParts.join("\n\n") : undefined;
+
+  const fallbackErrorBlock = stored.passages.length > 0 ? "a1" : "general";
+
+  // 4. composeAnswer null → errors on first available input block
+  const text = composeAnswer(stored, answers, generalAnswer);
   if (!text) {
     return Response.json({
       response_action: "errors",
-      errors: { a1: "Type an answer under at least one passage." },
+      errors: {
+        [fallbackErrorBlock]:
+          stored.passages.length > 0
+            ? "Type an answer under at least one passage."
+            : "Type a note to send.",
+      },
     });
   }
 
   // 5. Length > MAX_COMMAND_LENGTH → errors on the first answered block
-  const errorBlock = firstAnsweredBlock ?? "a1";
+  const errorBlock = firstAnsweredBlock ?? fallbackErrorBlock;
   if (text.length > MAX_COMMAND_LENGTH) {
     let answersChars = 0;
     for (const rawAnswer of answers.values()) {
       if (rawAnswer && rawAnswer.trim() !== "") {
         answersChars += rawAnswer.trimEnd().length;
       }
+    }
+    if (generalAnswer && generalAnswer.trim() !== "") {
+      answersChars += generalAnswer.trimEnd().length;
     }
     const message =
       answersChars > 30000
