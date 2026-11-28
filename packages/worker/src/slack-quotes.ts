@@ -2,6 +2,7 @@ export interface StoredQuotePassage {
   header: string;
   lines: string[];
   first: boolean;
+  prefill?: string;
 }
 
 export interface StoredQuote {
@@ -9,6 +10,8 @@ export interface StoredQuote {
   sessionId: string;
   passages: StoredQuotePassage[];
   total: number;
+  unmatchedNotes?: string[];
+  notesRaw?: string;
 }
 
 export const SLACK_QUOTE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -22,7 +25,19 @@ export function isValidStoredQuote(raw: unknown): raw is StoredQuote {
   if (q.v !== 1) return false;
   if (typeof q.sessionId !== "string" || q.sessionId.length === 0) return false;
   if (typeof q.total !== "number" || !Number.isInteger(q.total) || q.total < 0) return false;
-  if (!Array.isArray(q.passages) || q.passages.length === 0) return false;
+  if (!Array.isArray(q.passages)) return false;
+
+  if (q.unmatchedNotes !== undefined) {
+    if (!Array.isArray(q.unmatchedNotes) || !q.unmatchedNotes.every((n) => typeof n === "string")) {
+      return false;
+    }
+  }
+  if (q.notesRaw !== undefined && typeof q.notesRaw !== "string") {
+    return false;
+  }
+
+  const hasUnmatched = Array.isArray(q.unmatchedNotes) && q.unmatchedNotes.length > 0;
+  if (q.passages.length === 0 && !hasUnmatched) return false;
 
   for (const p of q.passages) {
     if (typeof p !== "object" || p === null) return false;
@@ -30,6 +45,9 @@ export function isValidStoredQuote(raw: unknown): raw is StoredQuote {
     if (typeof passage.header !== "string") return false;
     if (typeof passage.first !== "boolean") return false;
     if (!Array.isArray(passage.lines) || !passage.lines.every((line) => typeof line === "string")) {
+      return false;
+    }
+    if (passage.prefill !== undefined && typeof passage.prefill !== "string") {
       return false;
     }
   }

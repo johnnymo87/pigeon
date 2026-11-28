@@ -1379,6 +1379,119 @@ describe("interactivity: view_submission", () => {
     );
   });
 
+  it("queues /quote with notes in metadataJson and notes it in the ephemeral ack", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendCommand(box, "/quote", "3\n- approve PR 264\n- hold deploy", ch.channelId);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { text: string; response_type?: string };
+    expect(body.text).toContain("last 3 (with notes)");
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command_type).toBe("quote");
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({
+      pick: { kind: "last", n: 3 },
+      full: false,
+      notes: "- approve PR 264\n- hold deploy",
+    });
+  });
+
+  it("preserves leading newline in Slack /quote so '/quote\\n2 bugs left' is notes, not last-2", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendCommand(box, "/quote", "\n2 bugs left, fix first", ch.channelId);
+    expect(res.status).toBe(200);
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(JSON.parse(rows[0]!.metadata_json!)).toEqual({
+      pick: { kind: "since" },
+      full: false,
+      notes: "2 bugs left, fix first",
+    });
+  });
+
+  it("refuses /quote notes over 16,000 characters ephemerally and preserves notes", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const res = await sendCommand(box, "/quote", "a".repeat(16_001), ch.channelId);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { text: string };
+    expect(body.text).toContain("too long");
+    expect(body.text).toContain("Your notes (copy before retrying):");
+    expect(await commandsFor(box.machineId)).toHaveLength(0);
+  });
+
+  it("view_submission joins multi-box general + general2 answers in order", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [{ header: "# H", lines: ["q"], first: true }],
+      total: 1,
+      unmatchedNotes: ["part 1", "part 2"],
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000104" });
+    const res = await sendSubmission(box, {
+      id: `V_GEN_MULTI_${stamp()}`,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: {
+        values: {
+          a1: { answer: { value: "ans 1" } },
+          general2: { answer: { value: "part 2" } },
+          general: { answer: { value: "part 1" } },
+        },
+      },
+    });
+    expect(await res.json()).toEqual({ response_action: "clear" });
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("# H\n> q\nans 1\n\n# Other notes\npart 1\n\npart 2");
+  });
+
+  it("view_submission includes general (unmatched) notes and validates empty general-only modal on 'general'", async () => {
+    const box = await mkBox();
+    const ch = await seedSessionChannel(box);
+    const quoteId = `qid_${stamp()}`;
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: ch.sessionId,
+      passages: [],
+      total: 0,
+      unmatchedNotes: ["stand-alone note"],
+    };
+    await putQuote(env.DB, quoteId, stored);
+
+    // Blank submission on a general-only modal reports error on "general", not "a1"
+    const blankRes = await sendSubmission(box, {
+      id: `V_GEN_BLANK_${stamp()}`,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: { values: { general: { answer: { value: "   " } } } },
+    });
+    expect(await blankRes.json()).toEqual({
+      response_action: "errors",
+      errors: { general: "Type a note to send." },
+    });
+
+    // Non-blank submission queues the note
+    slack("chat.postMessage", { ok: true, ts: "1700000000.000103" });
+    const okRes = await sendSubmission(box, {
+      id: `V_GEN_OK_${stamp()}`,
+      callback_id: "quote_answer",
+      private_metadata: JSON.stringify({ quoteId, channelId: ch.channelId }),
+      state: { values: { general: { answer: { value: "stand-alone note" } } } },
+    });
+    expect(await okRes.json()).toEqual({ response_action: "clear" });
+    const rows = await commandsFor(box.machineId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.command).toBe("stand-alone note");
+  });
+
   it("returns error on session ended when no session is found", async () => {
     const box = await mkBox();
     const ch = await seedSessionChannel(box);

@@ -3855,3 +3855,53 @@ describe("bead eng-agent-platform-555.26: session/load at most once per session 
     await p3;
   });
 });
+
+describe("_honk/quote notes forwarding", () => {
+  it("forwards non-empty notes and parses prefills + unmatchedNotes, omitting blank notes", async () => {
+    const peer = new FakePeer();
+    peer.onRequest = (msg) => {
+      if (msg.method === "initialize") {
+        peer.reply(msg.id, { protocolVersion: 1, _meta: { honk: { protocol: 1 } } });
+      } else if (msg.method === "_honk/quote") {
+        peer.reply(msg.id, {
+          summary: "# trimmed",
+          replies: [
+            {
+              header: "# H1",
+              passages: [["p1"]],
+              prefills: ["draft 1"],
+              inProgress: false,
+            },
+          ],
+          notices: [],
+          warnings: [],
+          empty: null,
+          model: "claude-opus-5-5",
+          unmatchedNotes: ["extra"],
+        });
+      }
+    };
+    const client = new GooseAcpClient({ url: "ws://fake/acp", transportFactory: () => peer, log: () => {} });
+    await client.connect();
+
+    const res = await client.quote({
+      sessionId: "sess-1",
+      pick: { kind: "since" },
+      full: false,
+      notes: "draft 1\nextra",
+    });
+    expect((peer.lastOf("_honk/quote")!.params as Record<string, unknown>).notes).toBe(
+      "draft 1\nextra",
+    );
+    expect(res.replies[0]!.prefills).toEqual(["draft 1"]);
+    expect(res.unmatchedNotes).toEqual(["extra"]);
+
+    await client.quote({
+      sessionId: "sess-1",
+      pick: { kind: "since" },
+      full: false,
+      notes: "   ",
+    });
+    expect((peer.lastOf("_honk/quote")!.params as Record<string, unknown>).notes).toBeUndefined();
+  });
+});

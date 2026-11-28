@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { buildAnswerModal, composeAnswer, splitCopyPost } from "../src/slack-quote-modal";
+import {
+  buildAnswerModal,
+  clampInitialValue,
+  composeAnswer,
+  SLACK_INPUT_INITIAL_VALUE_MAX,
+  splitCopyPost,
+} from "../src/slack-quote-modal";
 import type { StoredQuote } from "../src/slack-quotes";
 
 describe("buildAnswerModal", () => {
@@ -475,5 +481,126 @@ describe("splitCopyPost", () => {
     expect(chunks[1]).toBe("B".repeat(2000));
     expect(chunks[0]!.length).toBeLessThanOrEqual(3500);
     expect(chunks[1]!.length).toBeLessThanOrEqual(3500);
+  });
+});
+
+describe("notes-guided modal prefill and unmatched notes", () => {
+  it("sets initial_value on prefilled passages and omits it on unprefilled ones", () => {
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "gse_1",
+      passages: [
+        { header: "# H1", lines: ["q1"], first: true, prefill: "approve PR 264" },
+        { header: "# H1", lines: ["q2"], first: false },
+      ],
+      total: 2,
+    };
+    const view = buildAnswerModal("q1", "C1", stored);
+    const a1 = view.blocks.find((b) => b.type === "input" && b.block_id === "a1");
+    const a2 = view.blocks.find((b) => b.type === "input" && b.block_id === "a2");
+    expect(a1 && a1.type === "input" && a1.element.initial_value).toBe("approve PR 264");
+    expect(a2 && a2.type === "input" && a2.element.initial_value).toBeUndefined();
+    expect(view.blocks.find((b) => b.type === "input" && b.block_id === "general")).toBeUndefined();
+  });
+
+  it("clamps initial_value at Slack's 3000-char limit without splitting surrogate pairs", () => {
+    const longEmoji = "😀".repeat(2000); // 4000 UTF-16 code units
+    const clamped = clampInitialValue(longEmoji);
+    expect(clamped.length).toBeLessThanOrEqual(SLACK_INPUT_INITIAL_VALUE_MAX);
+    expect(clamped.endsWith("…")).toBe(true);
+    expect(clamped).toBe(clamped.toWellFormed());
+  });
+
+  it("adds a prefilled 'general' input block for unmatchedNotes and stays <= 100 blocks", () => {
+    const passages = Array.from({ length: 55 }, (_, i) => ({
+      header: `# H${i + 1}`,
+      lines: [`line ${i + 1}`],
+      first: true,
+      ...(i === 52 ? { prefill: "note on omitted passage 53" } : {}),
+    }));
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "gse_1",
+      passages,
+      total: 55,
+      unmatchedNotes: ["general thought 1", "general thought 2"],
+    };
+    const view = buildAnswerModal("q2", "C1", stored);
+    expect(view.blocks.length).toBeLessThanOrEqual(100);
+    const general = view.blocks.find((b) => b.type === "input" && b.block_id === "general");
+    expect(general).toBeDefined();
+    expect(general && general.type === "input" && general.element.initial_value).toBe(
+      "general thought 1\n\ngeneral thought 2\n\nnote on omitted passage 53",
+    );
+  });
+
+  it("shows notesRaw at the top and splits >3000-char notes across general + general2 without truncation", () => {
+    const noteA = "A".repeat(2500);
+    const noteB = "B".repeat(2500);
+    const longPrefill = "P".repeat(3500);
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "gse_1",
+      passages: [{ header: "# H1", lines: ["q1"], first: true, prefill: longPrefill }],
+      total: 1,
+      unmatchedNotes: [noteA, noteB],
+      notesRaw: "original note 1\noriginal note 2",
+    };
+    const view = buildAnswerModal("q_split", "C1", stored);
+    expect(view.blocks.length).toBeLessThanOrEqual(100);
+    // First block is read-only raw notes
+    expect(view.blocks[0]).toEqual({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "*Your notes as typed:*\n> original note 1\n> original note 2",
+      },
+    });
+    const a1 = view.blocks.find((b) => b.type === "input" && b.block_id === "a1");
+    expect(a1 && a1.type === "input" && a1.label.text).toContain("draft from notes");
+    expect(a1 && a1.type === "input" && a1.element.initial_value?.length).toBe(3000);
+
+    const g1 = view.blocks.find((b) => b.type === "input" && b.block_id === "general");
+    const g2 = view.blocks.find((b) => b.type === "input" && b.block_id === "general2");
+    const g3 = view.blocks.find((b) => b.type === "input" && b.block_id === "general3");
+    expect(g1 && g1.type === "input" && g1.element.initial_value).toBe(noteA);
+    expect(g2 && g2.type === "input" && g2.element.initial_value).toBe(noteB);
+    expect(g3 && g3.type === "input" && g3.element.initial_value).toBe("[cont. of #1] " + "P".repeat(500));
+  });
+
+  it("supports empty passages when unmatchedNotes is non-empty", () => {
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "gse_1",
+      passages: [],
+      total: 0,
+      unmatchedNotes: ["just send this note"],
+    };
+    const view = buildAnswerModal("q3", "C1", stored);
+    expect(view.blocks).toHaveLength(1);
+    const general = view.blocks[0]!;
+    expect(general.type).toBe("input");
+    if (general.type === "input") {
+      expect(general.block_id).toBe("general");
+      expect(general.element.initial_value).toBe("just send this note");
+    }
+  });
+
+  it("composeAnswer appends '# Other notes' when passages are also answered, or sends bare when alone", () => {
+    const stored: StoredQuote = {
+      v: 1,
+      sessionId: "gse_1",
+      passages: [{ header: "# H1", lines: ["q1"], first: true }],
+      total: 1,
+      unmatchedNotes: ["extra note"],
+    };
+    const withBoth = composeAnswer(stored, new Map([[1, "yes"]]), "extra note");
+    expect(withBoth).toBe("# H1\n> q1\nyes\n\n# Other notes\nextra note");
+
+    const generalOnly = composeAnswer(stored, new Map(), "extra note");
+    expect(generalOnly).toBe("extra note");
+
+    const neither = composeAnswer(stored, new Map(), "   ");
+    expect(neither).toBeNull();
   });
 });

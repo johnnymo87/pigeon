@@ -216,3 +216,98 @@ honk chat's `/quote`: reads the session's log without loading an idle session in
 "same replies reuse the last answer" cache lives in honkd; `tag` overrides `tagFrom` (fixes the
 `stall-watcher-runs` attribution for honk chat's `/quote` too, if honk chat passes its program).
 Timeout: honk's per-call 90 s budget, batches as today; pigeon waits up to 10 min.
+
+---
+
+## Addendum: Notes-guided `/quote` (pigeon-exmt, 2026-11-28)
+
+Jonathan (2026-11-28, pigeon program channel): pass free-text notes he took while reading to
+`/quote` so the trim model uses them as a **floor** (selecting every passage his notes respond to
+while still thinking critically to select anything else that needs him), matches each note to its
+passage, and pre-fills the Answer modal — without silently dropping notes that match no passage.
+
+### 1. Slack command syntax (`packages/worker/src/chat/commands.ts`)
+
+```
+/quote [<session-id>] [full|all] [prev|N] [--|—] [<notes>]
+```
+
+- **Direct free text on a phone:** `/quote approve PR 264, hold off on deploy` and
+  `/quote 3 approve PR 264` work without requiring a separator.
+- **Multi-line notes:** Newlines and internal whitespace in `<notes>` are preserved verbatim
+  (e.g. pasting a bullet list after `/quote\n` or `/quote 3\n`).
+- **Explicit `--` separator (and iOS em-dash `—`):** Matches honk chat's `/quote [N|prev] -- <notes>`
+  and escapes notes that happen to start with a number (`1..1000`), `prev`, `full`, or `all`.
+- **Guarding `full`/`all` against prose:** `full` and `all` are consumed as the `full: true` flag
+  only when followed by end-of-string, newline, `--`/`—`, `prev`, or `1..1000`. So
+  `/quote all good, ship it` parses as `pick: since, full: false, notes: "all good, ship it"`.
+- **Bare malformed flags still answer with usage:** `/quote 0`, `/quote -1`, `/quote 1001`,
+  `/quote ses_abc`, `/quote full 0`, and bare `/quote --`.
+- **Cap:** `notes` is capped at 16,000 characters in the worker (Slack's own slash-command box
+  caps around ~4,000 characters).
+- **Ephemeral ack:** appends `(with notes)` to the pick label when notes are present.
+- **Manifest:** `usage_hint` in `manifest.template.json` updated to `"[N|prev|full] [notes]"`
+  (cosmetic; no app manifest re-paste is needed for `/quote <notes>` to work).
+
+### 2. `_honk/quote` contract extension (agreed with honk-9qf.31.8)
+
+Additive and backward-compatible:
+
+- **Request:** optional `notes?: string` (omitted when absent or whitespace-only).
+- **Reply:**
+  - `replies[i].passages: string[][]` unchanged.
+  - `replies[i].prefills?: (string | null)[]` — optional, parallel to `passages` (same length
+    when present; `prefills[j]` is the draft answer for `passages[j]`, or `null` if none).
+    Omitted when no passage in that reply has a prefill.
+  - `unmatchedNotes?: string[]` — optional, notes that matched no kept passage, in original
+    order. Omitted when empty.
+- **Deploy-skew invariant:** honkd guarantees that whenever `notes` is non-empty, the reply has
+  either at least one non-null `prefill` or non-empty `unmatchedNotes`. If pigeon sent non-empty
+  `notes` and receives neither (e.g. an older honkd that ignored `notes`), the daemon adds a
+  warning and carries the raw `notes` in `unmatchedNotes` so nothing is ever silently dropped.
+
+### 3. Stored quote & channel posts (daemon + worker)
+
+`StoredQuote` keeps `v: 1` with three optional additive fields:
+- `StoredQuotePassage.prefill?: string` (omitted when null/absent).
+- `StoredQuote.unmatchedNotes?: string[]` (omitted when empty).
+- `StoredQuote.notesRaw?: string` (the exact notes as typed, omitted when absent).
+- `StoredQuote.passages` may be empty only when `unmatchedNotes` is non-empty (so an `empty`
+  result like `nothing_since` with notes still offers an Answer modal prefilled with those notes).
+- **No silent loss on capping or failures:** If `capPassages` drops passages past the 45-passage /
+  100k-char cap (or truncates a prefill past 3,000 chars), the dropped prefill/tail is appended to
+  `unmatchedNotes`. Every failure/refusal reply (worker or daemon) appends the user's raw notes
+  (with broadcasts defused) so notes typed on a phone are never lost on an error.
+- **Body post (`qt:`):** Shows `📝 draft: <prefill>` under each prefilled passage and an
+  `Unmatched notes (carried into Answer modal):` section at the bottom when `unmatchedNotes` is
+  non-empty (broadcasts defused; markdown-escaped in rich mode).
+- **Answer button post (`qa:`):** Reports counts when present, e.g.
+  `✍️ Answer 3 passage(s) from this /quote (2 prefilled, 1 unmatched note)`.
+
+### 4. Answer modal & submission (`packages/worker/src/slack-quote-modal.ts`)
+
+- **Original notes visible:** When `notesRaw` is present, a read-only `"*Your notes as typed:*"`
+  section is shown at the top of the modal so Jonathan can verify any drafted prefills against his
+  original wording before tapping Send.
+- **Per-passage prefill:** Sets `initial_value` on each passage's `plain_text_input` when
+  `passage.prefill` is non-empty, and labels it `Your answer to [i] (draft from notes)`.
+- **Slack 3,000-char `initial_value` limit:** If a passage prefill exceeds 3,000 characters, it is
+  split (surrogate-pair safe) and the tail is carried into the unmatched notes boxes so nothing is
+  silently truncated.
+- **Unmatched notes boxes (`block_id: "general"`, `"general2"`, …):** Added at the end of the
+  modal when `unmatchedNotes` is non-empty (or when any passage omitted by the 100-block modal cap
+  carried a prefill, or a prefill overflowed 3,000 chars). Multi-line notes are separated by a
+  blank line (`\n\n`) and split across as many ≤3,000-char boxes as needed so long notes are never
+  cut off. The exact number of header + notes boxes is reserved up front so total blocks stay
+  ≤100.
+- **Submission (`composeAnswer`):** Reads `a1..aN` and all `general*` boxes in order. Appends
+  `# Other notes\n<text>` at the end when passage answers are also present, or sends `<text>` alone
+  when only general boxes are filled. Validation error block uses `"a1"` when passages exist and
+  `"general"` otherwise so Slack never rejects an error targeting a nonexistent block.
+
+### 5. Deploy order
+
+`honk` (`honk-9qf.31.8`) → `daemons` (`cloudbox`, `devbox`, `macbook`) → `worker`. Deploying
+daemons before the worker is required: an older daemon ignores unknown `metadata.notes` and would
+silently drop notes after the new worker acknowledged `(with notes)`. A new daemon against an old
+worker is completely safe (an old worker never sends `notes`).

@@ -207,9 +207,78 @@ describe("isValidQuotePick and isValidQuoteMetadata", () => {
     expect(isValidQuoteMetadata({ pick: { kind: "since" }, full: false })).toBe(true);
     expect(isValidQuoteMetadata({ pick: { kind: "prev" }, full: true })).toBe(true);
     expect(isValidQuoteMetadata({ pick: { kind: "last", n: 5 }, full: false })).toBe(true);
+    expect(
+      isValidQuoteMetadata({ pick: { kind: "since" }, full: false, notes: "approve PR 264" }),
+    ).toBe(true);
+    expect(isValidQuoteMetadata({ pick: { kind: "since" }, full: false, notes: 123 })).toBe(false);
     expect(isValidQuoteMetadata({ pick: { kind: "since" } })).toBe(false);
     expect(isValidQuoteMetadata({ pick: "since", full: false })).toBe(false);
     expect(isValidQuoteMetadata(null)).toBe(false);
     expect(isValidQuoteMetadata({})).toBe(false);
+  });
+
+  it("parses replies[].prefills and unmatchedNotes in parseQuoteResult", () => {
+    const parsed = parseQuoteResult({
+      summary: "# trimmed",
+      replies: [
+        {
+          header: "# 11-28 08:00 · ask",
+          passages: [["line 1"], ["line 2"]],
+          prefills: ["yes, approve", null],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: "claude-opus-5-5",
+      unmatchedNotes: ["also check CI"],
+    });
+    expect(parsed.replies[0]!.prefills).toEqual(["yes, approve", null]);
+    expect(parsed.unmatchedNotes).toEqual(["also check CI"]);
+
+    // Empty unmatchedNotes is omitted
+    const emptyUnmatched = parseQuoteResult({
+      summary: null,
+      replies: [],
+      notices: [],
+      warnings: [],
+      empty: "nothing_since",
+      model: null,
+      unmatchedNotes: [],
+    });
+    expect(emptyUnmatched.unmatchedNotes).toBeUndefined();
+
+    // Mismatched prefills length throws
+    expect(() =>
+      parseQuoteResult({
+        summary: null,
+        replies: [
+          {
+            header: "# H",
+            passages: [["a"], ["b"]],
+            prefills: ["only one"],
+            inProgress: false,
+          },
+        ],
+        notices: [],
+        warnings: [],
+        empty: null,
+        model: null,
+      }),
+    ).toThrow(/prefills/);
+
+    // Invalid unmatchedNotes throws
+    expect(() =>
+      parseQuoteResult({
+        summary: null,
+        replies: [],
+        notices: [],
+        warnings: [],
+        empty: null,
+        model: null,
+        unmatchedNotes: [42],
+      }),
+    ).toThrow(/unmatchedNotes/);
   });
 });

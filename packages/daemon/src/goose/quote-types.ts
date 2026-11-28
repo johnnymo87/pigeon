@@ -7,6 +7,7 @@ export interface QuoteRequest {
   sessionId: string;
   pick: QuotePick;
   full: boolean;
+  notes?: string;
   tag?: string;
   quoteId?: string;
 }
@@ -14,6 +15,7 @@ export interface QuoteRequest {
 export interface QuoteReply {
   header: string; // "# 11-24 13:05 (wake: mail) · ask"
   passages: string[][]; // verbatim, unquoted lines
+  prefills?: (string | null)[]; // parallel to passages when present
   inProgress: boolean;
 }
 
@@ -31,12 +33,14 @@ export interface QuoteResult {
   warnings: string[];
   empty: null | QuoteEmptyReason;
   model: string | null;
+  unmatchedNotes?: string[];
 }
 
 export interface StoredQuotePassage {
   header: string;
   lines: string[];
   first: boolean;
+  prefill?: string;
 }
 
 export interface StoredQuote {
@@ -44,6 +48,8 @@ export interface StoredQuote {
   sessionId: string;
   passages: StoredQuotePassage[];
   total: number;
+  unmatchedNotes?: string[];
+  notesRaw?: string;
 }
 
 export const QUOTE_MAX_PASSAGES = 45;
@@ -65,10 +71,13 @@ export function isValidQuotePick(raw: unknown): raw is QuotePick {
   return false;
 }
 
-export function isValidQuoteMetadata(raw: unknown): raw is { pick: QuotePick; full: boolean } {
+export function isValidQuoteMetadata(
+  raw: unknown,
+): raw is { pick: QuotePick; full: boolean; notes?: string } {
   if (typeof raw !== "object" || raw === null) return false;
   const m = raw as Record<string, unknown>;
   if (typeof m.full !== "boolean") return false;
+  if (m.notes !== undefined && typeof m.notes !== "string") return false;
   return isValidQuotePick(m.pick);
 }
 
@@ -113,6 +122,12 @@ export function parseQuoteResult(raw: unknown): QuoteResult {
     }
   }
 
+  if (obj.unmatchedNotes !== undefined) {
+    if (!Array.isArray(obj.unmatchedNotes) || !obj.unmatchedNotes.every((n) => typeof n === "string")) {
+      throw new Error("malformed _honk/quote result: unmatchedNotes must be string[]");
+    }
+  }
+
   if (!Array.isArray(obj.replies)) {
     throw new Error("malformed _honk/quote result: replies must be an array");
   }
@@ -139,12 +154,31 @@ export function parseQuoteResult(raw: unknown): QuoteResult {
       }
       passages.push([...p]);
     }
+    let prefills: (string | null)[] | undefined;
+    if (replyObj.prefills !== undefined) {
+      if (
+        !Array.isArray(replyObj.prefills) ||
+        replyObj.prefills.length !== passages.length ||
+        !replyObj.prefills.every((p) => p === null || typeof p === "string")
+      ) {
+        throw new Error(
+          "malformed _honk/quote result: reply prefills must be (string | null)[] matching passages length",
+        );
+      }
+      prefills = [...replyObj.prefills];
+    }
     replies.push({
       header: replyObj.header,
       passages,
+      ...(prefills !== undefined ? { prefills } : {}),
       inProgress: replyObj.inProgress,
     });
   }
+
+  const unmatchedNotes =
+    Array.isArray(obj.unmatchedNotes) && obj.unmatchedNotes.length > 0
+      ? [...obj.unmatchedNotes]
+      : undefined;
 
   return {
     summary: typeof obj.summary === "string" ? obj.summary : null,
@@ -153,5 +187,6 @@ export function parseQuoteResult(raw: unknown): QuoteResult {
     warnings: Array.isArray(obj.warnings) ? [...obj.warnings] : [],
     empty: (obj.empty as QuoteEmptyReason | undefined) || null,
     model: typeof obj.model === "string" ? obj.model : null,
+    ...(unmatchedNotes !== undefined ? { unmatchedNotes } : {}),
   };
 }

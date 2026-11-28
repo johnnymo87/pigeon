@@ -1213,6 +1213,7 @@ export class GooseAcpClient {
       pick: req.pick,
       full: req.full,
     };
+    if (req.notes !== undefined && req.notes.trim() !== "") params.notes = req.notes;
     if (req.tag !== undefined) params.tag = req.tag;
     if (req.quoteId !== undefined) params.quoteId = req.quoteId;
 

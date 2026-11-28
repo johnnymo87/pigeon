@@ -694,4 +694,178 @@ describe("createQuoteHandler", () => {
     expect(logged).toHaveLength(1);
     expect(logged[0]).toContain("unhandled error in /quote handler: unexpected db error");
   });
+
+  it("forwards notes to client.quote, stores prefills + unmatchedNotes, and reports counts", async () => {
+    const outbox: UpsertOutboxInput[] = [];
+    const quoteSpy = vi.fn().mockResolvedValue({
+      summary: "# trimmed",
+      replies: [
+        {
+          header: "# 11-28 08:00 · ask",
+          passages: [["q1"], ["q2"]],
+          prefills: ["yes on q1", null],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: "claude-opus-5-5",
+      unmatchedNotes: ["extra thought"],
+    });
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => ({
+        isHonk: true,
+        connect: vi.fn().mockResolvedValue(undefined),
+        quote: quoteSpy,
+        close: vi.fn(),
+      }),
+      reply: vi.fn(),
+      upsertOutbox: (input) => outbox.push(input),
+      machineId: "cloudbox",
+    });
+
+    await handler(
+      makeMessage({
+        commandId: "cmd_notes_1",
+        metadata: { pick: { kind: "since" }, full: false, notes: "yes on q1\nextra thought" },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(quoteSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ notes: "yes on q1\nextra thought" }),
+      { timeoutMs: 600_000 },
+    );
+    expect(outbox).toHaveLength(2);
+    const answerPayload = JSON.parse(outbox[1]!.payload);
+    expect(answerPayload.messages[0].text).toBe(
+      "✍️ Answer 2 passage(s) from this /quote (1 prefilled, 1 unmatched note)",
+    );
+    expect(answerPayload.quote.passages[0].prefill).toBe("yes on q1");
+    expect(answerPayload.quote.passages[1].prefill).toBeUndefined();
+    expect(answerPayload.quote.unmatchedNotes).toEqual(["extra thought"]);
+  });
+
+  it("preserves raw notes with a warning when an older honkd ignores notes (deploy-skew guard)", async () => {
+    const outbox: UpsertOutboxInput[] = [];
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => ({
+        isHonk: true,
+        connect: vi.fn().mockResolvedValue(undefined),
+        quote: vi.fn().mockResolvedValue({
+          summary: "# trimmed",
+          replies: [
+            {
+              header: "# 11-28 08:00 · ask",
+              passages: [["q1"]],
+              inProgress: false,
+            },
+          ],
+          notices: [],
+          warnings: [],
+          empty: null,
+          model: "claude-opus-5-5",
+        }),
+        close: vi.fn(),
+      }),
+      reply: vi.fn(),
+      upsertOutbox: (input) => outbox.push(input),
+      machineId: "cloudbox",
+    });
+
+    await handler(
+      makeMessage({
+        commandId: "cmd_notes_skew",
+        metadata: { pick: { kind: "since" }, full: false, notes: "my important note" },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(outbox).toHaveLength(2);
+    const bodyPayload = JSON.parse(outbox[0]!.payload);
+    expect(bodyPayload.messages[0].text).toContain("honkd on cloudbox did not match your notes");
+    const answerPayload = JSON.parse(outbox[1]!.payload);
+    expect(answerPayload.quote.unmatchedNotes).toEqual(["my important note"]);
+  });
+
+  it("still offers Answer modal when result is empty but unmatchedNotes is non-empty", async () => {
+    const outbox: UpsertOutboxInput[] = [];
+    const replySpy = vi.fn();
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => ({
+        isHonk: true,
+        connect: vi.fn().mockResolvedValue(undefined),
+        quote: vi.fn().mockResolvedValue({
+          summary: null,
+          replies: [],
+          notices: [],
+          warnings: [],
+          empty: "nothing_since",
+          model: null,
+          unmatchedNotes: ["stand-alone note"],
+        }),
+        close: vi.fn(),
+      }),
+      reply: replySpy,
+      upsertOutbox: (input) => outbox.push(input),
+      machineId: "cloudbox",
+    });
+
+    await handler(
+      makeMessage({
+        commandId: "cmd_notes_empty",
+        metadata: { pick: { kind: "since" }, full: false, notes: "stand-alone note" },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(replySpy).not.toHaveBeenCalled();
+    expect(outbox).toHaveLength(2);
+    const answerPayload = JSON.parse(outbox[1]!.payload);
+    expect(answerPayload.messages[0].text).toBe(
+      "✍️ Send 1 unmatched note(s) from this /quote",
+    );
+    expect(answerPayload.quote).toEqual({
+      v: 1,
+      sessionId: "ses_goose_1",
+      passages: [],
+      total: 0,
+      unmatchedNotes: ["stand-alone note"],
+      notesRaw: "stand-alone note",
+    });
+  });
+
+  it("preserves raw notes in failure replies when /quote errors", async () => {
+    const replySpy = vi.fn();
+    const handler = createQuoteHandler({
+      getSession: () => makeSession(),
+      createClient: () => ({
+        isHonk: true,
+        connect: vi.fn().mockRejectedValue(new Error("socket closed")),
+        quote: vi.fn(),
+        close: vi.fn(),
+      }),
+      reply: replySpy,
+      upsertOutbox: vi.fn(),
+      machineId: "cloudbox",
+    });
+
+    await handler(
+      makeMessage({
+        commandId: "cmd_notes_err",
+        metadata: { pick: { kind: "since" }, full: false, notes: "keep my @channel note" },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(replySpy).toHaveBeenCalledTimes(1);
+    const text = replySpy.mock.calls[0]![0] as string;
+    expect(text).toContain("/quote failed: socket closed");
+    expect(text).toContain("Your notes (copy before retrying):");
+    expect(text).toContain("keep my @\u200dchannel note");
+  });
 });

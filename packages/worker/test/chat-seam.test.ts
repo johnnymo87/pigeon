@@ -320,14 +320,110 @@ describe("parseChatCommand", () => {
     });
   });
 
+  it("parses /quote with notes (inline, multi-line, -- and em-dash)", () => {
+    expect(parseChatCommand("/quote approve PR 264, hold off on deploy")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "approve PR 264, hold off on deploy",
+    });
+    expect(parseChatCommand("/quote 3 approve PR 264")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 3 },
+      full: false,
+      notes: "approve PR 264",
+    });
+    expect(parseChatCommand("/quote prev yes on migration")).toEqual({
+      kind: "quote",
+      pick: { kind: "prev" },
+      full: false,
+      notes: "yes on migration",
+    });
+    expect(parseChatCommand("/quote\n- note 1\n- note 2")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "- note 1\n- note 2",
+    });
+    expect(parseChatCommand("/quote 3\n- note 1\n- note 2")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 3 },
+      full: false,
+      notes: "- note 1\n- note 2",
+    });
+    expect(parseChatCommand("/quote -- 264 looks good")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "264 looks good",
+    });
+    expect(parseChatCommand("/quote \u2014 264 looks good")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "264 looks good",
+    });
+    expect(parseChatCommand("/quote 3 -- 264 looks good")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 3 },
+      full: false,
+      notes: "264 looks good",
+    });
+    // Guard prose starting with "all" or "full" from being misparsed as full: true
+    expect(parseChatCommand("/quote all good, ship it")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "all good, ship it",
+    });
+    expect(parseChatCommand("/quote full steam ahead")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "full steam ahead",
+    });
+    expect(parseChatCommand("/quote full\nmy notes")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: true,
+      notes: "my notes",
+    });
+    expect(parseChatCommand("/quote full -- my notes")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: true,
+      notes: "my notes",
+    });
+    expect(parseChatCommand("/quote full 3 my notes")).toEqual({
+      kind: "quote",
+      pick: { kind: "last", n: 3 },
+      full: true,
+      notes: "my notes",
+    });
+    const id = "gse_12345678";
+    expect(parseChatCommand(`/quote ${id} approve PR 264`)).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      target: id,
+      notes: "approve PR 264",
+    });
+    expect(parseChatCommand("/quote 2026 release notes")).toEqual({
+      kind: "quote",
+      pick: { kind: "since" },
+      full: false,
+      notes: "2026 release notes",
+    });
+  });
+
   it("answers malformed /quote with usage", () => {
     expect(parseChatCommand("/quote 0")).toEqual({ kind: "usage", command: "quote" });
     expect(parseChatCommand("/quote -1")).toEqual({ kind: "usage", command: "quote" });
-    expect(parseChatCommand("/quote prev 3")).toEqual({ kind: "usage", command: "quote" });
-    expect(parseChatCommand("/quote fulll")).toEqual({ kind: "usage", command: "quote" });
     expect(parseChatCommand("/quote 1001")).toEqual({ kind: "usage", command: "quote" });
     expect(parseChatCommand("/quote ses_abc")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote ses_e7128 approve")).toEqual({ kind: "usage", command: "quote" });
     expect(parseChatCommand("/quote full 0")).toEqual({ kind: "usage", command: "quote" });
+    expect(parseChatCommand("/quote --")).toEqual({ kind: "usage", command: "quote" });
     expect(parseChatCommand("/quotex")).toBeNull();
     expect(SESSION_COMMAND_USAGE_TEXT).toContain("/quote [<session-id>] [N|prev|full]");
   });

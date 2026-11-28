@@ -520,4 +520,49 @@ describe("quoteBodyMarkdown", () => {
     expect(md).toContain("> group <\u200d!subteam^S123\\|team>");
     expect(md).toContain("> ping @\u200dchannel and @\u200dhere and @\u200deveryone");
   });
+
+  it("flattens prefills, preserves droppedPrefills in capPassages, and renders prefills + unmatched notes", () => {
+    const result: QuoteResult = {
+      summary: "# trimmed",
+      replies: [
+        {
+          header: "# 11-28 08:00 · ask",
+          passages: [["approve PR 264?"], ["hold deploy?"]],
+          prefills: ["yes, merge it @channel", null],
+          inProgress: false,
+        },
+      ],
+      notices: [],
+      warnings: [],
+      empty: null,
+      model: "claude-opus-5-5",
+      unmatchedNotes: ["check logs <!here>"],
+    };
+
+    const flattened = flattenPassages(result);
+    expect(flattened[0]!.prefill).toBe("yes, merge it @channel");
+    expect(flattened[1]!.prefill).toBeUndefined();
+
+    // capPassages preserves prefills on dropped passages
+    const capped = capPassages(
+      [
+        { header: "# H", lines: ["a"], first: true },
+        { header: "# H", lines: ["b"], first: false, prefill: "saved from drop" },
+      ],
+      1,
+    );
+    expect(capped.passages).toHaveLength(1);
+    expect(capped.droppedPrefills).toEqual(["saved from drop"]);
+
+    const plain = quoteBodyText(result, "since", "coord");
+    expect(plain).toContain("📝 draft: yes, merge it @\u200dchannel");
+    expect(plain).toContain("Unmatched notes (carried into Answer modal):");
+    expect(plain).toContain("- check logs <\u200d!here>");
+
+    const md = quoteBodyMarkdown(result, "since", "coord");
+    expect(md).not.toBeNull();
+    expect(md).toContain("📝 draft: yes, merge it @\u200dchannel");
+    expect(md).toContain("**Unmatched notes (carried into Answer modal):**");
+    expect(md).toContain("- check logs <\u200d!here>");
+  });
 });

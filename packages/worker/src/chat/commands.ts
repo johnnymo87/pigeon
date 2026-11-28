@@ -56,7 +56,7 @@ export type ChatCommand =
   | { kind: "session"; type: SessionCommandType; arg: string; target?: string }
   | { kind: "rename"; title: string | undefined }
   | { kind: "tag"; args: TagCommand }
-  | { kind: "quote"; pick: QuotePick; full: boolean; target?: string }
+  | { kind: "quote"; pick: QuotePick; full: boolean; target?: string; notes?: string }
   /**
    * A session command whose arguments do not parse (`/kill now`, `/kill ses_e7128` with a
    * too-short id, `/mcp`). Answered with `SESSION_COMMAND_USAGE_TEXT`, never forwarded: the same
@@ -73,7 +73,7 @@ export const SESSION_COMMAND_USAGE_TEXT = [
   "/compact [<session-id>]",
   "/mcp [<session-id>] list | enable <server> | disable <server>",
   "/model [<session-id>] [<provider/model>]",
-  "/quote [<session-id>] [N|prev|full]",
+  "/quote [<session-id>] [N|prev|full] [<notes>]",
 ].join("\n");
 
 /** Command names whose malformed forms answer with usage (`/killall` is not one of them). */
@@ -99,48 +99,130 @@ function session(type: SessionCommandType, arg: string, target: string | undefin
   return target ? { kind: "session", type, arg, target } : { kind: "session", type, arg };
 }
 
+const SHORT_SESSION_REF_RE = /^(?:ses|gse)_[A-Za-z0-9_-]*$/;
+const QUOTE_SEP_RE = /^(?:--|\u2014)(?=$|\s)/;
+
+function peekFirstLineToken(s: string): { token: string; afterToken: string } | null {
+  const m = s.match(/^([^\s]+)([\s\S]*)$/);
+  if (!m) return null;
+  return { token: m[1]!, afterToken: m[2]! };
+}
+
+function isValidQuoteN(token: string): number | null {
+  if (!/^\d+$/.test(token)) return null;
+  const n = Number(token);
+  return Number.isInteger(n) && n >= 1 && n <= 1000 ? n : null;
+}
+
+function consumeQuoteSeparator(s: string): { notes: string } | "bare" | null {
+  const m = s.match(QUOTE_SEP_RE);
+  if (!m) return null;
+  const after = s.slice(m[0].length).trim();
+  return after.length > 0 ? { notes: after } : "bare";
+}
+
 function parseQuoteCommand(text: string): ChatCommand | null {
   if (!/^\/quote(?=$|\s)/.test(text)) return null;
-  const tokens = text.trim().split(/\s+/);
-  const args = tokens.slice(1);
-  let idx = 0;
+  let rest = text.slice("/quote".length).replace(/^[ \t]+/, "");
+
+  if (rest.length === 0) {
+    return { kind: "quote", pick: { kind: "since" }, full: false };
+  }
+  if (rest.startsWith("\n") || rest.startsWith("\r")) {
+    const notes = rest.trim();
+    return notes
+      ? { kind: "quote", pick: { kind: "since" }, full: false, notes }
+      : { kind: "quote", pick: { kind: "since" }, full: false };
+  }
+
   let target: string | undefined;
-
-  if (idx < args.length && SESSION_REF_RE.test(args[idx]!)) {
-    target = args[idx];
-    idx++;
-  }
-
   let full = false;
-  if (idx < args.length && (args[idx] === "full" || args[idx] === "all")) {
-    full = true;
-    idx++;
-  }
-
   let pick: QuotePick = { kind: "since" };
-  if (idx < args.length) {
-    const token = args[idx]!;
-    if (token === "prev") {
-      pick = { kind: "prev" };
-      idx++;
-    } else if (/^\d+$/.test(token)) {
-      const n = Number(token);
-      if (Number.isInteger(n) && n >= 1 && n <= 1000) {
-        pick = { kind: "last", n };
-        idx++;
-      } else {
-        return null;
-      }
-    } else {
+
+  const finish = (notesRaw: string): ChatCommand => {
+    const notes = notesRaw.trim();
+    return {
+      kind: "quote",
+      pick,
+      full,
+      ...(target ? { target } : {}),
+      ...(notes ? { notes } : {}),
+    };
+  };
+
+  // 1. Optional target session id
+  const first = peekFirstLineToken(rest);
+  if (first) {
+    if (SESSION_REF_RE.test(first.token)) {
+      target = first.token;
+      rest = first.afterToken.replace(/^[ \t]+/, "");
+    } else if (SHORT_SESSION_REF_RE.test(first.token)) {
       return null;
     }
   }
 
-  if (idx < args.length) {
-    return null;
+  if (rest.length === 0 || rest.startsWith("\n") || rest.startsWith("\r")) {
+    return finish(rest);
   }
 
-  return target ? { kind: "quote", pick, full, target } : { kind: "quote", pick, full };
+  const sep1 = consumeQuoteSeparator(rest);
+  if (sep1 === "bare") return null;
+  if (sep1 !== null) return finish(sep1.notes);
+
+  // 2. Optional `full` / `all` (only consumed when followed by end, newline, `--`/`—`, `prev`, or integer)
+  const tokFull = peekFirstLineToken(rest);
+  if (tokFull && (tokFull.token === "full" || tokFull.token === "all")) {
+    const afterHoriz = tokFull.afterToken.replace(/^[ \t]+/, "");
+    const nextTok = peekFirstLineToken(afterHoriz);
+    const shouldConsumeFull =
+      afterHoriz.length === 0 ||
+      afterHoriz.startsWith("\n") ||
+      afterHoriz.startsWith("\r") ||
+      QUOTE_SEP_RE.test(afterHoriz) ||
+      (nextTok !== null &&
+        (nextTok.token === "prev" ||
+          isValidQuoteN(nextTok.token) !== null ||
+          (/^-?\d+$/.test(nextTok.token) && nextTok.afterToken.trim() === "")));
+    if (shouldConsumeFull) {
+      full = true;
+      rest = afterHoriz;
+    }
+  }
+
+  if (rest.length === 0 || rest.startsWith("\n") || rest.startsWith("\r")) {
+    return finish(rest);
+  }
+
+  const sep2 = consumeQuoteSeparator(rest);
+  if (sep2 === "bare") return null;
+  if (sep2 !== null) return finish(sep2.notes);
+
+  // 3. Optional `prev` or `N` (1..1000)
+  const tokPick = peekFirstLineToken(rest);
+  if (tokPick) {
+    if (tokPick.token === "prev") {
+      pick = { kind: "prev" };
+      rest = tokPick.afterToken.replace(/^[ \t]+/, "");
+    } else if (/^-?\d+$/.test(tokPick.token)) {
+      const n = isValidQuoteN(tokPick.token);
+      if (n !== null) {
+        pick = { kind: "last", n };
+        rest = tokPick.afterToken.replace(/^[ \t]+/, "");
+      } else if (tokPick.afterToken.trim() === "") {
+        return null;
+      }
+    }
+  }
+
+  if (rest.length === 0 || rest.startsWith("\n") || rest.startsWith("\r")) {
+    return finish(rest);
+  }
+
+  const sep3 = consumeQuoteSeparator(rest);
+  if (sep3 === "bare") return null;
+  if (sep3 !== null) return finish(sep3.notes);
+
+  return finish(rest);
 }
 
 export function parseChatCommand(text: string): ChatCommand | null {

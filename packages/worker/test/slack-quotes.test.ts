@@ -491,4 +491,51 @@ describe("POST /notifications/send with quote", () => {
     const res = await handleSendNotification(dbProxy, e, req);
     expect(res.status).toBe(200);
   });
+
+  it("isValidStoredQuote accepts prefill, unmatchedNotes, and empty passages when unmatchedNotes is non-empty", () => {
+    expect(
+      isValidStoredQuote({
+        v: 1,
+        sessionId: "gse_1",
+        passages: [{ header: "# H", lines: ["a"], first: true, prefill: "yes" }],
+        total: 1,
+        unmatchedNotes: ["extra"],
+      }),
+    ).toBe(true);
+    expect(
+      isValidStoredQuote({
+        v: 1,
+        sessionId: "gse_1",
+        passages: [],
+        total: 0,
+        unmatchedNotes: ["only unmatched"],
+      }),
+    ).toBe(true);
+    expect(
+      isValidStoredQuote({
+        v: 1,
+        sessionId: "gse_1",
+        passages: [],
+        total: 0,
+        unmatchedNotes: [],
+      }),
+    ).toBe(false);
+    expect(
+      isValidStoredQuote({
+        v: 1,
+        sessionId: "gse_1",
+        passages: [{ header: "# H", lines: ["a"], first: true, prefill: 123 }],
+        total: 1,
+      }),
+    ).toBe(false);
+    expect(
+      isValidStoredQuote({
+        v: 1,
+        sessionId: "gse_1",
+        passages: [{ header: "# H", lines: ["a"], first: true }],
+        total: 1,
+        unmatchedNotes: ["ok", 42],
+      }),
+    ).toBe(false);
+  });
 });
